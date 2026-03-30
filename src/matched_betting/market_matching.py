@@ -95,8 +95,6 @@ def is_game_win_loss_record(record: OddsRecord) -> bool:
     if not identity.home_team or not identity.away_team:
         return False
     #print("selection_side:",record.selection_side)
-    if record.selection_side.lower() != "back":
-        return False
     #print("market_name, market_type:",record.market_name, record.market_type)
     if not _is_moneyline_market(record.market_name.lower(), record.market_type.lower()):
         return False

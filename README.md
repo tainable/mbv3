@@ -1,98 +1,138 @@
 # matched_betting
 
-Initial ingestion layer for a matched betting system.
+Odds ingestion and aggregation system for matched betting on NBA and MLB games.
 
-This first version focuses on retrieving and normalizing NBA and MLB odds from:
-
-- Matchbook
-- Smarkets
-- Polymarket
-
-The codebase is intentionally modular so provider-specific logic stays isolated from the shared schema, CLI, and future comparison engine.
-
-## Current state
-
-- The project scaffold, virtual environment, config loading, CLI, normalized output schema, and tests are in place.
-- The Matchbook adapter is implemented with session login and live event/market price ingestion.
-- The Smarkets adapter is implemented with session login, event tree traversal, market contract discovery, and authenticated quote ladders.
-- The Polymarket adapter is implemented against public documented endpoints.
+Fetches live odds from Matchbook, Smarkets, and Polymarket, normalises them into a unified schema, matches records for the same game across providers using a canonical event ID, and writes both a full odds record file and a best-odds comparison table.
 
 ## Project layout
 
-```text
+```
 matched_betting/
-  src/matched_betting/
-    cli.py
-    config.py
-    http.py
-    models.py
-    providers/
-      base.py
-      matchbook.py
-      polymarket.py
-      registry.py
-      smarkets.py
-  tests/
+├── run.py                          # Launcher (adds src/ to sys.path)
+├── src/matched_betting/
+│   ├── cli.py                      # Argument parsing and orchestration
+│   ├── config.py                   # Settings loaded from .env
+│   ├── http.py                     # HTTP client with retry logic
+│   ├── models.py                   # OddsRecord and ProviderPayload dataclasses
+│   ├── event_matching.py           # Canonical event matching across providers
+│   ├── market_matching.py          # Moneyline filtering and canonical bet grouping
+│   ├── debug.py                    # Optional stderr debug logger
+│   └── providers/
+│       ├── base.py                 # Abstract OddsProvider interface
+│       ├── registry.py             # Provider factory
+│       ├── matchbook.py            # Matchbook authenticated API adapter
+│       ├── smarkets.py             # Smarkets authenticated API adapter
+│       └── polymarket.py           # Polymarket public API adapter
+└── tests/
+    ├── test_event_matching.py
+    ├── test_game_filtering.py
+    └── test_models.py
 ```
 
 ## Setup
 
-The dedicated virtual environment already lives at:
-
-`/Users/guysemple/matched_betting/.venv`
-
-To activate it:
+Create and activate a virtual environment:
 
 ```bash
-source /Users/guysemple/matched_betting/.venv/bin/activate
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
 ```
+
+No additional packages are required — the project uses only the Python standard library.
 
 ## Configuration
 
-Create an env file:
+Copy the example env file and fill in your credentials:
 
 ```bash
-cp /Users/guysemple/matched_betting/.env.example /Users/guysemple/matched_betting/.env
+cp .env.example .env
 ```
 
-Then add credentials as you provide them.
+Available env vars:
 
-## Run
+```
+# Output
+MATCHED_BETTING_OUTPUT_PATH=outputs/latest_odds.json
+
+# Matchbook (authenticated)
+MATCHBOOK_USERNAME=
+MATCHBOOK_PASSWORD=
+MATCHBOOK_BASE_URL=https://api.matchbook.com
+
+# Smarkets (authenticated)
+SMARKETS_USERNAME=
+SMARKETS_PASSWORD=
+SMARKETS_API_TOKEN=
+SMARKETS_BASE_URL=https://api.smarkets.com
+
+# Polymarket (public, no credentials required)
+POLYMARKET_GAMMA_BASE_URL=https://gamma-api.polymarket.com
+POLYMARKET_CLOB_BASE_URL=https://clob.polymarket.com
+```
+
+Providers without credentials will be skipped with a warning rather than crashing.
+
+## Running
 
 ```bash
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --format json
+python run.py
 ```
 
-Optional examples:
+The `run.py` launcher inserts `src/` onto `sys.path`, so no install step is required.
+
+### CLI flags
+
+| Flag | Description |
+|---|---|
+| `--leagues nba mlb` | Leagues to fetch (default: both) |
+| `--nba` | Shortcut for `--leagues nba` |
+| `--mlb` | Shortcut for `--leagues mlb` |
+| `--providers matchbook smarkets polymarket` | Providers to query (default: all three) |
+| `--out PATH` | Override the output file path |
+| `--debug` | Print progress messages to stderr |
+
+Examples:
 
 ```bash
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --providers polymarket
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --nba
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --mlb
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --leagues nba
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --out /Users/guysemple/matched_betting/outputs/latest_odds.json
-/Users/guysemple/matched_betting/.venv/bin/python /Users/guysemple/matched_betting/run.py --debug
+# Single provider
+python run.py --providers polymarket
+
+# Single league
+python run.py --nba
+
+# Custom output path
+python run.py --out outputs/nba_odds.json
+
+# Debug mode (progress to stderr, JSON to stdout)
+python run.py --debug
 ```
 
-The `run.py` launcher inserts `src/` onto `sys.path`, so no package install step is required.
+## Output
 
-`--debug` prints progress messages to `stderr` while the normal JSON output still goes to `stdout`.
+Each run writes two files derived from the output path stem:
 
-Each run now matches records to the same real-world game via `canonical_event_id`.
+| File | Contents |
+|---|---|
+| `*_all_odds.json` | All normalised `OddsRecord` objects with `canonical_event_id` |
+| `*_aggregated_games.json` | Best decimal odds per team per provider, one entry per game |
 
-By default the run writes two separate files:
+A summary is also printed to stdout:
 
-- `outputs/latest_odds_records.json`
-- `outputs/latest_odds_aggregated_games.json`
+```json
+{
+  "leagues": ["nba", "mlb"],
+  "providers_requested": ["matchbook", "smarkets", "polymarket"],
+  "record_count": 84,
+  "aggregated_game_count": 14,
+  "warnings": [],
+  "all_odds_output_path": "outputs/latest_odds_all_odds.json",
+  "aggregated_games_output_path": "outputs/latest_odds_aggregated_games.json"
+}
+```
 
-If you pass `--out /some/path/name.json`, those become:
+### Odds record schema
 
-- `/some/path/name_records.json`
-- `/some/path/name_aggregated_games.json`
-
-## Output schema
-
-Each normalized record uses the same shape regardless of source:
+All records share this shape regardless of source:
 
 ```json
 {
@@ -111,13 +151,37 @@ Each normalized record uses the same shape regardless of source:
   "source_market_id": "12345",
   "source_event_id": "abcde",
   "retrieved_at": "2026-03-21T19:30:00Z",
-  "metadata": {}
+  "metadata": {},
+  "canonical_event_id": "nba|20260321T1930|los angeles celtics|los angeles lakers"
 }
 ```
 
-## Notes
+### Aggregated game schema
 
-- Polymarket prices are normalized from public outcome prices into decimal odds using `1 / probability`.
-- Smarkets quote ladder prices are normalized from their integer probability format into decimal odds using `price / 10000` then `1 / probability`.
-- Exchange-specific concepts such as lay/back depth, commissions, and order book levels are deliberately left in `metadata` for now and can be pulled into the shared schema later if needed.
-- The next logical step after credential wiring is a comparison module that groups records by normalized event and market type.
+```json
+{
+  "team1": "Los Angeles Lakers",
+  "team2": "Boston Celtics",
+  "date_time": "2026-03-21T19:30:00Z",
+  "league": "nba",
+  "sport": "basketball",
+  "polymarket_team1_odds": 2.14,
+  "polymarket_team2_odds": 1.74,
+  "matchbook_team1_odds": 2.10,
+  "matchbook_team2_odds": 1.80,
+  "smarkets_team1_odds": null,
+  "smarkets_team2_odds": null
+}
+```
+
+`null` means the provider had no matching record for that team. Odds shown are the best (highest) decimal odds seen across that provider's records for the game.
+
+## How it works
+
+**Canonical event matching** (`event_matching.py`): team names are parsed from each provider's event description, normalised through a league-specific alias dictionary (e.g. "Cavs" → "Cleveland Cavaliers"), then grouped by league, team pair, and start time within a ±30-minute tolerance. The resulting canonical event ID takes the form `league|YYYYMMDDTHHMM|away_team|home_team`.
+
+**Odds normalisation**: Polymarket prices are converted from outcome probability to decimal odds using `1 / p`. Smarkets integer prices are first converted via `price / 10000` then the same formula. Matchbook prices are already decimal.
+
+**Filtering** (`market_matching.py`): only moneyline back bets with two identified teams are included in the output. Exchange-specific concepts (lay depth, commissions, order book levels) are preserved in `metadata` for future use.
+
+**Parallel ingestion**: all configured providers are queried concurrently via `ThreadPoolExecutor`. Provider failures are captured as warnings and do not abort the run.

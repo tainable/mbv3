@@ -212,15 +212,19 @@ def _build_aggregated_games_payload(
             "date_time": event_group.event_start,
             "league": event_group.league,
             "sport": event_group.sport,
-            "polymarket_team1_odds": None,
-            "polymarket_team2_odds": None,
-            "matchbook_team1_odds": None,
-            "matchbook_team2_odds": None,
-            "smarkets_team1_odds": None,
-            "smarkets_team2_odds": None,
+            "polymarket_team1_back_odds": None,
+            "polymarket_team2_back_odds": None,
+            "matchbook_team1_back_odds": None,
+            "matchbook_team2_back_odds": None,
+            "matchbook_team1_lay_odds": None,
+            "matchbook_team2_lay_odds": None,
+            "smarkets_team1_back_odds": None,
+            "smarkets_team2_back_odds": None,
+            "smarkets_team1_lay_odds": None,
+            "smarkets_team2_lay_odds": None,
         }
 
-        best_by_provider_team: dict[tuple[str, str], tuple[int, OddsRecord]] = {}
+        best_by_provider_team: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
         for index in indices:
             record = records[index]
             normalized_selection = _normalize_team_for_output(record.selection_name, record.league)
@@ -231,21 +235,29 @@ def _build_aggregated_games_payload(
                 team_slot = "team2"
             if team_slot is None:
                 continue
-            key = (record.provider, team_slot)
+            side = record.selection_side.lower()
+            key = (record.provider, team_slot, side)
             current = best_by_provider_team.get(key)
             try:
-                if current is None or record.decimal_odds > current[1].decimal_odds:
+                if current is None:
                     best_by_provider_team[key] = (index, record)
+                elif side == "lay":
+                    if record.decimal_odds < current[1].decimal_odds:
+                        best_by_provider_team[key] = (index, record)
+                else:
+                    if record.decimal_odds > current[1].decimal_odds:
+                        best_by_provider_team[key] = (index, record)
             except:
                 best_by_provider_team[key] = (index, record)
-            
+
         for provider_name in ("polymarket", "matchbook", "smarkets"):
             for team_slot in ("team1", "team2"):
-                chosen = best_by_provider_team.get((provider_name, team_slot))
-                if chosen is None:
-                    continue
-                _, record = chosen
-                entry[f"{provider_name}_{team_slot}_odds"] = record.decimal_odds
+                for side in ("back", "lay"):
+                    chosen = best_by_provider_team.get((provider_name, team_slot, side))
+                    if chosen is None:
+                        continue
+                    _, record = chosen
+                    entry[f"{provider_name}_{team_slot}_{side}_odds"] = record.decimal_odds
 
         payload.append(entry)
 

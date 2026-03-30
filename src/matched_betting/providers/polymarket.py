@@ -10,6 +10,7 @@ from matched_betting.models import OddsRecord, ProviderPayload, decimal_from_pro
 from matched_betting.providers.base import OddsProvider
 
 
+
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
@@ -214,7 +215,12 @@ class PolymarketProvider(OddsProvider):
             event_start = event.get("endDate")
 
         market_name = market.get("groupItemTitle") or market.get("question") or "Unknown market"
-        market_type = self._infer_market_type(outcomes)
+        market_type = self._infer_market_type(
+            outcomes,
+            slug=market.get("slug", ""),
+            question=market.get("question", ""),
+            sports_market_type=market.get("sportsMarketType", ""),
+        )
 
         records: list[OddsRecord] = []
         for outcome, probability in zip(outcomes, prices, strict=True):
@@ -255,7 +261,17 @@ class PolymarketProvider(OddsProvider):
         return records
 
     @staticmethod
-    def _infer_market_type(outcomes: list[str]) -> str:
+    def _infer_market_type(
+        outcomes: list[str],
+        slug: str = "",
+        question: str = "",
+        sports_market_type: str = "",
+    ) -> str:
+        combined = f"{slug.lower()} {question.lower()} {sports_market_type.lower()}"
+        if any(kw in combined for kw in ("spread", "cover", "handicap", "ats", "run-line", "runline")):
+            return "handicap"
+        if any(kw in combined for kw in ("over-under", "over/under", "total", "runs-over", "runs-under")):
+            return "total"
         if len(outcomes) == 2:
             return "two_way"
         if len(outcomes) == 3:
@@ -273,3 +289,4 @@ def _parse_stringified_json_list(value: Any) -> list[Any]:
         if isinstance(parsed, list):
             return parsed
     raise ValueError(f"Cannot parse list value: {value!r}")
+

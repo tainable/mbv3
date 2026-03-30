@@ -106,10 +106,9 @@ class MatchbookProvider(OddsProvider):
         if league == "nba":
             return any(tag.get("url-name") == "nba" for tag in meta_tags)
         if league == "mlb":
-            return any(
-                (tag.get("url-name") == "mlb") or (str(tag.get("name", "")).upper() == "MLB")
-                for tag in meta_tags
-            )
+            # Sport ID 3 already scopes the API response to baseball events, so
+            # trust it rather than relying on meta-tag values which vary by market.
+            return True
         return False
 
     def _event_to_records(

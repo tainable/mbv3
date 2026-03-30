@@ -139,7 +139,7 @@ class SmarketsProvider(OddsProvider):
                 if not contract:
                     continue
 
-                for side, ladder_key in (("back", "bids"), ("lay", "offers")):
+                for side, ladder_key in (("back", "offers"), ("lay", "bids")):
                     for level_index, level in enumerate(quote.get(ladder_key, [])):
                         probability = _smarkets_probability(level["price"])
                         records.append(
@@ -225,18 +225,16 @@ def _smarkets_probability(raw_price: int | float) -> float:
     return float(raw_price) / 10000.0
 
 
-def _is_core_market(market: dict[str, Any]) -> bool:
-    categories = {str(item).lower() for item in market.get("categories", [])}
-    primary_category = str(market.get("category") or "").lower()
-    market_type_name = str(market.get("market_type", {}).get("name") or "").lower()
-    market_name = str(market.get("name") or "").lower()
+_MONEYLINE_MARKET_NAMES = {
+    "winner (incl. overtime)",
+    "winner (including overtime)",
+    "Match winner",
+    "match winner"
+}
 
-    if "winner" in categories:
-        return True
-    if primary_category == "winner":
-        return True
-    if "winner" in market_type_name:
-        return True
+
+def _is_core_market(market: dict[str, Any]) -> bool:
+    market_name = str(market.get("name") or "").lower().strip()
     if "winner" in market_name:
-        return True
-    return False
+        print(f"[smarkets] winner market seen: '{market.get('name')}'")
+    return market_name in _MONEYLINE_MARKET_NAMES
