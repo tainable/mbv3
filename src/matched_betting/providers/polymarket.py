@@ -42,29 +42,35 @@ class PolymarketProvider(OddsProvider):
         records: list[OddsRecord] = []
         warnings: list[str] = []
 
+        half_segments = {"1h", "2h", "1st-half", "2nd-half", "first-half", "second-half", "halftime"}
+
         candidate_markets: list[tuple[dict[str, Any], str]] = []
         for market in all_markets:
             league = self._infer_league(market, team_index)
-            
+
             split_slug = market['slug'].split("-")
 
-            if "nba" in split_slug[0]:
-                if split_slug[1] in ['atl','phx','lal','ind','chi','phi', 
+            # Skip 1st/2nd half markets (e.g. nba-bos-lal-1h)
+            if any(seg in half_segments for seg in split_slug):
+                continue
+
+            if "nba" in leagues and "nba" in split_slug[0]:
+                if split_slug[1] in ['atl','phx','lal','ind','chi','phi',
                 'okc','bos','mia','cle','sas','mem','was','uta',
                 'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
-                    
-                    if split_slug[2] in ['atl','phx','lal','ind','chi','phi', 
+
+                    if split_slug[2] in ['atl','phx','lal','ind','chi','phi',
                 'okc','bos','mia','cle','sas','mem','was','uta',
                 'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
                         league = 'nba'
                         candidate_markets.append((market, league))
 
-            if "mlb" in split_slug[0]:
-                if split_slug[1] in ['cws','mil','wsh','chc','min','bal', 
+            if "mlb" in leagues and "mlb" in split_slug[0]:
+                if split_slug[1] in ['cws','mil','wsh','chc','min','bal',
                 'cin','bos','laa','hou','det','sd','tex','phi',
                 'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
-                    
-                    if split_slug[2] in ['cws','mil','wsh','chc','min','bal', 
+
+                    if split_slug[2] in ['cws','mil','wsh','chc','min','bal',
                 'cin','bos','laa','hou','det','sd','tex','phi',
                 'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
                         league = 'mlb'
@@ -76,7 +82,7 @@ class PolymarketProvider(OddsProvider):
             self.debug(
                 f"{self.name}: market {market_index}/{len(candidate_markets)} id={market.get('id', 'unknown')} league={league}"
             )
-            print(market['question'])
+            #print(market['question'])
             try:
                 market_records = self._market_to_records(market, league, retrieved_at)
                 records.extend(market_records)
