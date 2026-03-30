@@ -235,6 +235,5 @@ _MONEYLINE_MARKET_NAMES = {
 
 def _is_core_market(market: dict[str, Any]) -> bool:
     market_name = str(market.get("name") or "").lower().strip()
-    if "winner" in market_name:
-        print(f"[smarkets] winner market seen: '{market.get('name')}'")
+
     return market_name in _MONEYLINE_MARKET_NAMES
