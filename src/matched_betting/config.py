@@ -41,12 +41,19 @@ class PolymarketSettings:
 
 
 @dataclass(frozen=True)
+class SxBetSettings:
+    base_url: str
+    base_token: str
+
+
+@dataclass(frozen=True)
 class Settings:
     project_root: Path
     default_output_path: Path
     matchbook: MatchbookSettings
     smarkets: SmarketsSettings
     polymarket: PolymarketSettings
+    sx_bet: SxBetSettings
 
 
 def load_settings(project_root: Path) -> Settings:
@@ -74,6 +81,13 @@ def load_settings(project_root: Path) -> Settings:
             ),
             clob_base_url=os.getenv(
                 "POLYMARKET_CLOB_BASE_URL", "https://clob.polymarket.com"
+            ),
+        ),
+        sx_bet=SxBetSettings(
+            base_url=os.getenv("SX_BET_BASE_URL", "https://api.sx.bet"),
+            # USDC on SX Network (Polygon); override with SX_BET_BASE_TOKEN if needed
+            base_token=os.getenv(
+                "SX_BET_BASE_TOKEN", "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
             ),
         ),
     )

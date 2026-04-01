@@ -18,6 +18,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 
@@ -27,11 +28,13 @@ BACK_ODDS_FIELDS = {
         "polymarket_team1_back_odds",
         "matchbook_team1_back_odds",
         "smarkets_team1_back_odds",
+        "sx_bet_team1_back_odds",
     ],
     "team2": [
         "polymarket_team2_back_odds",
         "matchbook_team2_back_odds",
         "smarkets_team2_back_odds",
+        "sx_bet_team2_back_odds",
     ],
 }
 
@@ -214,9 +217,11 @@ def main() -> None:
     data = json.loads(input_path.read_text(encoding="utf-8"))
     games = data.get("aggregated_games", [])
 
+    run_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
     sure_bets = find_sure_bets(games, min_profit_pct=args.min_profit)
     back_lay_arbs = find_back_lay_arbs(games, min_profit_pct=args.min_profit)
 
+    print(f"Arb finder run:  {run_at}\n")
     print(f"=== Sure bets (back-back): {len(sure_bets)} found ===\n")
     _print_sure_bets(sure_bets)
 

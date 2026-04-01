@@ -7,6 +7,7 @@ from matched_betting.providers.base import OddsProvider
 from matched_betting.providers.matchbook import MatchbookProvider
 from matched_betting.providers.polymarket import PolymarketProvider
 from matched_betting.providers.smarkets import SmarketsProvider
+from matched_betting.providers.sx_bet import SxBetProvider
 
 
 def build_provider_registry(
@@ -18,4 +19,5 @@ def build_provider_registry(
         "matchbook": MatchbookProvider(settings.matchbook, http_client, debug_logger),
         "smarkets": SmarketsProvider(settings.smarkets, http_client, debug_logger),
         "polymarket": PolymarketProvider(settings.polymarket, http_client, debug_logger),
+        "sx_bet": SxBetProvider(settings.sx_bet, http_client, debug_logger),
     }

@@ -11,13 +11,13 @@ from matched_betting.debug import noop_debug, stderr_debug
 from matched_betting.event_matching import match_records_to_canonical_events
 from matched_betting.http import HttpClient
 from matched_betting.market_matching import is_game_win_loss_record
-from matched_betting.models import OddsRecord
+from matched_betting.models import OddsRecord, utc_now_iso
 from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
 DEFAULT_LEAGUES = ["nba", "mlb"]
-DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket"]
+DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -30,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--providers",
         nargs="+",
         default=DEFAULT_PROVIDERS,
-        choices=DEFAULT_PROVIDERS,
+        choices=["matchbook", "smarkets", "polymarket", "sx_bet"],
     )
     parser.add_argument("--format", choices=["json"], default="json")
     parser.add_argument("--out", type=Path, help="Optional output path. Defaults to MATCHED_BETTING_OUTPUT_PATH.")
@@ -54,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
 
     records: list[OddsRecord] = []
     warnings: list[str] = []
+
+    scrape_started_at = utc_now_iso()
+    print(f"Scrape started:  {scrape_started_at}", flush=True)
 
     with ThreadPoolExecutor(max_workers=len(args.providers)) as executor:
         future_to_provider = {}
@@ -93,6 +96,9 @@ def main(argv: list[str] | None = None) -> int:
         records.extend(provider_records)
         warnings.extend(provider_warnings)
 
+    scrape_ended_at = utc_now_iso()
+    print(f"Scrape finished: {scrape_ended_at}", flush=True)
+
     records.sort(
         key=lambda item: (
             item.league,
@@ -128,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     output_payload: dict[str, Any] = {
+        "scrape_started_at": scrape_started_at,
+        "scrape_ended_at": scrape_ended_at,
         "leagues": leagues,
         "providers_requested": args.providers,
         "record_count": len(records),
@@ -222,6 +230,8 @@ def _build_aggregated_games_payload(
             "smarkets_team2_back_odds": None,
             "smarkets_team1_lay_odds": None,
             "smarkets_team2_lay_odds": None,
+            "sx_bet_team1_back_odds": None,
+            "sx_bet_team2_back_odds": None,
         }
 
         best_by_provider_team: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
@@ -250,7 +260,7 @@ def _build_aggregated_games_payload(
             except:
                 best_by_provider_team[key] = (index, record)
 
-        for provider_name in ("polymarket", "matchbook", "smarkets"):
+        for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet"):
             for team_slot in ("team1", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get((provider_name, team_slot, side))

@@ -67,9 +67,16 @@ class HttpClient:
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     return json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
-                if exc.code != 429 or attempt >= self.max_retries:
-                    raise
-                time.sleep(1 + attempt)
+                if exc.code == 429 and attempt < self.max_retries:
+                    time.sleep(1 + attempt)
+                    continue
+                try:
+                    body = exc.read().decode("utf-8", errors="replace")
+                except Exception:
+                    body = "<unreadable>"
+                raise RuntimeError(
+                    f"HTTP {exc.code} {request_url}: {body}"
+                ) from exc
 
 
 def _to_items(value: Any) -> list[Any]:

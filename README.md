@@ -2,7 +2,7 @@
 
 Odds ingestion and aggregation system for matched betting on NBA and MLB games.
 
-Fetches live odds from Matchbook, Smarkets, and Polymarket, normalises them into a unified schema, matches records for the same game across providers using a canonical event ID, and writes both a full odds record file and a best-odds comparison table.
+Fetches live odds from Matchbook, Smarkets, Polymarket, and SX Bet, normalises them into a unified schema, matches records for the same game across providers using a canonical event ID, and writes both a full odds record file and a best-odds comparison table.
 
 ## Project layout
 
@@ -22,7 +22,8 @@ matched_betting/
 │       ├── registry.py             # Provider factory
 │       ├── matchbook.py            # Matchbook authenticated API adapter
 │       ├── smarkets.py             # Smarkets authenticated API adapter
-│       └── polymarket.py           # Polymarket public API adapter
+│       ├── polymarket.py           # Polymarket public API adapter
+│       └── sx_bet.py               # SX Bet public API adapter (P2P, no credentials required)
 └── tests/
     ├── test_event_matching.py
     ├── test_game_filtering.py
@@ -68,6 +69,10 @@ SMARKETS_BASE_URL=https://api.smarkets.com
 # Polymarket (public, no credentials required)
 POLYMARKET_GAMMA_BASE_URL=https://gamma-api.polymarket.com
 POLYMARKET_CLOB_BASE_URL=https://clob.polymarket.com
+
+# SX Bet (public, no credentials required)
+SX_BET_BASE_URL=https://api.sx.bet
+SX_BET_BASE_TOKEN=0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B
 ```
 
 Providers without credentials will be skipped with a warning rather than crashing.
@@ -87,7 +92,7 @@ The `run.py` launcher inserts `src/` onto `sys.path`, so no install step is requ
 | `--leagues nba mlb` | Leagues to fetch (default: both) |
 | `--nba` | Shortcut for `--leagues nba` |
 | `--mlb` | Shortcut for `--leagues mlb` |
-| `--providers matchbook smarkets polymarket` | Providers to query (default: all three) |
+| `--providers matchbook smarkets polymarket sx_bet` | Providers to query (default: all four) |
 | `--out PATH` | Override the output file path |
 | `--debug` | Print progress messages to stderr |
 
@@ -95,7 +100,10 @@ Examples:
 
 ```bash
 # Single provider
-python run.py --providers polymarket
+python run.py --providers sx_bet
+
+# Multiple providers
+python run.py --providers polymarket sx_bet
 
 # Single league
 python run.py --nba
@@ -121,7 +129,7 @@ A summary is also printed to stdout:
 ```json
 {
   "leagues": ["nba", "mlb"],
-  "providers_requested": ["matchbook", "smarkets", "polymarket"],
+  "providers_requested": ["matchbook", "smarkets", "polymarket", "sx_bet"],
   "record_count": 84,
   "aggregated_game_count": 14,
   "warnings": [],
@@ -170,7 +178,9 @@ All records share this shape regardless of source:
   "matchbook_team1_odds": 2.10,
   "matchbook_team2_odds": 1.80,
   "smarkets_team1_odds": null,
-  "smarkets_team2_odds": null
+  "smarkets_team2_odds": null,
+  "sx_bet_team1_back_odds": 2.08,
+  "sx_bet_team2_back_odds": 1.82
 }
 ```
 
@@ -180,8 +190,8 @@ All records share this shape regardless of source:
 
 **Canonical event matching** (`event_matching.py`): team names are parsed from each provider's event description, normalised through a league-specific alias dictionary (e.g. "Cavs" → "Cleveland Cavaliers"), then grouped by league, team pair, and start time within a ±30-minute tolerance. The resulting canonical event ID takes the form `league|YYYYMMDDTHHMM|away_team|home_team`.
 
-**Odds normalisation**: Polymarket prices are converted from outcome probability to decimal odds using `1 / p`. Smarkets integer prices are first converted via `price / 10000` then the same formula. Matchbook prices are already decimal.
+**Odds normalisation**: Polymarket prices are converted from outcome probability to decimal odds using `1 / p`. Smarkets integer prices are first converted via `price / 10000` then the same formula. Matchbook prices are already decimal. SX Bet stores odds as scaled integers (`maker_probability × 10²⁰`); taker decimal odds are computed as `1 / (1 - maker_probability)` using the cross-referenced outcome (team one's odds derive from the best maker orders on outcome two, and vice versa).
 
-**Filtering** (`market_matching.py`): only moneyline back bets with two identified teams are included in the output. Exchange-specific concepts (lay depth, commissions, order book levels) are preserved in `metadata` for future use.
+**Filtering** (`market_matching.py`): only moneyline back bets with two identified teams are included in the output. For SX Bet specifically, only markets with `type == 226` (Moneyline Including Overtime) are fetched. Exchange-specific concepts (lay depth, commissions, order book levels) are preserved in `metadata` for future use.
 
 **Parallel ingestion**: all configured providers are queried concurrently via `ThreadPoolExecutor`. Provider failures are captured as warnings and do not abort the run.
