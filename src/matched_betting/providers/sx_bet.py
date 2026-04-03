@@ -13,12 +13,14 @@ from matched_betting.providers.base import OddsProvider
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "ucl": "soccer",
 }
 
 # SX Bet league IDs (from GET /leagues)
 _LEAGUE_IDS: dict[str, int] = {
     "nba": 1,
     "mlb": 171,
+    "ucl": 30, 
 }
 
 # SX Bet stores percentageOdds as an integer representing probability * 10^20
@@ -26,6 +28,9 @@ _ODDS_SCALE = 10**20
 
 # Market type 226 = "Moneyline Including Overtime" (two-way winner market)
 _MONEYLINE_TYPE = 226
+
+# TODO: verify SX Bet market type for soccer match result (Yes/No per outcome)
+_SOCCER_RESULT_TYPE = 1
 
 
 class SxBetProvider(OddsProvider):
@@ -46,6 +51,9 @@ class SxBetProvider(OddsProvider):
         warnings: list[str] = []
         retrieved_at = utc_now_iso()
 
+        if "ucl" in leagues:
+            self._log_soccer_leagues()
+
         for league in leagues:
             league_id = _LEAGUE_IDS.get(league)
             if league_id is None:
@@ -53,7 +61,7 @@ class SxBetProvider(OddsProvider):
                 continue
 
             self.debug(f"{self.name}: fetching {league} markets (leagueId={league_id})")
-            markets = self._fetch_markets(league_id)
+            markets = self._fetch_markets(league_id, league)
             self.debug(f"{self.name}: found {len(markets)} {league} moneyline markets")
 
             if not markets:
@@ -66,25 +74,44 @@ class SxBetProvider(OddsProvider):
             best_odds_map = self._fetch_best_odds(market_hashes)
             self.debug(f"{self.name}: best odds returned for {len(best_odds_map)} markets")
 
-            for market_hash, market in hash_to_market.items():
-                best = best_odds_map.get(market_hash)
+            if league == "ucl":
+                ucl_records, ucl_warnings = self._process_ucl_markets(
+                    hash_to_market, best_odds_map, retrieved_at
+                )
+                records.extend(ucl_records)
+                warnings.extend(ucl_warnings)
+            else:
+                for market_hash, market in hash_to_market.items():
+                    best = best_odds_map.get(market_hash)
 
-                if best is None:
-                    self.debug(f"{self.name}: no best odds for market {market_hash}, skipping")
-                    continue
-                try:
-                    market_records = self._market_to_records(market, best, league, retrieved_at)
-                    records.extend(market_records)
-                    self.debug(
-                        f"{self.name}: market {market_hash} -> {len(market_records)} records"
-                    )
-                except Exception as exc:
-                    warnings.append(f"Skipped SX Bet market {market_hash}: {exc}")
-                    self.debug(f"{self.name}: skipped market {market_hash}: {exc}")
+                    if best is None:
+                        self.debug(f"{self.name}: no best odds for market {market_hash}, skipping")
+                        continue
+                    try:
+                        market_records = self._market_to_records(market, best, league, retrieved_at)
+                        records.extend(market_records)
+                        self.debug(
+                            f"{self.name}: market {market_hash} -> {len(market_records)} records"
+                        )
+                    except Exception as exc:
+                        warnings.append(f"Skipped SX Bet market {market_hash}: {exc}")
+                        self.debug(f"{self.name}: skipped market {market_hash}: {exc}")
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
-    def _fetch_markets(self, league_id: int) -> list[dict[str, Any]]:
+    def _log_soccer_leagues(self) -> None:
+        try:
+            raw = self.http_client.get_json(
+                f"{self.settings.base_url}/leagues/active",
+            )
+            leagues = raw.get("data", {}).get("leagues", []) if isinstance(raw.get("data"), dict) else []
+            self.debug(f"{self.name}: all SX Bet leagues ({len(leagues)} total):")
+            for l in leagues:
+                self.debug(f"{self.name}:   {l}")
+        except Exception as exc:
+            self.debug(f"{self.name}: could not fetch leagues list: {exc}")
+
+    def _fetch_markets(self, league_id: int, league: str) -> list[dict[str, Any]]:
         all_markets: list[dict[str, Any]] = []
         params: dict[str, str] = {"leagueId": str(league_id)}
 
@@ -102,10 +129,154 @@ class SxBetProvider(OddsProvider):
                 break
             params = {"leagueId": str(league_id), "paginationKey": next_key}
 
-        # Keep only type 226 markets (Moneyline Including Overtime)
-        moneyline = [m for m in all_markets if m.get("type") == _MONEYLINE_TYPE]
-        self.debug(f"{self.name}: {len(all_markets)} total markets, {len(moneyline)} moneyline (type {_MONEYLINE_TYPE})")
-        return moneyline
+        if league == "ucl":
+            type_counts: dict[Any, int] = {}
+            for m in all_markets:
+                t = m.get("type")
+                type_counts[t] = type_counts.get(t, 0) + 1
+            self.debug(f"{self.name}: UCL market types found across {len(all_markets)} markets:")
+            for t, count in sorted(type_counts.items(), key=lambda x: -x[1]):
+                sample = next((m.get("marketName") or m.get("label") or m.get("type") for m in all_markets if m.get("type") == t), "")
+                self.debug(f"{self.name}:   type={t}  count={count}  example={sample!r}")
+
+        market_type = _SOCCER_RESULT_TYPE if league == "ucl" else _MONEYLINE_TYPE
+        filtered = [
+            m for m in all_markets
+            if m.get("type") == market_type and m.get("leagueId") == league_id
+        ]
+        self.debug(f"{self.name}: {len(all_markets)} total markets, {len(filtered)} after filtering for type {market_type} and leagueId {league_id}")
+        return filtered
+
+    def _process_ucl_markets(
+        self,
+        hash_to_market: dict[str, dict[str, Any]],
+        best_odds_map: dict[str, dict[str, Any]],
+        retrieved_at: str,
+    ) -> tuple[list[OddsRecord], list[str]]:
+        """Handle UCL Yes/No binary markets (one market per outcome: home win, away win, draw).
+
+        SX Bet creates a separate market for each outcome rather than a single 3-way market.
+        teamOneName is the outcome (e.g. "Real Madrid", "Draw"), teamTwoName is "No" or similar.
+        Markets for the same fixture share a sportXEventId.
+        """
+        records: list[OddsRecord] = []
+        warnings: list[str] = []
+
+        # Debug: dump raw market structure so we can identify the correct grouping key
+        for market in list(hash_to_market.values())[:5]:
+            self.debug(
+                f"{self.name}: UCL market sample: sportXEventId={market.get('sportXEventId')!r}"
+                f" teamOne={market.get('teamOneName')!r} teamTwo={market.get('teamTwoName')!r}"
+                f" gameTime={market.get('gameTime')} outcomeOneName={market.get('outcomeOneName')!r}"
+            )
+
+        # Group markets by fixture. Use sportXEventId if present; fall back to
+        # gameTime + teamOneName + teamTwoName as a composite key for soccer markets
+        # where sportXEventId may be null.
+        event_groups: dict[str, list[dict[str, Any]]] = {}
+        for market in hash_to_market.values():
+            sport_event_id = market.get("sportXEventId")
+            if sport_event_id:
+                group_key = str(sport_event_id)
+            else:
+                group_key = f"{market.get('gameTime')}|{market.get('teamOneName')}|{market.get('teamTwoName')}"
+            event_groups.setdefault(group_key, []).append(market)
+
+        for event_id, event_markets in event_groups.items():
+            self.debug(f"{self.name}: UCL event {event_id} has {len(event_markets)} markets:")
+            for m in event_markets:
+                self.debug(
+                    f"{self.name}:   hash={m.get('marketHash')} teamOne={m.get('teamOneName')!r}"
+                    f" teamTwo={m.get('teamTwoName')!r} marketName={m.get('marketName')!r}"
+                    f" type={m.get('type')} label={m.get('label')!r}"
+                    f" outcomeOneName={m.get('outcomeOneName')!r} outcomeTwoName={m.get('outcomeTwoName')!r}"
+                )
+
+            _draw_variants = {"draw", "tie"}
+
+            # event_name: use teamOneName/teamTwoName from the first market — these should
+            # be the home/away team names, consistent across all outcome markets in the group.
+            first = event_markets[0]
+            home_name = first.get("teamOneName") or ""
+            away_name = first.get("teamTwoName") or ""
+            if home_name and away_name:
+                event_name = f"{home_name} vs {away_name}"
+            else:
+                event_name = first.get("marketName") or f"UCL event {event_id}"
+
+            game_time = first.get("gameTime")
+            event_start = _unix_to_iso(game_time) if game_time else None
+
+            for market in event_markets:
+                market_hash = market["marketHash"]
+                best = best_odds_map.get(market_hash)
+                if best is None:
+                    self.debug(f"{self.name}: no best odds for UCL market {market_hash}, skipping")
+                    continue
+
+                outcome_name = market.get("outcomeOneName", "")
+                if not outcome_name:
+                    warnings.append(f"Skipped SX Bet UCL market {market_hash}: missing outcome name")
+                    continue
+
+                if outcome_name.lower() in _draw_variants:
+                    outcome_name = "draw"
+
+                # Back "outcomeOne": taker prob = 1 - maker prob from outcomeTwo
+                # Lay  "outcomeOne": taker prob = 1 - maker prob from outcomeOne
+                outcome_one_data = best.get("outcomeOne", {})
+                outcome_two_data = best.get("outcomeTwo", {})
+
+                shared = dict(
+                    provider=self.name,
+                    sport="soccer",
+                    league="ucl",
+                    event_name=event_name,
+                    event_start=event_start,
+                    market_name="Match Result",
+                    market_type="three_way",
+                    selection_name=outcome_name,
+                    currency="USD",
+                    source_market_id=market_hash,
+                    source_event_id=str(event_id) if event_id != "unknown" else None,
+                    retrieved_at=retrieved_at,
+                    metadata={
+                        "market_hash": market_hash,
+                        "game_time": game_time,
+                        "league_id": market.get("leagueId"),
+                        "market_type": market.get("type"),
+                    },
+                )
+
+                for side, maker_data in (("back", outcome_two_data), ("lay", outcome_one_data)):
+                    raw_pct = maker_data.get("percentageOdds")
+                    if raw_pct is None:
+                        continue
+                    try:
+                        maker_prob = int(raw_pct) / _ODDS_SCALE
+                    except (TypeError, ValueError):
+                        continue
+
+                    if side == "back":
+                        # Taker backs Yes: their probability = 1 - No-maker probability
+                        prob = 1.0 - maker_prob
+                    else:
+                        # Lay odds = what the backer gets = 1 / Yes-maker probability.
+                        # The Yes-maker probability IS the implied probability of the outcome.
+                        prob = maker_prob
+
+                    if not (0.0 < prob < 1.0):
+                        continue
+                    records.append(
+                        OddsRecord(
+                            **shared,
+                            selection_side=side,
+                            decimal_odds=round(1.0 / prob, 6),
+                            implied_probability=round(prob, 6),
+                        )
+                    )
+
+        return records, warnings
 
     def _fetch_best_odds(self, market_hashes: list[str]) -> dict[str, dict[str, Any]]:
         """Fetch best available odds by market hash.

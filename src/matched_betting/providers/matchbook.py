@@ -33,6 +33,9 @@ class MatchbookProvider(OddsProvider):
         self._login()
         self.debug(f"{self.name}: login successful")
 
+        if "ucl" in leagues:
+            self._log_available_sports()
+
         records: list[OddsRecord] = []
         warnings: list[str] = []
 
@@ -76,6 +79,19 @@ class MatchbookProvider(OddsProvider):
             raise ProviderNotReadyError("Matchbook login succeeded without a session token.")
         return str(token)
 
+    def _log_available_sports(self) -> None:
+        try:
+            payload = self.http_client.get_json(
+                f"{self.settings.base_url}/edge/rest/sports",
+                headers={"Accept": "application/json"},
+            )
+            sports = payload.get("sports", [])
+            self.debug(f"{self.name}: available sports ({len(sports)} total):")
+            for sport in sports:
+                self.debug(f"{self.name}:   id={sport.get('id')}  name={sport.get('name')!r}  url-name={sport.get('url-name')!r}")
+        except Exception as exc:
+            self.debug(f"{self.name}: could not fetch sports list: {exc}")
+
     def _iter_events(self, *, sport_id: int) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         offset = 0
@@ -109,6 +125,9 @@ class MatchbookProvider(OddsProvider):
             # Sport ID 3 already scopes the API response to baseball events, so
             # trust it rather than relying on meta-tag values which vary by market.
             return True
+        if league == "ucl":
+            # TODO: verify the exact url-name Matchbook uses for the Champions League
+            return any(tag.get("url-name") in ("champions-league", "ucl", "uefa-champions-league") for tag in meta_tags)
         return False
 
     def _event_to_records(
@@ -119,18 +138,22 @@ class MatchbookProvider(OddsProvider):
     ) -> list[OddsRecord]:
         records: list[OddsRecord] = []
         open_markets = [market for market in event.get("markets", []) if market.get("status") == "open"]
+        moneyline_markets = [m for m in open_markets if _is_moneyline_market(m)]
         self.debug(
-            f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets"
+            f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
+            f"{len(moneyline_markets)} moneyline after filtering"
         )
-        for market_index, market in enumerate(open_markets, start=1):
+        for market_index, market in enumerate(moneyline_markets, start=1):
             self.debug(
                 f"{self.name}: event_id={event.get('id')} market {market_index}/{len(open_markets)} "
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type = str(market.get("market-type") or market.get("type") or "unknown")
+            market_type_raw = str(market.get("market-type") or market.get("type") or "unknown")
+            market_type = _MARKET_TYPE_NORMALISE.get(market_type_raw.lower(), market_type_raw)
             for runner in market.get("runners", []):
-                for price_index, price in enumerate(runner.get("prices", [])):
+                best_by_side = _best_prices_per_side(runner.get("prices", []))
+                for side, price in best_by_side.items():
                     decimal_odds = price.get("decimal-odds") or price.get("odds")
                     if decimal_odds is None:
                         continue
@@ -144,7 +167,7 @@ class MatchbookProvider(OddsProvider):
                             market_name=market_name,
                             market_type=market_type,
                             selection_name=str(runner.get("name") or "Unknown selection"),
-                            selection_side=str(price.get("side") or "back"),
+                            selection_side=side,
                             decimal_odds=float(decimal_odds),
                             implied_probability=round(1 / float(decimal_odds), 6),
                             currency=str(price.get("currency") or "GBP"),
@@ -153,7 +176,6 @@ class MatchbookProvider(OddsProvider):
                             retrieved_at=retrieved_at,
                             metadata={
                                 "market_status": market.get("status"),
-                                "price_level": price_index,
                                 "available_amount": price.get("available-amount"),
                                 "handicap": runner.get("handicap", market.get("handicap")),
                                 "exchange_type": price.get("exchange-type"),
@@ -164,12 +186,67 @@ class MatchbookProvider(OddsProvider):
         return records
 
 
+_MONEYLINE_MARKET_NAMES = {
+    "match odds",      # Soccer / UCL
+    "match winner",    # Alternative soccer naming
+    "money line",
+    "moneyline",
+    "winner (incl. overtime)",
+    "winner (including overtime)",
+}
+
+
+def _best_prices_per_side(prices: list[dict]) -> dict[str, dict]:
+    """Return the single best price per side from a Matchbook runner's price ladder.
+
+    For back: highest decimal odds (best for the backer).
+    For lay:  lowest decimal odds (cheapest lay, best for the backer on the other side).
+    """
+    best: dict[str, dict] = {}
+    for price in prices:
+        side = str(price.get("side") or "back")
+        raw_odds = price.get("decimal-odds") or price.get("odds")
+        if raw_odds is None:
+            continue
+        try:
+            odds = float(raw_odds)
+        except (TypeError, ValueError):
+            continue
+        current = best.get(side)
+        if current is None:
+            best[side] = price
+        else:
+            current_odds = float(current.get("decimal-odds") or current.get("odds") or 0)
+            if side == "back" and odds > current_odds:
+                best[side] = price
+            elif side == "lay" and odds < current_odds:
+                best[side] = price
+    return best
+
+
+_MARKET_TYPE_NORMALISE = {
+    "one_x_two": "three_way",
+    "win_draw_win": "three_way",
+    "winner_3_way": "three_way",
+    "match_odds": "three_way",
+    "moneyline": "two_way",
+    "winner_2_way": "two_way",
+}
+
+
+def _is_moneyline_market(market: dict) -> bool:
+    name = str(market.get("name") or "").lower().strip()
+    return name in _MONEYLINE_MARKET_NAMES
+
+
 LEAGUE_SPORT_IDS = {
     "nba": 4,
     "mlb": 3,
+    "ucl": 15,  # TODO: verify Matchbook sport ID for soccer
 }
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "ucl": "soccer",
 }

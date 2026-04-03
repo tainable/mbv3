@@ -90,14 +90,14 @@ def match_records_to_canonical_bets(
 
 
 def is_game_win_loss_record(record: OddsRecord) -> bool:
-    identity = infer_event_identity(record)
-    if not identity.home_team or not identity.away_team:
-        return False
     if not _is_moneyline_market(record.market_name.lower(), record.market_type.lower()):
         return False
     selection = normalize_team_name(record.selection_name, record.league)
     if selection in ("draw", "tie"):
         return True
+    identity = infer_event_identity(record)
+    if not identity.home_team or not identity.away_team:
+        return False
     return selection in {identity.home_team, identity.away_team}
 
 
@@ -170,8 +170,11 @@ def infer_bet_identity(
 def _is_moneyline_market(market_name_lower: str, market_type: str) -> bool:
     return (
         "moneyline" in market_name_lower
+        or "match odds" in market_name_lower
+        or "match winner" in market_name_lower
+        or "full-time result" in market_name_lower
         or market_name_lower.startswith("winner")
-        or market_type in {"money_line", "winner_2_way", "two_way", "three_way"}
+        or market_type in {"money_line", "winner_2_way", "winner_3_way", "one_x_two", "two_way", "three_way"}
     )
 
 

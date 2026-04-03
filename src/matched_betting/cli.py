@@ -8,9 +8,10 @@ from typing import Any
 
 from matched_betting.config import load_settings
 from matched_betting.debug import noop_debug, stderr_debug
-from matched_betting.event_matching import match_records_to_canonical_events
+from matched_betting.event_matching import infer_event_identity, match_records_to_canonical_events
 from matched_betting.http import HttpClient
-from matched_betting.market_matching import is_game_win_loss_record
+from matched_betting.market_matching import _is_moneyline_market, is_game_win_loss_record
+from matched_betting.event_matching import normalize_team_name
 from matched_betting.models import OddsRecord, utc_now_iso
 from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
@@ -112,6 +113,17 @@ def main(argv: list[str] | None = None) -> int:
         )
     )
     original_record_count = len(records)
+    for record in records:
+        if not is_game_win_loss_record(record):
+            identity = infer_event_identity(record)
+            selection = normalize_team_name(record.selection_name, record.league)
+            passed_moneyline = _is_moneyline_market(record.market_name.lower(), record.market_type.lower())
+            debug(
+                f"  DROP provider={record.provider} event={record.event_name!r}"
+                f" selection={record.selection_name!r} -> normalized={selection!r}"
+                f" home={identity.home_team!r} away={identity.away_team!r}"
+                f" moneyline_ok={passed_moneyline}"
+            )
     records = [record for record in records if is_game_win_loss_record(record)]
     debug(
         f"filtered to game win/loss back bets: kept {len(records)} of {original_record_count} records"
@@ -216,8 +228,8 @@ def _build_aggregated_games_payload(
     payload: list[dict[str, Any]] = []
     for canonical_event_id, indices in grouped_indices.items():
         event_group = events_by_id[canonical_event_id]
-        team1 = _pretty_team(event_group.away_team)
-        team2 = _pretty_team(event_group.home_team)
+        team1 = _pretty_team(event_group.home_team)
+        team2 = _pretty_team(event_group.away_team)
         # Derive market_type: prefer three_way if any record has it
         market_types = {records[i].market_type for i in indices}
         if "three_way" in market_types:
@@ -253,8 +265,11 @@ def _build_aggregated_games_payload(
             "smarkets_team2_back_odds": None,
             "smarkets_team2_lay_odds": None,
             "sx_bet_team1_back_odds": None,
+            "sx_bet_team1_lay_odds": None,
             "sx_bet_draw_back_odds": None,
+            "sx_bet_draw_lay_odds": None,
             "sx_bet_team2_back_odds": None,
+            "sx_bet_team2_lay_odds": None,
         }
 
         best_by_provider_team: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
@@ -262,9 +277,9 @@ def _build_aggregated_games_payload(
             record = records[index]
             normalized_selection = _normalize_team_for_output(record.selection_name, record.league)
             team_slot = None
-            if event_group.away_team and normalized_selection == event_group.away_team:
+            if event_group.home_team and normalized_selection == event_group.home_team:
                 team_slot = "team1"
-            elif event_group.home_team and normalized_selection == event_group.home_team:
+            elif event_group.away_team and normalized_selection == event_group.away_team:
                 team_slot = "team2"
             elif normalized_selection in ("draw", "tie"):
                 team_slot = "draw"

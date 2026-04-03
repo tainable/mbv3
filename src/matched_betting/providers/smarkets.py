@@ -134,42 +134,57 @@ class SmarketsProvider(OddsProvider):
                 f"{self.name}: market_id={market['id']} -> {len(contract_map)} contracts, {len(quotes_payload)} quote books"
             )
 
+            quoted_ids = {str(k) for k in quotes_payload.keys()}
+            for cid, contract in contract_map.items():
+                if cid not in quoted_ids:
+                    self.debug(
+                        f"{self.name}: contract {cid} ({contract.get('name')!r}) has no quote entry — skipped"
+                    )
+
             for contract_id, quote in quotes_payload.items():
                 contract = contract_map.get(str(contract_id))
                 if not contract:
                     continue
 
                 for side, ladder_key in (("back", "offers"), ("lay", "bids")):
-                    for level_index, level in enumerate(quote.get(ladder_key, [])):
-                        probability = _smarkets_probability(level["price"])
-                        records.append(
-                            OddsRecord(
-                                provider=self.name,
-                                sport=LEAGUE_TO_SPORT[league],
-                                league=league,
-                                event_name=str(event.get("name") or "Unknown event"),
-                                event_start=event.get("start_datetime"),
-                                market_name=str(market.get("name") or "Unknown market"),
-                                market_type=str(market.get("market_type", {}).get("name") or "unknown"),
-                                selection_name=str(contract.get("name") or "Unknown selection"),
-                                selection_side=side,
-                                decimal_odds=decimal_from_probability(probability),
-                                implied_probability=round(probability, 6),
-                                currency="GBP",
-                                source_market_id=str(market.get("id")),
-                                source_event_id=str(event.get("id")),
-                                retrieved_at=retrieved_at,
-                                metadata={
-                                    "contract_id": str(contract_id),
-                                    "price_level": level_index,
-                                    "raw_price": level.get("price"),
-                                    "raw_quantity": level.get("quantity"),
-                                    "contract_type": contract.get("contract_type", {}).get("name"),
-                                    "market_category": market.get("category"),
-                                    "market_param": market.get("market_type", {}).get("param"),
-                                },
-                            )
+                    levels = quote.get(ladder_key, [])
+                    self.debug(
+                        f"{self.name}: contract={contract.get('name')!r} side={side}"
+                        f" levels={len(levels)} {'-> taking best' if levels else '-> skipped (no liquidity)'}"
+                    )
+                    if not levels:
+                        continue
+                    # Take only the best price: first offer (highest decimal odds) for back,
+                    # first bid (lowest decimal odds) for lay.
+                    best = levels[0]
+                    probability = _smarkets_probability(best["price"])
+                    records.append(
+                        OddsRecord(
+                            provider=self.name,
+                            sport=LEAGUE_TO_SPORT[league],
+                            league=league,
+                            event_name=str(event.get("name") or "Unknown event"),
+                            event_start=event.get("start_datetime"),
+                            market_name=str(market.get("name") or "Unknown market"),
+                            market_type=_normalise_market_type(str(market.get("market_type", {}).get("name") or "unknown")),
+                            selection_name=str(contract.get("name") or "Unknown selection"),
+                            selection_side=side,
+                            decimal_odds=decimal_from_probability(probability),
+                            implied_probability=round(probability, 6),
+                            currency="GBP",
+                            source_market_id=str(market.get("id")),
+                            source_event_id=str(event.get("id")),
+                            retrieved_at=retrieved_at,
+                            metadata={
+                                "contract_id": str(contract_id),
+                                "raw_price": best.get("price"),
+                                "raw_quantity": best.get("quantity"),
+                                "contract_type": contract.get("contract_type", {}).get("name"),
+                                "market_category": market.get("category"),
+                                "market_param": market.get("market_type", {}).get("param"),
+                            },
                         )
+                    )
 
         return records, warnings
 
@@ -213,12 +228,31 @@ class SmarketsProvider(OddsProvider):
 LEAGUE_ROOT_EVENT_IDS = {
     "nba": 19694311,
     "mlb": 13240353,
+    "ucl": 25363462,
 }
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "ucl": "soccer",
 }
+
+
+_MARKET_TYPE_NORMALISE = {
+    "winner_3_way": "three_way",
+    "one_x_two": "three_way",
+    "win_draw_win": "three_way",
+    "full time result": "three_way",
+    "match winner": "three_way",
+    "winner_2_way": "two_way",
+    "moneyline": "two_way",
+    "winner (incl. overtime)": "two_way",
+    "winner (including overtime)": "two_way",
+}
+
+
+def _normalise_market_type(raw: str) -> str:
+    return _MARKET_TYPE_NORMALISE.get(raw.lower(), raw)
 
 
 def _smarkets_probability(raw_price: int | float) -> float:
@@ -228,8 +262,9 @@ def _smarkets_probability(raw_price: int | float) -> float:
 _MONEYLINE_MARKET_NAMES = {
     "winner (incl. overtime)",
     "winner (including overtime)",
-    "Match winner",
-    "match winner"
+    "match winner",
+    "winner",  # Smarkets UCL match winner market
+    "full-time result"
 }
 
 

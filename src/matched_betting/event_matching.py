@@ -60,7 +60,41 @@ TEAM_ALIASES = {
         "wizards": "washington wizards",
     },
     "ucl": {
-        # TODO: add UCL team name aliases (e.g. "man city": "manchester city")
+        # Bayern Munich — Matchbook encodes ü as space giving "m nchen"
+        "bayern": "bayern munich",
+        "fc bayern munich": "bayern munich",
+        "fc bayern m nchen": "bayern munich",
+        "fc bayern munchen": "bayern munich",
+        # PSG
+        "psg": "paris saint germain",
+        "paris saint-germain": "paris saint germain",
+        "paris saint germain fc": "paris saint germain",
+        # Sporting CP
+        "sporting": "sporting clube de portugal cp",
+        "sporting cp": "sporting clube de portugal cp",
+        "sporting clube de portugal": "sporting clube de portugal cp",
+        # Atletico Madrid — é strips to space giving "atl tico"
+        "atletico madrid": "atletico de madrid",
+        "atletico": "atletico de madrid",
+        "atl tico de madrid": "atletico de madrid",
+        "atl tico madrid": "atletico de madrid",
+        "club atl tico de madrid": "atletico de madrid",
+        "club atletico de madrid": "atletico de madrid",
+        # Barcelona
+        "barca": "fc barcelona",
+        "barcelona": "fc barcelona",
+        "barcelona fc": "fc barcelona",
+        # Arsenal
+        "arsenal fc": "arsenal",
+        # Real Madrid
+        "real madrid cf": "real madrid",
+        # Liverpool
+        "liverpool fc": "liverpool",
+        # Other common UCL teams
+        "man city": "manchester city",
+        "inter": "inter milan",
+        "ac milan": "ac milan",
+        "milan": "ac milan",
     },
     "mlb": {
         "d backs": "arizona diamondbacks",
@@ -190,10 +224,9 @@ def _parse_teams(event_name: str, league: str) -> tuple[str | None, str | None, 
                 away = normalize_team_name(left, league)
                 home = normalize_team_name(right, league)
                 return home, away, True
-            team_one = normalize_team_name(left, league)
-            team_two = normalize_team_name(right, league)
-            ordered_pair = sorted([team_one, team_two])
-            return ordered_pair[0], ordered_pair[1], False
+            home = normalize_team_name(left, league)
+            away = normalize_team_name(right, league)
+            return home, away, False
     return None, None, False
 
 

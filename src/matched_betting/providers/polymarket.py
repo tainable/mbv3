@@ -55,37 +55,42 @@ class PolymarketProvider(OddsProvider):
             if any(seg in half_segments for seg in split_slug):
                 continue
 
+            _nba_non_moneyline = {"spread", "total", "over", "under", "cover", "ats"}
             if "nba" in leagues and "nba" in split_slug[0]:
-                if split_slug[1] in ['atl','phx','lal','ind','chi','phi',
-                'okc','bos','mia','cle','sas','mem','was','uta',
-                'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
+                if not any(seg in _nba_non_moneyline for seg in split_slug):
+                    if split_slug[1] in ['atl','phx','lal','ind','chi','phi',
+                    'okc','bos','mia','cle','sas','mem','was','uta',
+                    'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
 
-                    if split_slug[2] in ['atl','phx','lal','ind','chi','phi',
-                'okc','bos','mia','cle','sas','mem','was','uta',
-                'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
-                        league = 'nba'
-                        candidate_markets.append((market, league))
+                        if split_slug[2] in ['atl','phx','lal','ind','chi','phi',
+                    'okc','bos','mia','cle','sas','mem','was','uta',
+                    'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
+                            league = 'nba'
+                            candidate_markets.append((market, league))
 
+            _mlb_non_moneyline = {"spread", "total", "over", "under", "runline", "run-line"}
             if "mlb" in leagues and "mlb" in split_slug[0]:
-                if split_slug[1] in ['cws','mil','wsh','chc','min','bal',
-                'cin','bos','laa','hou','det','sd','tex','phi',
-                'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
+                if not any(seg in _mlb_non_moneyline for seg in split_slug):
+                    if split_slug[1] in ['cws','mil','wsh','chc','min','bal',
+                    'cin','bos','laa','hou','det','sd','tex','phi',
+                    'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
 
-                    if split_slug[2] in ['cws','mil','wsh','chc','min','bal',
-                'cin','bos','laa','hou','det','sd','tex','phi',
-                'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
-                        league = 'mlb'
-                        candidate_markets.append((market, league))
+                        if split_slug[2] in ['cws','mil','wsh','chc','min','bal',
+                    'cin','bos','laa','hou','det','sd','tex','phi',
+                    'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
+                            league = 'mlb'
+                            candidate_markets.append((market, league))
 
             ucl_teams = team_index.get("ucl", [])
             if "ucl" in leagues and ucl_teams:
-                slug = market.get("slug", "")
+
                 # Match head-to-head UCL slugs: ucl-{team1}-{team2}-{date}
-                # Markets may not exist until close to match day (QF first legs April 8-9)
+                # Markets may not exist until close to match day
                 if split_slug[0] == "ucl" and len(split_slug) >= 3:
                     if split_slug[1] in ucl_teams and split_slug[2] in ucl_teams:
                         if split_slug[-1] in ucl_teams or split_slug[-1] == "draw":
                             candidate_markets.append((market, "ucl"))
+
         
         self.debug(f"{self.name}: found {len(candidate_markets)} candidate markets after league filtering")
 
@@ -105,9 +110,9 @@ class PolymarketProvider(OddsProvider):
                 
             except Exception as exc:
                 market_id = str(market.get("id", "unknown"))
-                warnings.append(f"Skipped Polymarket market {market_id}: {exc}")
-                self.debug(f"{self.name}: skipped market {market_id}: {exc}")
-
+                slug = str(market.get("slug", "unknown"))
+                warnings.append(f"Skipped Polymarket market {market_id} ({slug}): {exc}")
+                self.debug(f"{self.name}: skipped market {market_id} ({slug}): {exc}")
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
     def _load_team_index(self, leagues: list[str]) -> dict[str, set[str]]:
@@ -212,14 +217,14 @@ class PolymarketProvider(OddsProvider):
             lay_probs = [None] * 3
         elif len(outcomes) == 2:
             try:
-                ask = float(market.get("bestAsk"))
+                p0 = float(market.get("bestAsk"))
             except (TypeError, ValueError):
-                ask = None
+                p0 = None
             try:
-                bid_comp = 1-float(market.get("bestBid"))
+                p1 = 1 - float(market.get("bestBid"))
             except (TypeError, ValueError):
-                bid_comp = None
-            back_probs = [ask, bid_comp]
+                p1 = None
+            back_probs = [p0, p1]
             lay_probs = [None, None]
         else:
             raise ValueError(f"unexpected outcome count: {len(outcomes)}")
@@ -241,13 +246,13 @@ class PolymarketProvider(OddsProvider):
                 raise ValueError("UCL Yes/No market has no 'Yes' outcome")
             outcomes = [group_title]
             try:
-                back_probs = [float(market.get("bestBid"))]
+                back_probs = [float(market.get("bestAsk"))]
             except (TypeError, ValueError):
-                raise ValueError("UCL Yes/No market missing bestBid for back price")
+                raise ValueError("UCL Yes/No market missing bestAsk for back price")
             try:
-                lay_probs = [1 - float(market.get("bestAsk"))]
+                lay_probs = [float(market.get("bestBid"))]
             except (TypeError, ValueError):
-                raise ValueError("UCL Yes/No market missing bestAsk for lay price")
+                raise ValueError("UCL Yes/No market missing bestBid for lay price")
 
         if league == "ucl":
             # Build event name from the two team outcomes (skip draw/no-draw outcomes)
@@ -283,9 +288,10 @@ class PolymarketProvider(OddsProvider):
             market_name = market.get("groupItemTitle") or market.get("question") or "Unknown market"
 
         # For single-outcome Yes/No remapped markets, infer_market_type would return "multi_way"
-        # (only 1 outcome left). Force two_way so the moneyline filter accepts these records.
+        # (only 1 outcome left). UCL markets are three-way (home/draw/away); all other
+        # single-outcome remapped markets fall back to two_way for the moneyline filter.
         if len(outcomes) == 1:
-            market_type = "two_way"
+            market_type = "three_way" if league == "ucl" else "two_way"
         else:
             market_type = self._infer_market_type(
                 outcomes,
@@ -315,7 +321,11 @@ class PolymarketProvider(OddsProvider):
         )
 
         records: list[OddsRecord] = []
+
         for i, (outcome, back_prob) in enumerate(zip(outcomes, back_probs)):
+
+            if "draw" in outcome.lower():
+                outcome = "draw"
             try:
                 iprob = round(back_prob, 6)
             except (TypeError, ValueError):
@@ -331,22 +341,21 @@ class PolymarketProvider(OddsProvider):
                 )
             )
 
-            # Lay record: buying "No" on Polymarket is equivalent to a lay bet.
-            # Use independent lay_probs when available (e.g. Yes/No markets where
-            # back=bestBid_Yes and lay=1-bestAsk_Yes to properly account for spread).
+            # Lay record: only emit when we have an explicit lay price (e.g. UCL Yes/No
+            # markets where bestBid gives the layer's implied probability).
+            # For two-way markets (NBA/MLB), "laying" one side is just backing the other —
+            # there is no independent exchange lay, so we skip it.
             explicit_lay = lay_probs[i] if lay_probs and i < len(lay_probs) else None
-            lay_prob = explicit_lay if explicit_lay is not None else 1 - back_prob
-            if 0 < lay_prob < 1:
+            if explicit_lay is not None and 0 < explicit_lay < 1:
                 records.append(
                     OddsRecord(
                         **shared,
                         selection_name=str(outcome),
                         selection_side="lay",
-                        decimal_odds=decimal_from_probability(lay_prob),
-                        implied_probability=round(lay_prob, 6),
+                        decimal_odds=decimal_from_probability(explicit_lay),
+                        implied_probability=round(explicit_lay, 6),
                     )
                 )
-
         return records
 
     @staticmethod
