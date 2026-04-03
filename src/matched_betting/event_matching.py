@@ -59,6 +59,9 @@ TEAM_ALIASES = {
         "jazz": "utah jazz",
         "wizards": "washington wizards",
     },
+    "ucl": {
+        # TODO: add UCL team name aliases (e.g. "man city": "manchester city")
+    },
     "mlb": {
         "d backs": "arizona diamondbacks",
         "diamondbacks": "arizona diamondbacks",

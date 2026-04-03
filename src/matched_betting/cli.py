@@ -17,15 +17,17 @@ from matched_betting.providers.registry import build_provider_registry
 
 
 DEFAULT_LEAGUES = ["nba", "mlb"]
+ALL_LEAGUES = ["nba", "mlb", "ucl"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet"]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Retrieve and normalize odds for matched betting.")
-    parser.add_argument("--leagues", nargs="+", default=DEFAULT_LEAGUES, choices=DEFAULT_LEAGUES)
+    parser.add_argument("--leagues", nargs="+", default=DEFAULT_LEAGUES, choices=ALL_LEAGUES)
     league_shortcuts = parser.add_mutually_exclusive_group()
     league_shortcuts.add_argument("--nba", action="store_true", help="Shortcut for --leagues nba")
     league_shortcuts.add_argument("--mlb", action="store_true", help="Shortcut for --leagues mlb")
+    league_shortcuts.add_argument("--ucl", action="store_true", help="Shortcut for --leagues ucl")
     parser.add_argument(
         "--providers",
         nargs="+",
@@ -196,6 +198,8 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
         return ["nba"]
     if args.mlb:
         return ["mlb"]
+    if args.ucl:
+        return ["ucl"]
     return list(args.leagues)
 
 
@@ -214,23 +218,42 @@ def _build_aggregated_games_payload(
         event_group = events_by_id[canonical_event_id]
         team1 = _pretty_team(event_group.away_team)
         team2 = _pretty_team(event_group.home_team)
+        # Derive market_type: prefer three_way if any record has it
+        market_types = {records[i].market_type for i in indices}
+        if "three_way" in market_types:
+            market_type = "three_way"
+        elif "two_way" in market_types:
+            market_type = "two_way"
+        else:
+            market_type = next(iter(market_types), None)
+
         entry: dict[str, Any] = {
             "team1": team1,
             "team2": team2,
             "date_time": event_group.event_start,
             "league": event_group.league,
             "sport": event_group.sport,
+            "market_type": market_type,
             "polymarket_team1_back_odds": None,
+            "polymarket_team1_lay_odds": None,
+            "polymarket_draw_back_odds": None,
+            "polymarket_draw_lay_odds": None,
             "polymarket_team2_back_odds": None,
+            "polymarket_team2_lay_odds": None,
             "matchbook_team1_back_odds": None,
-            "matchbook_team2_back_odds": None,
             "matchbook_team1_lay_odds": None,
+            "matchbook_draw_back_odds": None,
+            "matchbook_draw_lay_odds": None,
+            "matchbook_team2_back_odds": None,
             "matchbook_team2_lay_odds": None,
             "smarkets_team1_back_odds": None,
-            "smarkets_team2_back_odds": None,
             "smarkets_team1_lay_odds": None,
+            "smarkets_draw_back_odds": None,
+            "smarkets_draw_lay_odds": None,
+            "smarkets_team2_back_odds": None,
             "smarkets_team2_lay_odds": None,
             "sx_bet_team1_back_odds": None,
+            "sx_bet_draw_back_odds": None,
             "sx_bet_team2_back_odds": None,
         }
 
@@ -243,6 +266,8 @@ def _build_aggregated_games_payload(
                 team_slot = "team1"
             elif event_group.home_team and normalized_selection == event_group.home_team:
                 team_slot = "team2"
+            elif normalized_selection in ("draw", "tie"):
+                team_slot = "draw"
             if team_slot is None:
                 continue
             side = record.selection_side.lower()
@@ -261,13 +286,15 @@ def _build_aggregated_games_payload(
                 best_by_provider_team[key] = (index, record)
 
         for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet"):
-            for team_slot in ("team1", "team2"):
+            for team_slot in ("team1", "draw", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get((provider_name, team_slot, side))
                     if chosen is None:
                         continue
                     _, record = chosen
-                    entry[f"{provider_name}_{team_slot}_{side}_odds"] = record.decimal_odds
+                    key = f"{provider_name}_{team_slot}_{side}_odds"
+                    if key in entry:
+                        entry[key] = record.decimal_odds
 
         payload.append(entry)
 
