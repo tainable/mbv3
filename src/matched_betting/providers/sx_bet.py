@@ -74,6 +74,9 @@ class SxBetProvider(OddsProvider):
             best_odds_map = self._fetch_best_odds(market_hashes)
             self.debug(f"{self.name}: best odds returned for {len(best_odds_map)} markets")
 
+            self.debug(f"{self.name}: fetching order liquidity for {len(market_hashes)} markets")
+            avail_map = self._fetch_available(market_hashes)
+
             if league == "ucl":
                 ucl_records, ucl_warnings = self._process_ucl_markets(
                     hash_to_market, best_odds_map, retrieved_at
@@ -88,7 +91,10 @@ class SxBetProvider(OddsProvider):
                         self.debug(f"{self.name}: no best odds for market {market_hash}, skipping")
                         continue
                     try:
-                        market_records = self._market_to_records(market, best, league, retrieved_at)
+                        market_records = self._market_to_records(
+                            market, best, league, retrieved_at,
+                            avail=avail_map.get(market_hash),
+                        )
                         records.extend(market_records)
                         self.debug(
                             f"{self.name}: market {market_hash} -> {len(market_records)} records"
@@ -278,6 +284,41 @@ class SxBetProvider(OddsProvider):
 
         return records, warnings
 
+    def _fetch_available(self, market_hashes: list[str]) -> dict[str, dict[str, float]]:
+        """Return {marketHash: {outcome_one_avail_usd, outcome_two_avail_usd}} taker stakes."""
+        try:
+            raw = self.http_client.get_json(
+                f"{self.settings.base_url}/orders",
+                params={
+                    "marketHashes": ",".join(market_hashes),
+                    "baseToken": self.settings.base_token,
+                },
+            )
+            orders = raw.get("data", [])
+        except Exception:
+            return {}
+
+        result: dict[str, dict[str, float]] = {}
+        for order in orders:
+            h = order.get("marketHash")
+            if not h:
+                continue
+            try:
+                maker_avail = (int(order["totalBetSize"]) - int(order["fillAmount"])) / 1e6
+                pct = int(order["percentageOdds"]) / 1e20
+                if pct <= 0 or pct >= 1:
+                    continue
+                taker_avail = maker_avail * (1 - pct) / pct
+                entry = result.setdefault(h, {"outcome_one_avail_usd": 0.0, "outcome_two_avail_usd": 0.0})
+                # isMakerBettingOutcomeOne=False → taker backs outcomeOne
+                if not order.get("isMakerBettingOutcomeOne"):
+                    entry["outcome_one_avail_usd"] += taker_avail
+                else:
+                    entry["outcome_two_avail_usd"] += taker_avail
+            except Exception:
+                continue
+        return result
+
     def _fetch_best_odds(self, market_hashes: list[str]) -> dict[str, dict[str, Any]]:
         """Fetch best available odds by market hash.
 
@@ -302,6 +343,7 @@ class SxBetProvider(OddsProvider):
         best: dict[str, Any],
         league: str,
         retrieved_at: str,
+        avail: dict[str, float] | None = None,
     ) -> list[OddsRecord]:
         market_hash = market["marketHash"]
         team_one: str = market["teamOneName"]
@@ -326,8 +368,13 @@ class SxBetProvider(OddsProvider):
             (team_two, outcome_one_data),  # team two's taker odds come from outcomeOne maker orders
         ]
 
+        # avail keys: outcome_one_avail_usd (taker backing outcomeOne = team_one)
+        #             outcome_two_avail_usd (taker backing outcomeTwo = team_two)
+        avail_one = avail.get("outcome_one_avail_usd") if avail else None
+        avail_two = avail.get("outcome_two_avail_usd") if avail else None
+
         records: list[OddsRecord] = []
-        for team_name, maker_data in outcomes:
+        for i, (team_name, maker_data) in enumerate(outcomes):
             raw_pct = maker_data.get("percentageOdds")
             if raw_pct is None:
                 continue
@@ -341,6 +388,7 @@ class SxBetProvider(OddsProvider):
                 continue
 
             decimal_odds = 1.0 / taker_prob
+            avail_usd = avail_one if i == 0 else avail_two
             records.append(
                 OddsRecord(
                     provider=self.name,
@@ -363,6 +411,7 @@ class SxBetProvider(OddsProvider):
                         "game_time": game_time,
                         "league_id": market.get("leagueId"),
                         "market_type": _MONEYLINE_TYPE,
+                        "available_usd": round(avail_usd, 2) if avail_usd is not None else None,
                     },
                 )
             )

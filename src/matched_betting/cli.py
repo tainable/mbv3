@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 import json
 from pathlib import Path
 from typing import Any
@@ -17,7 +17,7 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "mlb"]
+DEFAULT_LEAGUES = ["nba", "mlb", "ucl"]
 ALL_LEAGUES = ["nba", "mlb", "ucl"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet"]
 
@@ -39,6 +39,49 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", type=Path, help="Optional output path. Defaults to MATCHED_BETTING_OUTPUT_PATH.")
     parser.add_argument("--debug", action="store_true", help="Print progress messages to stderr.")
     return parser
+
+
+def fetch_aggregated_games(
+    leagues: list[str],
+    providers: list[str],
+    project_root: Path | None = None,
+    per_provider_timeout: float = 90.0,
+) -> list[dict[str, Any]]:
+    """Fetch fresh odds from providers and return the aggregated games list.
+
+    Each provider is given up to ``per_provider_timeout`` seconds before being
+    skipped so a single slow provider cannot block the refresh indefinitely.
+    """
+    if project_root is None:
+        project_root = Path(__file__).resolve().parents[2]
+    settings = load_settings(project_root)
+    http_client = HttpClient()
+    provider_registry = build_provider_registry(settings, http_client, noop_debug)
+
+    records: list[OddsRecord] = []
+
+    executor = ThreadPoolExecutor(max_workers=len(providers))
+    try:
+        future_to_provider: dict[Future, str] = {
+            executor.submit(provider_registry[name].fetch_odds, leagues): name
+            for name in providers
+            if name in provider_registry
+        }
+        try:
+            for future in as_completed(future_to_provider, timeout=per_provider_timeout):
+                try:
+                    payload = future.result()
+                    records.extend(payload.records)
+                except Exception:
+                    pass
+        except FuturesTimeoutError:
+            pass  # timed out — use whatever records arrived so far
+    finally:
+        executor.shutdown(wait=False)  # don't block on slow provider threads
+
+    records = [r for r in records if is_game_win_loss_record(r)]
+    canonical_assignment, canonical_events = match_records_to_canonical_events(records)
+    return _build_aggregated_games_payload(records, canonical_assignment, canonical_events)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -199,10 +242,56 @@ def main(argv: list[str] | None = None) -> int:
         + "\n",
         encoding="utf-8",
     )
+    market_index_output_path = output_path.with_name(f"{output_path.stem}_market_index.json")
+    debug(f"writing market index to {market_index_output_path}")
+    market_index_output_path.write_text(
+        json.dumps(
+            _build_market_index(aggregated_games_payload),
+            indent=2,
+            sort_keys=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
     rendered = json.dumps(output_payload, indent=2, sort_keys=False)
     print(rendered)
     debug(f"finished run record_count={len(records)} warning_count={len(warnings)}")
     return 0
+
+
+def _build_market_index(aggregated_games: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build a league → provider → [market IDs] index from the aggregated games payload."""
+    index: dict[str, dict[str, list[str]]] = {}
+    provider_fields = [
+        ("polymarket", "polymarket_market_id"),
+        ("matchbook",  "matchbook_event_id"),
+        ("smarkets",   "smarkets_market_id"),
+        ("sx_bet",     "sx_bet_market_hash"),
+    ]
+    for game in aggregated_games:
+        league = (game.get("league") or "other").lower()
+        if league not in index:
+            index[league] = {}
+        for provider, field in provider_fields:
+            market_id = game.get(field)
+            if not market_id:
+                continue
+            index[league].setdefault(provider, [])
+            if market_id not in index[league][provider]:
+                index[league][provider].append(market_id)
+
+    # Sort leagues predictably: known leagues first, then alphabetical
+    known_order = ["nba", "mlb", "ucl"]
+    sorted_index = {}
+    for league in known_order:
+        if league in index:
+            sorted_index[league] = index[league]
+    for league in sorted(index):
+        if league not in sorted_index:
+            sorted_index[league] = index[league]
+
+    return {"market_index": sorted_index}
 
 
 def _resolve_leagues(args: argparse.Namespace) -> list[str]:
@@ -213,6 +302,21 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
     if args.ucl:
         return ["ucl"]
     return list(args.leagues)
+
+
+def _extract_available(record: OddsRecord) -> float | None:
+    """Return the available amount (in native currency) for a single odds record."""
+    m = record.metadata
+    if record.provider == "matchbook":
+        return m.get("available_amount")
+    if record.provider == "smarkets":
+        raw = m.get("raw_quantity")
+        return round(raw / 10000, 2) if raw is not None else None
+    if record.provider == "polymarket":
+        liq = m.get("liquidity_usd")
+        return round(liq / 2, 2) if liq is not None else None
+    if record.provider == "sx_bet":
+        return m.get("available_usd")
 
 
 def _build_aggregated_games_payload(
@@ -246,6 +350,10 @@ def _build_aggregated_games_payload(
             "league": event_group.league,
             "sport": event_group.sport,
             "market_type": market_type,
+            "polymarket_market_id": None,
+            "smarkets_market_id": None,
+            "matchbook_event_id": None,
+            "sx_bet_market_hash": None,
             "polymarket_team1_back_odds": None,
             "polymarket_team1_lay_odds": None,
             "polymarket_draw_back_odds": None,
@@ -307,9 +415,36 @@ def _build_aggregated_games_payload(
                     if chosen is None:
                         continue
                     _, record = chosen
-                    key = f"{provider_name}_{team_slot}_{side}_odds"
-                    if key in entry:
-                        entry[key] = record.decimal_odds
+                    odds_key = f"{provider_name}_{team_slot}_{side}_odds"
+                    avail_key = f"{provider_name}_{team_slot}_{side}_avail"
+                    if odds_key in entry:
+                        entry[odds_key] = record.decimal_odds
+                    entry[avail_key] = _extract_available(record)
+
+        # Store market/event IDs for targeted refresh later.
+        # Polymarket UCL: each outcome is a separate Yes/No binary market, so store
+        # per-slot IDs. Other providers use one ID per event/market.
+        for team_slot in ("team1", "draw", "team2"):
+            for side in ("back", "lay"):
+                key = ("polymarket", team_slot, side)
+                if key in best_by_provider_team:
+                    _, record = best_by_provider_team[key]
+                    entry[f"polymarket_{team_slot}_market_id"] = record.source_market_id
+                    # Also set the legacy single-ID field to the first one found
+                    if entry["polymarket_market_id"] is None:
+                        entry["polymarket_market_id"] = record.source_market_id
+                    break
+
+        for provider_name, id_field, id_attr in (
+            ("smarkets",  "smarkets_market_id",  "source_market_id"),
+            ("matchbook", "matchbook_event_id",   "source_event_id"),
+            ("sx_bet",    "sx_bet_market_hash",   "source_market_id"),
+        ):
+            for key in best_by_provider_team:
+                if key[0] == provider_name:
+                    _, record = best_by_provider_team[key]
+                    entry[id_field] = getattr(record, id_attr)
+                    break
 
         payload.append(entry)
 

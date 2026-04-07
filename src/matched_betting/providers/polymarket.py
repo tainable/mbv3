@@ -317,6 +317,7 @@ class PolymarketProvider(OddsProvider):
                 "slug": market.get("slug"),
                 "market_type_raw": market.get("marketType"),
                 "sports_market_type_raw": market.get("sportsMarketType"),
+                "liquidity_usd": market.get("liquidityNum"),
             },
         )
 
