@@ -9,7 +9,9 @@ Fetches live odds from Matchbook, Smarkets, Polymarket, and SX Bet, normalises t
 ```
 matched_betting/
 ├── run.py                          # Launcher (adds src/ to sys.path)
+├── arb_finder.py                   # Arbitrage finder (sure bets and back-lay arbs)
 ├── src/matched_betting/
+│   ├── __main__.py                 # Enables python -m matched_betting
 │   ├── cli.py                      # Argument parsing and orchestration
 │   ├── config.py                   # Settings loaded from .env
 │   ├── http.py                     # HTTP client with retry logic
@@ -173,18 +175,72 @@ All records share this shape regardless of source:
   "date_time": "2026-03-21T19:30:00Z",
   "league": "nba",
   "sport": "basketball",
-  "polymarket_team1_odds": 2.14,
-  "polymarket_team2_odds": 1.74,
-  "matchbook_team1_odds": 2.10,
-  "matchbook_team2_odds": 1.80,
-  "smarkets_team1_odds": null,
-  "smarkets_team2_odds": null,
+  "market_type": "two_way",
+  "polymarket_market_id": "abc123",
+  "matchbook_event_id": "456",
+  "smarkets_market_id": "789",
+  "sx_bet_market_hash": "0xabc",
+  "polymarket_team1_back_odds": 2.14,
+  "polymarket_team1_lay_odds": null,
+  "polymarket_team2_back_odds": 1.74,
+  "polymarket_team2_lay_odds": null,
+  "matchbook_team1_back_odds": 2.10,
+  "matchbook_team1_lay_odds": 2.12,
+  "matchbook_team2_back_odds": 1.80,
+  "matchbook_team2_lay_odds": 1.82,
+  "smarkets_team1_back_odds": null,
+  "smarkets_team1_lay_odds": null,
+  "smarkets_team2_back_odds": null,
+  "smarkets_team2_lay_odds": null,
   "sx_bet_team1_back_odds": 2.08,
-  "sx_bet_team2_back_odds": 1.82
+  "sx_bet_team1_lay_odds": null,
+  "sx_bet_team2_back_odds": 1.82,
+  "sx_bet_team2_lay_odds": null
 }
 ```
 
-`null` means the provider had no matching record for that team. Odds shown are the best (highest) decimal odds seen across that provider's records for the game.
+`null` means the provider had no matching record for that outcome/side. Each provider stores the best (highest for back, lowest for lay) decimal odds seen across its records for the game. Three-way markets (e.g. football with draw) include additional `*_draw_back_odds` and `*_draw_lay_odds` fields. Market IDs are stored per provider to enable targeted odds re-fetching.
+
+## Arbitrage finder
+
+`arb_finder.py` reads the aggregated games output and identifies two types of opportunity:
+
+- **Sure bets** — back the same outcome across different providers such that the sum of implied probabilities is below 1 (after commission).
+- **Back-lay arbs** — back an outcome on one exchange and lay it on another when the effective back odds exceed the effective lay odds (after commission).
+
+Both two-way (NBA/MLB moneyline) and three-way (e.g. football with draw) markets are supported.
+
+### Commission assumptions
+
+| Provider | Rate |
+|---|---|
+| Matchbook | 2% on net winnings |
+| Smarkets | 0% during 60-day intro period, else 2% |
+| SX Bet | 0% |
+| Polymarket | Dynamic: `0.0075 × 4 × p × (1 − p)` on stake |
+
+Update `SMARKETS_ZERO_COMMISSION_PERIOD` in `arb_finder.py` when the Smarkets intro period ends.
+
+### Usage
+
+```bash
+python arb_finder.py
+python arb_finder.py --input outputs/latest_odds_aggregated_games.json
+python arb_finder.py --min-profit 0.5
+python arb_finder.py --no-refresh
+```
+
+### CLI flags
+
+| Flag | Description |
+|---|---|
+| `--input PATH` | Path to aggregated games JSON (default: `outputs/latest_odds_aggregated_games.json`) |
+| `--min-profit PCT` | Minimum net profit % to report (default: 0.0) |
+| `--no-refresh` | Skip the targeted odds re-fetch after identifying arbs |
+
+After listing arbs, the finder re-fetches current odds for each identified opportunity directly from the provider APIs (using the stored market IDs) and reports whether each arb is still valid, showing the delta from the originally aggregated odds.
+
+Max available liquidity is shown per leg in GBP. USD amounts (Polymarket) are converted via a live exchange rate from `open.er-api.com`, falling back to 0.79 if the request fails.
 
 ## How it works
 
