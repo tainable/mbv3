@@ -6,7 +6,8 @@ from matched_betting.config import MatchbookSettings
 from matched_betting.http import HttpClient
 from matched_betting.debug import DebugLogger
 from matched_betting.models import OddsRecord, ProviderPayload, utc_now_iso
-from matched_betting.providers.base import OddsProvider, ProviderNotReadyError
+from matched_betting.normalization import normalize_team_name
+from matched_betting.providers.base import GameContext, OddsProvider, ProviderNotReadyError
 
 
 class MatchbookProvider(OddsProvider):
@@ -33,7 +34,7 @@ class MatchbookProvider(OddsProvider):
         self._login()
         self.debug(f"{self.name}: login successful")
 
-        if "ucl" in leagues:
+        if any(lg in leagues for lg in ("ucl", "epl")):
             self._log_available_sports()
 
         records: list[OddsRecord] = []
@@ -62,6 +63,45 @@ class MatchbookProvider(OddsProvider):
                     warnings.append(f"Skipped Matchbook event {event.get('id')}: {exc}")
                     self.debug(f"{self.name}: skipped event {event.get('id')}: {exc}")
             self.debug(f"{self.name}: matched {matched_events} {league} events")
+
+        return ProviderPayload(provider=self.name, records=records, warnings=warnings)
+
+    def fetch_odds_by_ids(
+        self,
+        game_contexts: list[GameContext],
+        leagues: list[str],
+    ) -> ProviderPayload:
+        if not (self.settings.username and self.settings.password):
+            raise ProviderNotReadyError(
+                "Matchbook credentials are missing. Add MATCHBOOK_USERNAME and MATCHBOOK_PASSWORD to .env."
+            )
+        retrieved_at = utc_now_iso()
+        self.debug(f"{self.name}: targeted fetch: logging in")
+        self._login()
+        self.debug(f"{self.name}: targeted fetch: login successful")
+
+        records: list[OddsRecord] = []
+        warnings: list[str] = []
+
+        for game in game_contexts:
+            event_id = game.get("matchbook_event_id")
+            league = game.get("league")
+            if not event_id or league not in leagues:
+                continue
+            self.debug(f"{self.name}: targeted fetch event_id={event_id} league={league}")
+            try:
+                event_data = self.http_client.get_json(
+                    f"{self.settings.base_url}/edge/rest/events/{event_id}",
+                    headers={"Accept": "application/json"},
+                )
+                event_records = self._event_to_records(event_data, league, retrieved_at)
+                records.extend(event_records)
+                self.debug(
+                    f"{self.name}: targeted fetch event_id={event_id} -> {len(event_records)} records"
+                )
+            except Exception as exc:
+                warnings.append(f"Skipped Matchbook event {event_id}: {exc}")
+                self.debug(f"{self.name}: targeted fetch: skipped event {event_id}: {exc}")
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
@@ -128,6 +168,9 @@ class MatchbookProvider(OddsProvider):
         if league == "ucl":
             # TODO: verify the exact url-name Matchbook uses for the Champions League
             return any(tag.get("url-name") in ("champions-league", "ucl", "uefa-champions-league") for tag in meta_tags)
+        if league == "epl":
+            # ODO: verify the exact url-name Matchbook uses for the Premier League
+            return any(tag.get("url-name") in ("premier-league", "epl", "english-premier-league") for tag in meta_tags)
         return False
 
     def _event_to_records(
@@ -149,8 +192,7 @@ class MatchbookProvider(OddsProvider):
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type_raw = str(market.get("market-type") or market.get("type") or "unknown")
-            market_type = _MARKET_TYPE_NORMALISE.get(market_type_raw.lower(), market_type_raw)
+            market_type = "three_way" if league in ("ucl", "epl") else "two_way"
             for runner in market.get("runners", []):
                 best_by_side = _best_prices_per_side(runner.get("prices", []))
                 for side, price in best_by_side.items():
@@ -166,7 +208,7 @@ class MatchbookProvider(OddsProvider):
                             event_start=event.get("start"),
                             market_name=market_name,
                             market_type=market_type,
-                            selection_name=str(runner.get("name") or "Unknown selection"),
+                            selection_name=normalize_team_name(str(runner.get("name") or "Unknown selection"), league),
                             selection_side=side,
                             decimal_odds=float(decimal_odds),
                             implied_probability=round(1 / float(decimal_odds), 6),
@@ -224,16 +266,6 @@ def _best_prices_per_side(prices: list[dict]) -> dict[str, dict]:
     return best
 
 
-_MARKET_TYPE_NORMALISE = {
-    "one_x_two": "three_way",
-    "win_draw_win": "three_way",
-    "winner_3_way": "three_way",
-    "match_odds": "three_way",
-    "moneyline": "two_way",
-    "winner_2_way": "two_way",
-}
-
-
 def _is_moneyline_market(market: dict) -> bool:
     name = str(market.get("name") or "").lower().strip()
     return name in _MONEYLINE_MARKET_NAMES
@@ -242,11 +274,13 @@ def _is_moneyline_market(market: dict) -> bool:
 LEAGUE_SPORT_IDS = {
     "nba": 4,
     "mlb": 3,
-    "ucl": 15,  # TODO: verify Matchbook sport ID for soccer
+    "ucl": 15,
+    "epl": 15,  # Same sport ID as UCL (soccer)
 }
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
     "ucl": "soccer",
+    "epl": "soccer",
 }

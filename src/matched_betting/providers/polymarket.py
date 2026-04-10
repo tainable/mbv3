@@ -7,7 +7,8 @@ from matched_betting.config import PolymarketSettings
 from matched_betting.debug import DebugLogger
 from matched_betting.http import HttpClient
 from matched_betting.models import OddsRecord, ProviderPayload, decimal_from_probability, utc_now_iso
-from matched_betting.providers.base import OddsProvider
+from matched_betting.normalization import normalize_team_name
+from matched_betting.providers.base import GameContext, OddsProvider
 
 
 
@@ -15,7 +16,11 @@ LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
     "ucl": "soccer",
+    "epl": "soccer",
 }
+
+# Leagues that use Yes/No binary markets per outcome (soccer-style)
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl"})
 
 
 class PolymarketProvider(OddsProvider):
@@ -91,6 +96,14 @@ class PolymarketProvider(OddsProvider):
                         if split_slug[-1] in ucl_teams or split_slug[-1] == "draw":
                             candidate_markets.append((market, "ucl"))
 
+            epl_teams = team_index.get("epl", [])
+            if "epl" in leagues and epl_teams:
+                # Match head-to-head EPL slugs: epl-{team1}-{team2}-{date}-{team_or_draw}
+                if split_slug[0] == "epl" and len(split_slug) >= 3:
+                    if split_slug[1] in epl_teams and split_slug[2] in epl_teams:
+                        if split_slug[-1] in epl_teams or split_slug[-1] == "draw":
+                            candidate_markets.append((market, "epl"))
+
         
         self.debug(f"{self.name}: found {len(candidate_markets)} candidate markets after league filtering")
 
@@ -115,6 +128,55 @@ class PolymarketProvider(OddsProvider):
                 self.debug(f"{self.name}: skipped market {market_id} ({slug}): {exc}")
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
+    def fetch_odds_by_ids(
+        self,
+        game_contexts: list[GameContext],
+        leagues: list[str],
+    ) -> ProviderPayload:
+        retrieved_at = utc_now_iso()
+        records: list[OddsRecord] = []
+        warnings: list[str] = []
+
+        for game in game_contexts:
+            league = game.get("league")
+            if league not in leagues:
+                continue
+
+            if league in _SOCCER_LEAGUES:
+                ids_to_fetch = [
+                    mid for mid in (
+                        game.get("polymarket_team1_market_id"),
+                        game.get("polymarket_draw_market_id"),
+                        game.get("polymarket_team2_market_id"),
+                    )
+                    if mid
+                ]
+            else:
+                mid = game.get("polymarket_market_id")
+                ids_to_fetch = [mid] if mid else []
+
+            for market_id in ids_to_fetch:
+                self.debug(f"{self.name}: targeted fetch market_id={market_id} league={league}")
+                try:
+                    result = self.http_client.get_json(
+                        f"{self.settings.gamma_base_url}/markets",
+                        params={"id": market_id},
+                    )
+                    market_list = result if isinstance(result, list) else []
+                    if not market_list:
+                        warnings.append(f"Polymarket targeted fetch: market {market_id} returned empty")
+                        continue
+                    market_records = self._market_to_records(market_list[0], league, retrieved_at)
+                    records.extend(market_records)
+                    self.debug(
+                        f"{self.name}: targeted fetch market_id={market_id} -> {len(market_records)} records"
+                    )
+                except Exception as exc:
+                    warnings.append(f"Skipped Polymarket market {market_id}: {exc}")
+                    self.debug(f"{self.name}: targeted fetch: skipped market {market_id}: {exc}")
+
+        return ProviderPayload(provider=self.name, records=records, warnings=warnings)
+
     def _load_team_index(self, leagues: list[str]) -> dict[str, set[str]]:
         index: dict[str, set[str]] = {league: set() for league in leagues}
         for league in leagues:
@@ -132,6 +194,14 @@ class PolymarketProvider(OddsProvider):
 
             elif league == "ucl":
                 index[league] = ['rma1','bay1','spo1','ars','psg1','liv1','fcb1','atm1']
+
+            elif league == "epl":
+                # ODO: verify exact Polymarket team slug codes for EPL
+                index[league] = [
+                    'ars','che','liv','mac','mun','tot','new','ast',
+                    'bri','wes','wol','cry','ful','bre','eve','bou','not',
+                    'bur','lee','sun',  # promoted: Burnley, Leeds, Sunderland
+                ]
 
             else:
                 raw_teams = self.http_client.get_json(
@@ -195,6 +265,8 @@ class PolymarketProvider(OddsProvider):
             return "mlb"
         if "ucl" in question:
             return "ucl"
+        if "premier league" in question or "epl" in question:
+            return "epl"
 
         return None
 
@@ -217,14 +289,22 @@ class PolymarketProvider(OddsProvider):
             lay_probs = [None] * 3
         elif len(outcomes) == 2:
             try:
-                p0 = float(market.get("bestAsk"))
+                best_ask = float(market.get("bestAsk"))
             except (TypeError, ValueError):
-                p0 = None
+                best_ask = None
             try:
-                p1 = 1 - float(market.get("bestBid"))
+                best_bid = float(market.get("bestBid"))
             except (TypeError, ValueError):
-                p1 = None
-            back_probs = [p0, p1]
+                best_bid = None
+
+            # bestAsk/bestBid refer to the YES (primary) outcome of this market,
+            # which Polymarket identifies via groupItemTitle. Find which outcomes
+            # index that team sits at and assign prices accordingly.
+            yes_idx = _yes_outcome_index(outcomes, market.get("groupItemTitle"), league)
+            no_idx = 1 - yes_idx
+            back_probs = [None, None]
+            back_probs[yes_idx] = best_ask
+            back_probs[no_idx] = (1.0 - best_bid) if best_bid is not None else None
             lay_probs = [None, None]
         else:
             raise ValueError(f"unexpected outcome count: {len(outcomes)}")
@@ -234,10 +314,10 @@ class PolymarketProvider(OddsProvider):
 
         event = (market.get("events") or [{}])[0]
 
-        # Polymarket UCL markets are typically Yes/No binary markets per outcome.
+        # Polymarket soccer markets (UCL/EPL) are typically Yes/No binary markets per outcome.
         # "Yes" = this team/outcome wins; remap to the meaningful name from groupItemTitle.
         # "No" is dropped — its probability is the complement and is emitted as a lay record.
-        if league == "ucl" and {o.lower() for o in outcomes} <= {"yes", "no"}:
+        if league in _SOCCER_LEAGUES and {o.lower() for o in outcomes} <= {"yes", "no"}:
             group_title = market.get("groupItemTitle")
             if not group_title:
                 raise ValueError("UCL Yes/No market missing groupItemTitle for outcome name")
@@ -254,7 +334,7 @@ class PolymarketProvider(OddsProvider):
             except (TypeError, ValueError):
                 raise ValueError("UCL Yes/No market missing bestBid for lay price")
 
-        if league == "ucl":
+        if league in _SOCCER_LEAGUES:
             # Build event name from the two team outcomes (skip draw/no-draw outcomes)
             _draw_variants = {"draw", "tie", "no draw", "not draw"}
             non_draw = [o for o in outcomes if o.lower() not in _draw_variants]
@@ -268,19 +348,29 @@ class PolymarketProvider(OddsProvider):
                     or f"{outcomes[0]} vs {outcomes[-1]}"
                 )
         else:
-            event_name = (
-                event.get("title")
-                or market.get("groupItemTitle")
-                or market.get("question")
-                or "Unknown event"
-            )
+            title = event.get("title") or ""
+            _separators = (" vs ", " vs. ", " v ", " at ", " @ ")
+            if any(sep in title.lower() for sep in _separators):
+                event_name = title
+            elif len(outcomes) == 2:
+                # Build a parseable "X vs Y" from normalized outcomes so canonical
+                # matching works even when the event title is absent or unparseable.
+                t0 = normalize_team_name(str(outcomes[0]), league)
+                t1 = normalize_team_name(str(outcomes[1]), league)
+                event_name = f"{t0} vs {t1}"
+            else:
+                event_name = (
+                    market.get("groupItemTitle")
+                    or market.get("question")
+                    or "Unknown event"
+                )
 
-        if league in ("mlb", "ucl"):
+        if league in ("mlb", "ucl", "epl"):
             event_start = event.get("startTime")
         else:
             event_start = event.get("endDate")
 
-        if league == "ucl":
+        if league in _SOCCER_LEAGUES:
             # For soccer, market_name should describe the game so each record is self-describing
             # alongside selection_name (which identifies the specific team/draw outcome)
             market_name = event_name
@@ -291,7 +381,7 @@ class PolymarketProvider(OddsProvider):
         # (only 1 outcome left). UCL markets are three-way (home/draw/away); all other
         # single-outcome remapped markets fall back to two_way for the moneyline filter.
         if len(outcomes) == 1:
-            market_type = "three_way" if league == "ucl" else "two_way"
+            market_type = "three_way" if league in _SOCCER_LEAGUES else "two_way"
         else:
             market_type = self._infer_market_type(
                 outcomes,
@@ -327,6 +417,7 @@ class PolymarketProvider(OddsProvider):
 
             if "draw" in outcome.lower():
                 outcome = "draw"
+            outcome = normalize_team_name(str(outcome), league)
             try:
                 iprob = round(back_prob, 6)
             except (TypeError, ValueError):
@@ -376,6 +467,23 @@ class PolymarketProvider(OddsProvider):
         if len(outcomes) == 3:
             return "three_way"
         return "multi_way"
+
+
+def _yes_outcome_index(outcomes: list[str], group_item_title: str | None, league: str) -> int:
+    """Return the outcomes index that bestAsk/bestBid refer to.
+
+    On Polymarket, bestAsk and bestBid track the YES token for the market's
+    primary outcome, which groupItemTitle names. If groupItemTitle matches
+    outcomes[1] (not outcomes[0]), the prices must be assigned in reverse.
+    Falls back to 0 if groupItemTitle is absent or doesn't match either outcome.
+    """
+    if not group_item_title:
+        return 0
+    normalized_title = normalize_team_name(group_item_title, league)
+    for i, outcome in enumerate(outcomes):
+        if normalize_team_name(str(outcome), league) == normalized_title:
+            return i
+    return 0
 
 
 def _parse_stringified_json_list(value: Any) -> list[Any]:

@@ -48,8 +48,9 @@ def _usd_to_gbp() -> float:
         rate = 1.0 / data["rates"]["USD"]  # GBP per 1 USD
         _usd_to_gbp_cache = rate
         return rate
-    except Exception:
-        return 0.79  # fallback
+    except Exception as exc:
+        print(f"WARNING: FX rate fetch failed ({exc}); using fallback rate 0.79 GBP/USD", file=sys.stderr)
+        return 0.79
 
 
 def _to_gbp(amount: float | None, currency: str) -> float | None:
@@ -140,7 +141,9 @@ def _provider_from_field(field: str) -> str:
 # Commission helpers
 # ---------------------------------------------------------------------------
 
+# *** VERIFY BEFORE EACH RUN ***
 # Set to True while within Smarkets' 60-day zero-commission introductory period.
+# If this is wrong, all Smarkets arb calculations will use the incorrect commission rate.
 SMARKETS_ZERO_COMMISSION_PERIOD = True
 
 # Exchange commission on net winnings (back and lay)
@@ -150,6 +153,13 @@ PROVIDER_COMMISSION: dict[str, float] = {
     "sx_bet":    0.00,   # no commission
     "polymarket": 0.00,  # handled separately (dynamic fee)
 }
+
+if SMARKETS_ZERO_COMMISSION_PERIOD:
+    print(
+        "NOTE: SMARKETS_ZERO_COMMISSION_PERIOD=True — Smarkets commission assumed 0%. "
+        "Set to False in arb_finder.py if the introductory period has ended.",
+        file=sys.stderr,
+    )
 
 
 def _polymarket_fee_rate(decimal_odds: float) -> float:
@@ -169,6 +179,9 @@ def _eff_back_odds(odds: float, provider: str) -> float:
 
 def _eff_lay_odds(odds: float, provider: str) -> float:
     """Effective lay cost after provider commission (higher = worse for arb)."""
+    if provider == "polymarket":
+        fee = _polymarket_fee_rate(odds)
+        return 1.0 + (odds - 1.0) / (1.0 - fee)
     c = PROVIDER_COMMISSION.get(provider, 0.0)
     if c == 0.0:
         return odds
@@ -457,7 +470,8 @@ def _fetch_polymarket_leg(game: dict, outcome_name: str, side: str, http) -> flo
             prices = _parse_str_json_list(market.get("outcomePrices"))
             p = float(prices[idx])
         return round(1.0 / p, 6) if p and p > 0 else None
-    except Exception:
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: polymarket live fetch failed for market {market_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
 
@@ -485,7 +499,8 @@ def _fetch_smarkets_leg(game: dict, outcome_name: str, side: str, http) -> float
             probability = float(levels[0]["price"]) / 10000.0
             return round(1.0 / probability, 6) if probability > 0 else None
         return None
-    except Exception:
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: smarkets live fetch failed for market {market_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
 
@@ -521,7 +536,8 @@ def _fetch_matchbook_leg(game: dict, outcome_name: str, side: str, http, setting
                         odds = price.get("decimal-odds") or price.get("odds")
                         return float(odds) if odds is not None else None
         return None
-    except Exception:
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: matchbook live fetch failed for event {event_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
 
@@ -547,7 +563,8 @@ def _fetch_sx_bet_leg(game: dict, outcome_name: str, side: str, http, settings) 
             return None
         taker_prob = 1.0 - int(raw_pct) / (10 ** 20)
         return round(1.0 / taker_prob, 6) if 0 < taker_prob < 1 else None
-    except Exception:
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: sx_bet live fetch failed for market {market_hash}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
 

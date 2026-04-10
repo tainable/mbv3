@@ -7,6 +7,7 @@ from typing import Any
 
 from matched_betting.debug import DebugLogger, noop_debug
 from matched_betting.models import OddsRecord
+from matched_betting.normalization import TEAM_ALIASES, normalize_team_name  # noqa: F401 (re-exported)
 
 
 TEAM_SPLIT_PATTERNS = [
@@ -16,121 +17,6 @@ TEAM_SPLIT_PATTERNS = [
     (" vs ", False),
     (" v ", False),
 ]
-
-TEAM_ALIASES = {
-    "nba": {
-        "okc thunder": "oklahoma city thunder",
-        "la clippers": "los angeles clippers",
-        "ny knicks": "new york knicks",
-        "phx suns": "phoenix suns",
-        "gs warriors": "golden state warriors",
-        "sixers": "philadelphia 76ers",
-        "cavs": "cleveland cavaliers",
-        "pels": "new orleans pelicans",
-        "pelicans": "new orleans pelicans",
-        "wolves": "minnesota timberwolves",
-        "blazers": "portland trail blazers",
-        "hawks": "atlanta hawks",
-        "celtics": "boston celtics",
-        "nets": "brooklyn nets",
-        "hornets": "charlotte hornets",
-        "bulls": "chicago bulls",
-        "mavericks": "dallas mavericks",
-        "nuggets": "denver nuggets",
-        "pistons": "detroit pistons",
-        "warriors": "golden state warriors",
-        "rockets": "houston rockets",
-        "pacers": "indiana pacers",
-        "clippers": "los angeles clippers",
-        "lakers": "los angeles lakers",
-        "grizzlies": "memphis grizzlies",
-        "heat": "miami heat",
-        "bucks": "milwaukee bucks",
-        "timberwolves": "minnesota timberwolves",
-        "knicks": "new york knicks",
-        "magic": "orlando magic",
-        "sixers": "philadelphia 76ers",
-        "76ers": "philadelphia 76ers",
-        "suns": "phoenix suns",
-        "kings": "sacramento kings",
-        "spurs": "san antonio spurs",
-        "thunder": "oklahoma city thunder",
-        "raptors": "toronto raptors",
-        "jazz": "utah jazz",
-        "wizards": "washington wizards",
-    },
-    "ucl": {
-        # Bayern Munich — Matchbook encodes ü as space giving "m nchen"
-        "bayern": "bayern munich",
-        "fc bayern munich": "bayern munich",
-        "fc bayern m nchen": "bayern munich",
-        "fc bayern munchen": "bayern munich",
-        # PSG
-        "psg": "paris saint germain",
-        "paris saint-germain": "paris saint germain",
-        "paris saint germain fc": "paris saint germain",
-        # Sporting CP
-        "sporting": "sporting clube de portugal cp",
-        "sporting cp": "sporting clube de portugal cp",
-        "sporting clube de portugal": "sporting clube de portugal cp",
-        # Atletico Madrid — é strips to space giving "atl tico"
-        "atletico madrid": "atletico de madrid",
-        "atletico": "atletico de madrid",
-        "atl tico de madrid": "atletico de madrid",
-        "atl tico madrid": "atletico de madrid",
-        "club atl tico de madrid": "atletico de madrid",
-        "club atletico de madrid": "atletico de madrid",
-        # Barcelona
-        "barca": "fc barcelona",
-        "barcelona": "fc barcelona",
-        "barcelona fc": "fc barcelona",
-        # Arsenal
-        "arsenal fc": "arsenal",
-        # Real Madrid
-        "real madrid cf": "real madrid",
-        # Liverpool
-        "liverpool fc": "liverpool",
-        # Other common UCL teams
-        "man city": "manchester city",
-        "inter": "inter milan",
-        "ac milan": "ac milan",
-        "milan": "ac milan",
-    },
-    "mlb": {
-        "d backs": "arizona diamondbacks",
-        "diamondbacks": "arizona diamondbacks",
-        "white sox": "chicago white sox",
-        "cubs": "chicago cubs",
-        "guardians": "cleveland guardians",
-        "reds": "cincinnati reds",
-        "rockies": "colorado rockies",
-        "tigers": "detroit tigers",
-        "astros": "houston astros",
-        "royals": "kansas city royals",
-        "angels": "los angeles angels",
-        "dodgers": "los angeles dodgers",
-        "marlins": "miami marlins",
-        "brewers": "milwaukee brewers",
-        "twins": "minnesota twins",
-        "mets": "new york mets",
-        "yankees": "new york yankees",
-        "athletics": "oakland athletics",
-        "a's": "oakland athletics",
-        "phillies": "philadelphia phillies",
-        "pirates": "pittsburgh pirates",
-        "padres": "san diego padres",
-        "giants": "san francisco giants",
-        "mariners": "seattle mariners",
-        "rays": "tampa bay rays",
-        "rangers": "texas rangers",
-        "blue jays": "toronto blue jays",
-        "nationals": "washington nationals",
-        "red sox": "boston red sox",
-        "braves": "atlanta braves",
-        "orioles": "baltimore orioles",
-        "cardinals": "st louis cardinals",
-    },
-}
 
 
 @dataclass(frozen=True)
@@ -228,12 +114,6 @@ def _parse_teams(event_name: str, league: str) -> tuple[str | None, str | None, 
             away = normalize_team_name(right, league)
             return home, away, False
     return None, None, False
-
-
-def normalize_team_name(team_name: str, league: str) -> str:
-    normalized = re.sub(r"[^a-z0-9\s]", " ", team_name.lower())
-    normalized = re.sub(r"\s+", " ", normalized).strip()
-    return TEAM_ALIASES.get(league, {}).get(normalized, normalized)
 
 
 def _split_case_insensitive(value: str, separator: str) -> tuple[str, str]:

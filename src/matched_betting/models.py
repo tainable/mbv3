@@ -9,11 +9,10 @@ def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def decimal_from_probability(probability: float) -> float:
-    if probability == None:
+def decimal_from_probability(probability: float) -> float | None:
+    if probability is None:
         return None
-    
-    elif probability <= 0 or probability > 1:
+    if probability <= 0 or probability > 1:
         raise ValueError(f"Probability must be in (0, 1], got {probability!r}")
     return round(1 / probability, 6)
 

@@ -5,7 +5,7 @@ import re
 from typing import Any
 
 from matched_betting.debug import DebugLogger, noop_debug
-from matched_betting.event_matching import CanonicalEventGroup, infer_event_identity, normalize_team_name
+from matched_betting.event_matching import CanonicalEventGroup, infer_event_identity
 from matched_betting.models import OddsRecord
 
 
@@ -92,7 +92,7 @@ def match_records_to_canonical_bets(
 def is_game_win_loss_record(record: OddsRecord) -> bool:
     if not _is_moneyline_market(record.market_name.lower(), record.market_type.lower()):
         return False
-    selection = normalize_team_name(record.selection_name, record.league)
+    selection = record.selection_name
     if selection in ("draw", "tie"):
         return True
     identity = infer_event_identity(record)
@@ -112,7 +112,7 @@ def infer_bet_identity(
     market_name_lower = market_name.lower()
 
     if _is_moneyline_market(market_name_lower, market_type):
-        normalized_selection = normalize_team_name(selection_name, record.league)
+        normalized_selection = selection_name
         display_selection = _pretty_name(normalized_selection)
         return BetIdentity(
             canonical_event_id=canonical_event_id,
@@ -168,14 +168,7 @@ def infer_bet_identity(
 
 
 def _is_moneyline_market(market_name_lower: str, market_type: str) -> bool:
-    return (
-        "moneyline" in market_name_lower
-        or "match odds" in market_name_lower
-        or "match winner" in market_name_lower
-        or "full-time result" in market_name_lower
-        or market_name_lower.startswith("winner")
-        or market_type in {"money_line", "winner_2_way", "winner_3_way", "one_x_two", "two_way", "three_way"}
-    )
+    return market_type in {"two_way", "three_way"}
 
 
 def _extract_handicap(record: OddsRecord) -> float | None:
@@ -201,7 +194,7 @@ def _extract_handicap(record: OddsRecord) -> float | None:
 
 
 def _extract_selection_team(record: OddsRecord, event_group: CanonicalEventGroup) -> str:
-    selection = normalize_team_name(record.selection_name, record.league)
+    selection = record.selection_name
     if selection and selection not in {"over", "under"}:
         return selection
 

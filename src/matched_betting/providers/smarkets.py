@@ -10,7 +10,8 @@ from matched_betting.config import SmarketsSettings
 from matched_betting.debug import DebugLogger
 from matched_betting.http import HttpClient
 from matched_betting.models import OddsRecord, ProviderPayload, decimal_from_probability, utc_now_iso
-from matched_betting.providers.base import OddsProvider
+from matched_betting.normalization import normalize_team_name
+from matched_betting.providers.base import GameContext, OddsProvider
 
 
 class SmarketsProvider(OddsProvider):
@@ -35,7 +36,11 @@ class SmarketsProvider(OddsProvider):
         warnings: list[str] = []
 
         for league in leagues:
-            competition_id = LEAGUE_ROOT_EVENT_IDS[league]
+            competition_id = LEAGUE_ROOT_EVENT_IDS.get(league)
+            if competition_id is None:
+                warnings.append(f"No Smarkets root event ID configured for {league} — skipping")
+                self.debug(f"{self.name}: skipping {league} (no root event ID configured)")
+                continue
             try:
                 self.debug(f"{self.name}: fetching child events for {league} (event-id={competition_id})")
                 game_events = self._fetch_children(competition_id)
@@ -69,6 +74,125 @@ class SmarketsProvider(OddsProvider):
                     self.debug(f"{self.name}: skipped event {event.get('id')}: {exc}")
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
+
+    def fetch_odds_by_ids(
+        self,
+        game_contexts: list[GameContext],
+        leagues: list[str],
+    ) -> ProviderPayload:
+        retrieved_at = utc_now_iso()
+        contract_cache: dict[str, dict[str, Any]] = {}
+        quotes_cache: dict[str, dict[str, Any]] = {}
+        records: list[OddsRecord] = []
+        warnings: list[str] = []
+
+        for game in game_contexts:
+            market_id = game.get("smarkets_market_id")
+            league = game.get("league")
+            if not market_id or league not in leagues:
+                continue
+            event_name = f"{game.get('team1', '')} vs {game.get('team2', '')}"
+            event_start = game.get("date_time")
+            self.debug(f"{self.name}: targeted fetch market_id={market_id} league={league}")
+            try:
+                market_records, market_warnings = self._targeted_market_to_records(
+                    market_id=market_id,
+                    event_name=event_name,
+                    event_start=event_start,
+                    league=league,
+                    retrieved_at=retrieved_at,
+                    contract_cache=contract_cache,
+                    quotes_cache=quotes_cache,
+                )
+                records.extend(market_records)
+                warnings.extend(market_warnings)
+                self.debug(
+                    f"{self.name}: targeted fetch market_id={market_id} -> {len(market_records)} records"
+                )
+            except Exception as exc:
+                warnings.append(f"Skipped Smarkets market {market_id}: {exc}")
+                self.debug(f"{self.name}: targeted fetch: skipped market {market_id}: {exc}")
+
+        return ProviderPayload(provider=self.name, records=records, warnings=warnings)
+
+    def _targeted_market_to_records(
+        self,
+        market_id: str,
+        event_name: str,
+        event_start: str | None,
+        league: str,
+        retrieved_at: str,
+        contract_cache: dict[str, dict[str, Any]],
+        quotes_cache: dict[str, dict[str, Any]],
+    ) -> tuple[list[OddsRecord], list[str]]:
+        """Fetch contracts and quotes for a single known market ID and build OddsRecords.
+
+        Skips the event-level API call entirely.  Event name and start are
+        reconstructed from the game context passed by the caller.
+        """
+        records: list[OddsRecord] = []
+        warnings: list[str] = []
+
+        try:
+            contracts_payload = self._get_market_contracts(market_id, contract_cache)
+            quotes_payload = self._get_market_quotes(market_id, quotes_cache)
+        except HTTPError as exc:
+            warnings.append(f"Skipped Smarkets market {market_id}: HTTP {exc.code}")
+            return records, warnings
+        except Exception as exc:
+            warnings.append(f"Skipped Smarkets market {market_id}: {exc}")
+            return records, warnings
+
+        contract_map = {
+            str(c["id"]): c for c in contracts_payload.get("contracts", [])
+        }
+        self.debug(
+            f"{self.name}: targeted market_id={market_id} -> "
+            f"{len(contract_map)} contracts, {len(quotes_payload)} quote books"
+        )
+
+        for contract_id, quote in quotes_payload.items():
+            contract = contract_map.get(str(contract_id))
+            if not contract:
+                continue
+            for side, ladder_key in (("back", "offers"), ("lay", "bids")):
+                levels = quote.get(ladder_key, [])
+                self.debug(
+                    f"{self.name}: contract={contract.get('name')!r} side={side}"
+                    f" levels={len(levels)}"
+                    f" {'-> taking best' if levels else '-> skipped (no liquidity)'}"
+                )
+                if not levels:
+                    continue
+                best = levels[0]
+                probability = _smarkets_probability(best["price"])
+                records.append(
+                    OddsRecord(
+                        provider=self.name,
+                        sport=LEAGUE_TO_SPORT[league],
+                        league=league,
+                        event_name=event_name,
+                        event_start=event_start,
+                        market_name="Match Winner",
+                        market_type="three_way" if league in ("ucl", "epl") else "two_way",
+                        selection_name=normalize_team_name(
+                            str(contract.get("name") or "Unknown selection"), league
+                        ),
+                        selection_side=side,
+                        decimal_odds=decimal_from_probability(probability),
+                        implied_probability=round(probability, 6),
+                        currency="GBP",
+                        source_market_id=market_id,
+                        source_event_id=market_id,
+                        retrieved_at=retrieved_at,
+                        metadata={
+                            "contract_id": str(contract_id),
+                            "raw_price": best.get("price"),
+                            "raw_quantity": best.get("quantity"),
+                        },
+                    )
+                )
+        return records, warnings
 
     def _fetch_children(self, parent_id: int) -> list[dict[str, Any]]:
         self.debug(f"{self.name}: requesting event children for parent_id={parent_id}")
@@ -166,8 +290,8 @@ class SmarketsProvider(OddsProvider):
                             event_name=str(event.get("name") or "Unknown event"),
                             event_start=event.get("start_datetime"),
                             market_name=str(market.get("name") or "Unknown market"),
-                            market_type=_normalise_market_type(str(market.get("market_type", {}).get("name") or "unknown")),
-                            selection_name=str(contract.get("name") or "Unknown selection"),
+                            market_type="three_way" if league in ("ucl", "epl") else "two_way",
+                            selection_name=normalize_team_name(str(contract.get("name") or "Unknown selection"), league),
                             selection_side=side,
                             decimal_odds=decimal_from_probability(probability),
                             implied_probability=round(probability, 6),
@@ -229,30 +353,15 @@ LEAGUE_ROOT_EVENT_IDS = {
     "nba": 19694311,
     "mlb": 13240353,
     "ucl": 25363462,
+    "epl": 25508311,
 }
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
     "ucl": "soccer",
+    "epl": "soccer",
 }
-
-
-_MARKET_TYPE_NORMALISE = {
-    "winner_3_way": "three_way",
-    "one_x_two": "three_way",
-    "win_draw_win": "three_way",
-    "full time result": "three_way",
-    "match winner": "three_way",
-    "winner_2_way": "two_way",
-    "moneyline": "two_way",
-    "winner (incl. overtime)": "two_way",
-    "winner (including overtime)": "two_way",
-}
-
-
-def _normalise_market_type(raw: str) -> str:
-    return _MARKET_TYPE_NORMALISE.get(raw.lower(), raw)
 
 
 def _smarkets_probability(raw_price: int | float) -> float:
