@@ -133,6 +133,18 @@ class PolymarketProvider(OddsProvider):
         game_contexts: list[GameContext],
         leagues: list[str],
     ) -> ProviderPayload:
+        """Targeted refresh using stored CLOB token IDs where available.
+
+        For each game, prefers reading the per-slot CLOB token IDs stored in
+        the aggregated games output (polymarket_team1_clob_token_id etc.) and
+        hitting the CLOB book API directly, skipping the intermediate Gamma
+        lookup.  Falls back to a Gamma API call when stored token IDs are
+        absent (e.g. on first run after a full fetch that pre-dates this change).
+
+        This mirrors the EPL per-slot approach for all leagues:
+          - Soccer (EPL/UCL): team1 / draw / team2 slots, market_type three_way
+          - NBA/MLB:          team1 / team2 slots,         market_type two_way
+        """
         retrieved_at = utc_now_iso()
         records: list[OddsRecord] = []
         warnings: list[str] = []
@@ -142,40 +154,269 @@ class PolymarketProvider(OddsProvider):
             if league not in leagues:
                 continue
 
-            if league in _SOCCER_LEAGUES:
-                ids_to_fetch = [
-                    mid for mid in (
-                        game.get("polymarket_team1_market_id"),
-                        game.get("polymarket_draw_market_id"),
-                        game.get("polymarket_team2_market_id"),
-                    )
-                    if mid
-                ]
-            else:
-                mid = game.get("polymarket_market_id")
-                ids_to_fetch = [mid] if mid else []
+            team1 = game.get("team1") or ""
+            team2 = game.get("team2") or ""
+            event_name = f"{team1} vs {team2}" if team1 and team2 else "Unknown event"
+            event_start = game.get("date_time")
 
-            for market_id in ids_to_fetch:
-                self.debug(f"{self.name}: targeted fetch market_id={market_id} league={league}")
-                try:
-                    result = self.http_client.get_json(
-                        f"{self.settings.gamma_base_url}/markets",
-                        params={"id": market_id},
-                    )
-                    market_list = result if isinstance(result, list) else []
-                    if not market_list:
-                        warnings.append(f"Polymarket targeted fetch: market {market_id} returned empty")
+            if league in _SOCCER_LEAGUES:
+                market_type = "three_way"
+                slots: list[tuple[str, str | None, str | None]] = [
+                    (
+                        normalize_team_name(team1, league),
+                        game.get("polymarket_team1_clob_token_id"),
+                        game.get("polymarket_team1_market_id"),
+                    ),
+                    (
+                        "draw",
+                        game.get("polymarket_draw_clob_token_id"),
+                        game.get("polymarket_draw_market_id"),
+                    ),
+                    (
+                        normalize_team_name(team2, league),
+                        game.get("polymarket_team2_clob_token_id"),
+                        game.get("polymarket_team2_market_id"),
+                    ),
+                ]
+                for outcome_name, clob_token_id, market_id in slots:
+                    if not outcome_name:
                         continue
-                    market_records = self._market_to_records(market_list[0], league, retrieved_at)
-                    records.extend(market_records)
-                    self.debug(
-                        f"{self.name}: targeted fetch market_id={market_id} -> {len(market_records)} records"
-                    )
-                except Exception as exc:
-                    warnings.append(f"Skipped Polymarket market {market_id}: {exc}")
-                    self.debug(f"{self.name}: targeted fetch: skipped market {market_id}: {exc}")
+                    if clob_token_id:
+                        self.debug(f"{self.name}: CLOB direct token={clob_token_id} outcome={outcome_name!r}")
+                        try:
+                            slot_records = self._fetch_clob_records_by_token(
+                                clob_token_id, market_id or "", league, outcome_name,
+                                market_type, event_name, event_start, retrieved_at,
+                            )
+                            records.extend(slot_records)
+                            self.debug(f"{self.name}: CLOB token={clob_token_id} -> {len(slot_records)} records")
+                        except Exception as exc:
+                            warnings.append(f"Skipped Polymarket CLOB token {clob_token_id}: {exc}")
+                            self.debug(f"{self.name}: CLOB: skipped token {clob_token_id}: {exc}")
+                    elif market_id:
+                        # Fallback: resolve token ID via Gamma (older aggregated games output)
+                        self.debug(f"{self.name}: CLOB gamma-lookup market_id={market_id} outcome={outcome_name!r}")
+                        try:
+                            slot_records = self._fetch_clob_binary_records(
+                                market_id, league, outcome_name, event_name, event_start, retrieved_at,
+                            )
+                            records.extend(slot_records)
+                            self.debug(f"{self.name}: CLOB market_id={market_id} -> {len(slot_records)} records")
+                        except Exception as exc:
+                            warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")
+                            self.debug(f"{self.name}: CLOB: skipped market {market_id}: {exc}")
+            else:
+                # NBA / MLB — two-way markets; per-slot token IDs stored alongside market ID
+                market_type = "two_way"
+                market_id = game.get("polymarket_market_id")
+                team1_name = normalize_team_name(team1, league)
+                team2_name = normalize_team_name(team2, league)
+                team1_token = game.get("polymarket_team1_clob_token_id")
+                team2_token = game.get("polymarket_team2_clob_token_id")
+
+                if team1_token or team2_token:
+                    # Use stored CLOB token IDs directly, one book call per outcome
+                    for outcome_name, clob_token_id, slot_market_id in [
+                        (team1_name, team1_token, game.get("polymarket_team1_market_id") or market_id),
+                        (team2_name, team2_token, game.get("polymarket_team2_market_id") or market_id),
+                    ]:
+                        if not clob_token_id:
+                            continue
+                        self.debug(f"{self.name}: CLOB direct token={clob_token_id} outcome={outcome_name!r}")
+                        try:
+                            slot_records = self._fetch_clob_records_by_token(
+                                clob_token_id, slot_market_id or "", league, outcome_name,
+                                market_type, event_name, event_start, retrieved_at,
+                            )
+                            records.extend(slot_records)
+                            self.debug(f"{self.name}: CLOB token={clob_token_id} -> {len(slot_records)} records")
+                        except Exception as exc:
+                            warnings.append(f"Skipped Polymarket CLOB token {clob_token_id}: {exc}")
+                            self.debug(f"{self.name}: CLOB: skipped token {clob_token_id}: {exc}")
+                elif market_id:
+                    # Fallback: resolve token IDs via Gamma (older aggregated games output)
+                    self.debug(f"{self.name}: CLOB gamma-lookup market_id={market_id} league={league}")
+                    try:
+                        game_records = self._fetch_clob_moneyline_records(
+                            market_id, league, event_name, event_start, retrieved_at,
+                        )
+                        records.extend(game_records)
+                        self.debug(f"{self.name}: CLOB market_id={market_id} -> {len(game_records)} records")
+                    except Exception as exc:
+                        warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")
+                        self.debug(f"{self.name}: CLOB: skipped market {market_id}: {exc}")
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
+
+    def _fetch_clob_records_by_token(
+        self,
+        clob_token_id: str,
+        source_market_id: str,
+        league: str,
+        outcome_name: str,
+        market_type: str,
+        event_name: str,
+        event_start: str | None,
+        retrieved_at: str,
+    ) -> list[OddsRecord]:
+        """Fetch a single CLOB book using a known token ID, skipping the Gamma lookup.
+
+        Used in update mode when the token ID is already stored in the aggregated
+        games output, avoiding a round-trip to the Gamma API per outcome slot.
+        """
+        best_ask, best_bid, total_ask_size = self._fetch_clob_book(clob_token_id)
+        shared: dict = dict(
+            provider=self.name,
+            sport=LEAGUE_TO_SPORT[league],
+            league=league,
+            event_name=event_name,
+            event_start=event_start,
+            market_name=event_name,
+            market_type=market_type,
+            selection_name=outcome_name,
+            currency="USD",
+            source_market_id=source_market_id,
+            source_event_id=None,
+            retrieved_at=retrieved_at,
+            metadata={"token_id": clob_token_id, "liquidity_usd": total_ask_size * 2},
+        )
+        result: list[OddsRecord] = []
+        if best_ask and 0 < best_ask < 1:
+            result.append(OddsRecord(
+                **shared,
+                selection_side="back",
+                decimal_odds=decimal_from_probability(best_ask),
+                implied_probability=round(best_ask, 6),
+            ))
+        if best_bid and 0 < best_bid < 1:
+            result.append(OddsRecord(
+                **shared,
+                selection_side="lay",
+                decimal_odds=decimal_from_probability(best_bid),
+                implied_probability=round(best_bid, 6),
+            ))
+        return result
+
+    def _fetch_clob_book(self, token_id: str) -> tuple[float | None, float | None, float]:
+        """Return (best_ask, best_bid, total_ask_size_usd) for a CLOB token."""
+        book = self.http_client.get_json(
+            f"{self.settings.clob_base_url}/book",
+            params={"token_id": token_id},
+        )
+        asks = book.get("asks", [])
+        bids = book.get("bids", [])
+        best_ask = float(asks[-1]["price"]) if asks else None
+        best_bid = float(bids[-1]["price"]) if bids else None
+        total_ask_size = sum(float(a.get("size", 0)) for a in asks)
+        return best_ask, best_bid, total_ask_size
+
+    def _fetch_gamma_token_ids(self, market_id: str) -> tuple[list[str], list[str]]:
+        """Return (outcomes, clob_token_ids) for a Gamma numeric market ID."""
+        raw = self.http_client.get_json(
+            f"{self.settings.gamma_base_url}/markets",
+            params={"id": market_id},
+        )
+        market_data = raw[0] if isinstance(raw, list) else raw
+        outcomes = _parse_stringified_json_list(market_data.get("outcomes"))
+        clob_token_ids = _parse_stringified_json_list(market_data.get("clobTokenIds"))
+        return outcomes, clob_token_ids
+
+    def _fetch_clob_binary_records(
+        self,
+        market_id: str,
+        league: str,
+        outcome_name: str,
+        event_name: str,
+        event_start: str | None,
+        retrieved_at: str,
+    ) -> list[OddsRecord]:
+        """Fetch a soccer Yes/No binary market from CLOB and return OddsRecords.
+
+        outcome_name is already the meaningful label (team name or 'draw');
+        the Yes token maps to that outcome.
+        """
+        outcomes, clob_token_ids = self._fetch_gamma_token_ids(market_id)
+        yes_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "yes"), None)
+        if yes_idx is None or yes_idx >= len(clob_token_ids):
+            raise ValueError(f"Market {market_id} has no Yes token in Gamma clobTokenIds")
+        token_id = clob_token_ids[yes_idx]
+
+        best_ask, best_bid, total_ask_size = self._fetch_clob_book(token_id)
+
+        shared: dict = dict(
+            provider=self.name,
+            sport=LEAGUE_TO_SPORT[league],
+            league=league,
+            event_name=event_name,
+            event_start=event_start,
+            market_name=event_name,
+            market_type="three_way",
+            selection_name=outcome_name,
+            currency="USD",
+            source_market_id=market_id,
+            source_event_id=None,
+            retrieved_at=retrieved_at,
+            metadata={"token_id": token_id, "liquidity_usd": total_ask_size * 2},
+        )
+        records: list[OddsRecord] = []
+        if best_ask and 0 < best_ask < 1:
+            records.append(OddsRecord(
+                **shared,
+                selection_side="back",
+                decimal_odds=decimal_from_probability(best_ask),
+                implied_probability=round(best_ask, 6),
+            ))
+        if best_bid and 0 < best_bid < 1:
+            records.append(OddsRecord(
+                **shared,
+                selection_side="lay",
+                decimal_odds=decimal_from_probability(best_bid),
+                implied_probability=round(best_bid, 6),
+            ))
+        return records
+
+    def _fetch_clob_moneyline_records(
+        self,
+        market_id: str,
+        league: str,
+        event_name: str,
+        event_start: str | None,
+        retrieved_at: str,
+    ) -> list[OddsRecord]:
+        """Fetch a two-way moneyline market (NBA/MLB) from CLOB and return OddsRecords."""
+        outcomes, clob_token_ids = self._fetch_gamma_token_ids(market_id)
+        if not clob_token_ids:
+            raise ValueError(f"Market {market_id} has no clobTokenIds in Gamma")
+
+        records: list[OddsRecord] = []
+        for outcome_raw, token_id in zip(outcomes, clob_token_ids):
+            if not token_id or not outcome_raw:
+                continue
+            outcome_name = normalize_team_name(outcome_raw, league)
+
+            best_ask, _, total_ask_size = self._fetch_clob_book(token_id)
+            if not best_ask or not (0 < best_ask < 1):
+                continue
+
+            records.append(OddsRecord(
+                provider=self.name,
+                sport=LEAGUE_TO_SPORT[league],
+                league=league,
+                event_name=event_name,
+                event_start=event_start,
+                market_name=event_name,
+                market_type="two_way",
+                selection_name=outcome_name,
+                selection_side="back",
+                decimal_odds=decimal_from_probability(best_ask),
+                implied_probability=round(best_ask, 6),
+                currency="USD",
+                source_market_id=market_id,
+                source_event_id=None,
+                retrieved_at=retrieved_at,
+                metadata={"token_id": token_id, "liquidity_usd": total_ask_size * 2},
+            ))
+        return records
 
     def _load_team_index(self, leagues: list[str]) -> dict[str, set[str]]:
         index: dict[str, set[str]] = {league: set() for league in leagues}
@@ -277,6 +518,7 @@ class PolymarketProvider(OddsProvider):
         retrieved_at: str,
     ) -> list[OddsRecord]:
         outcomes = _parse_stringified_json_list(market.get("outcomes"))
+        clob_token_ids = _parse_stringified_json_list(market.get("clobTokenIds"))
 
         lay_probs: list[float | None] = []
 
@@ -324,6 +566,8 @@ class PolymarketProvider(OddsProvider):
             yes_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "yes"), None)
             if yes_idx is None:
                 raise ValueError("UCL Yes/No market has no 'Yes' outcome")
+            yes_token = clob_token_ids[yes_idx] if yes_idx < len(clob_token_ids) else None
+            clob_token_ids = [yes_token] if yes_token else []
             outcomes = [group_title]
             try:
                 back_probs = [float(market.get("bestAsk"))]
@@ -423,9 +667,12 @@ class PolymarketProvider(OddsProvider):
             except (TypeError, ValueError):
                 iprob = None
 
+            clob_token = clob_token_ids[i] if i < len(clob_token_ids) else None
+            record_kw = {**shared, "metadata": {**shared["metadata"], "clob_token_id": clob_token}}
+
             records.append(
                 OddsRecord(
-                    **shared,
+                    **record_kw,
                     selection_name=str(outcome),
                     selection_side="back",
                     decimal_odds=decimal_from_probability(back_prob),
@@ -441,7 +688,7 @@ class PolymarketProvider(OddsProvider):
             if explicit_lay is not None and 0 < explicit_lay < 1:
                 records.append(
                     OddsRecord(
-                        **shared,
+                        **record_kw,
                         selection_name=str(outcome),
                         selection_side="lay",
                         decimal_odds=decimal_from_probability(explicit_lay),

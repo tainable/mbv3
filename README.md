@@ -1,6 +1,6 @@
 # matched_betting
 
-Odds ingestion and aggregation system for matched betting on NBA and MLB games.
+Odds ingestion and aggregation system for matched betting on NBA, MLB, UCL, and EPL games.
 
 Fetches live odds from Matchbook, Smarkets, Polymarket, and SX Bet, normalises them into a unified schema, matches records for the same game across providers using a canonical event ID, and writes both a full odds record file and a best-odds comparison table.
 
@@ -10,12 +10,15 @@ Fetches live odds from Matchbook, Smarkets, Polymarket, and SX Bet, normalises t
 matched_betting/
 ├── run.py                          # Launcher (adds src/ to sys.path)
 ├── arb_finder.py                   # Arbitrage finder (sure bets and back-lay arbs)
+├── find_smarkets_event_ids.py      # Dev utility: discover Smarkets competition IDs
+├── find_sx_bet_league_ids.py       # Dev utility: discover SX Bet league IDs
 ├── src/matched_betting/
 │   ├── __main__.py                 # Enables python -m matched_betting
 │   ├── cli.py                      # Argument parsing and orchestration
 │   ├── config.py                   # Settings loaded from .env
 │   ├── http.py                     # HTTP client with retry logic
 │   ├── models.py                   # OddsRecord and ProviderPayload dataclasses
+│   ├── normalization.py            # Team name alias dictionaries and normalizer
 │   ├── event_matching.py           # Canonical event matching across providers
 │   ├── market_matching.py          # Moneyline filtering and canonical bet grouping
 │   ├── debug.py                    # Optional stderr debug logger
@@ -87,44 +90,63 @@ python run.py
 
 The `run.py` launcher inserts `src/` onto `sys.path`, so no install step is required.
 
+### Run modes
+
+| Mode flag | Description |
+|---|---|
+| _(none)_ | **Full fetch** — discover all markets from scratch, write all outputs |
+| `--update` | **Update** — re-fetch odds only for market IDs already in the market index; prunes IDs that return no odds |
+| `--reuse` | **Reuse** — re-emit the previous `_aggregated_games.json` and `_all_odds.json` without making any network calls |
+| `--index-only` | **Index only** — run provider discovery and write the market index, skip odds outputs |
+
 ### CLI flags
 
 | Flag | Description |
 |---|---|
-| `--leagues nba mlb` | Leagues to fetch (default: both) |
+| `--leagues nba mlb ucl epl` | Leagues to fetch (default: all four) |
 | `--nba` | Shortcut for `--leagues nba` |
 | `--mlb` | Shortcut for `--leagues mlb` |
+| `--ucl` | Shortcut for `--leagues ucl` |
+| `--epl` | Shortcut for `--leagues epl` |
 | `--providers matchbook smarkets polymarket sx_bet` | Providers to query (default: all four) |
-| `--out PATH` | Override the output file path |
+| `--out PATH` | Override the output file path stem |
 | `--debug` | Print progress messages to stderr |
+| `--multi-provider` | With `--update`: skip games covered by only one provider (filters out far-future games only listed on Polymarket) |
 
 Examples:
 
 ```bash
+# Full discovery run
+python run.py
+
+# Update only (fast, uses cached market IDs)
+python run.py --update
+
+# Refresh the market index without collecting odds
+python run.py --index-only
+
 # Single provider
 python run.py --providers sx_bet
 
-# Multiple providers
-python run.py --providers polymarket sx_bet
-
-# Single league
-python run.py --nba
+# Multiple providers, single league
+python run.py --providers polymarket sx_bet --nba
 
 # Custom output path
 python run.py --out outputs/nba_odds.json
 
-# Debug mode (progress to stderr, JSON to stdout)
+# Debug mode
 python run.py --debug
 ```
 
 ## Output
 
-Each run writes two files derived from the output path stem:
+Each run writes up to three files derived from the output path stem:
 
 | File | Contents |
 |---|---|
 | `*_all_odds.json` | All normalised `OddsRecord` objects with `canonical_event_id` |
 | `*_aggregated_games.json` | Best decimal odds per team per provider, one entry per game |
+| `*_market_index.json` | Persistent index of known market IDs grouped by league and game |
 
 A summary is also printed to stdout:
 
@@ -201,6 +223,44 @@ All records share this shape regardless of source:
 
 `null` means the provider had no matching record for that outcome/side. Each provider stores the best (highest for back, lowest for lay) decimal odds seen across its records for the game. Three-way markets (e.g. football with draw) include additional `*_draw_back_odds` and `*_draw_lay_odds` fields. Market IDs are stored per provider to enable targeted odds re-fetching.
 
+## Developer utilities
+
+Two standalone scripts help discover the ID values you need to configure new leagues or debug provider mappings. Both read credentials from `.env` via the same `load_settings` path used by the main tool.
+
+### find_smarkets_event_ids.py
+
+Walks the Smarkets event hierarchy to find the root competition IDs referenced by the Smarkets provider.
+
+```bash
+# List all top-level sports
+python find_smarkets_event_ids.py
+
+# Search for competitions by name (fastest)
+python find_smarkets_event_ids.py --name "premier"
+
+# Walk ancestry from a known match event ID up to its root
+python find_smarkets_event_ids.py --ancestors 12345678
+
+# List children of a parent event ID
+python find_smarkets_event_ids.py --parent 1234567
+
+# Recursively search children for a keyword (up to --depth levels deep)
+python find_smarkets_event_ids.py --parent 1234567 --search "premier" --depth 3
+```
+
+### find_sx_bet_league_ids.py
+
+Queries the SX Bet `/leagues/active` endpoint to find league IDs referenced by the SX Bet provider. No credentials required.
+
+```bash
+# List all active leagues
+python find_sx_bet_league_ids.py
+
+# Filter by keyword (case-insensitive)
+python find_sx_bet_league_ids.py --search "premier"
+python find_sx_bet_league_ids.py --search "england"
+```
+
 ## Arbitrage finder
 
 `arb_finder.py` reads the aggregated games output and identifies two types of opportunity:
@@ -244,10 +304,91 @@ Max available liquidity is shown per leg in GBP. USD amounts (Polymarket) are co
 
 ## How it works
 
-**Canonical event matching** (`event_matching.py`): team names are parsed from each provider's event description, normalised through a league-specific alias dictionary (e.g. "Cavs" → "Cleveland Cavaliers"), then grouped by league, team pair, and start time within a ±30-minute tolerance. The resulting canonical event ID takes the form `league|YYYYMMDDTHHMM|away_team|home_team`.
+### Architecture overview
 
-**Odds normalisation**: Polymarket prices are converted from outcome probability to decimal odds using `1 / p`. Smarkets integer prices are first converted via `price / 10000` then the same formula. Matchbook prices are already decimal. SX Bet stores odds as scaled integers (`maker_probability × 10²⁰`); taker decimal odds are computed as `1 / (1 - maker_probability)` using the cross-referenced outcome (team one's odds derive from the best maker orders on outcome two, and vice versa).
+```
+run.py / python -m matched_betting
+    └── cli.py (main)
+            ├── load_settings (config.py)         # reads .env
+            ├── build_provider_registry            # instantiates providers
+            ├── ThreadPoolExecutor                 # parallel provider fetches
+            │     ├── MatchbookProvider.fetch_odds
+            │     ├── SmarketsProvider.fetch_odds
+            │     ├── PolymarketProvider.fetch_odds
+            │     └── SxBetProvider.fetch_odds
+            │           └── each returns ProviderPayload(records=[OddsRecord, ...])
+            ├── match_records_to_canonical_events  # event_matching.py
+            ├── is_game_win_loss_record filter      # market_matching.py
+            ├── aggregate_games                    # cli.py
+            └── write JSON outputs
+```
 
-**Filtering** (`market_matching.py`): only moneyline back bets with two identified teams are included in the output. For SX Bet specifically, only markets with `type == 226` (Moneyline Including Overtime) are fetched. Exchange-specific concepts (lay depth, commissions, order book levels) are preserved in `metadata` for future use.
+### Step-by-step data flow
 
-**Parallel ingestion**: all configured providers are queried concurrently via `ThreadPoolExecutor`. Provider failures are captured as warnings and do not abort the run.
+**1. Configuration** (`config.py`)
+
+`load_settings()` reads a `.env` file from the project root (using a zero-dependency parser — no `python-dotenv` required) and populates frozen `Settings` dataclasses for each provider. Missing credentials cause a provider to raise `ProviderNotReadyError` at fetch time, which is caught and recorded as a warning rather than crashing the run.
+
+**2. Provider fetching** (`providers/`)
+
+Each provider implements the `OddsProvider` abstract base class (`base.py`) with two methods:
+
+- `fetch_odds(leagues)` — full discovery: paginates the provider API to find all markets for the requested leagues.
+- `fetch_odds_by_ids(game_contexts, leagues)` — targeted fetch: uses stored market/event IDs from the market index to re-fetch only known markets. Defaults to `fetch_odds` if not overridden.
+
+All providers are queried concurrently via `ThreadPoolExecutor`. Each provider returns a `ProviderPayload` containing a flat list of `OddsRecord` objects and any provider-level warnings. Individual provider failures are caught and appended as warnings without aborting the run.
+
+**3. Data model** (`models.py`)
+
+Every record across every provider shares the same frozen `OddsRecord` dataclass:
+
+- **Provider metadata**: `provider`, `sport`, `league`
+- **Event identity**: `event_name`, `event_start`, `source_event_id`
+- **Market identity**: `market_name`, `market_type`, `source_market_id`
+- **Odds**: `selection_name`, `selection_side` (`back`/`lay`), `decimal_odds`, `implied_probability`
+- **Extras**: `currency`, `retrieved_at`, `metadata` (provider-specific raw fields)
+
+**4. Odds normalisation** (per provider)
+
+Each provider adapter translates its native API format into the common schema:
+
+- **Matchbook**: prices are already decimal; lay depth is stored in `metadata`.
+- **Smarkets**: integer prices (`0`–`10000`) are divided by `10000` then inverted to decimal (`1 / p`).
+- **Polymarket**: token IDs are resolved from the Gamma API (`/markets?id=…`) using `clobTokenIds` aligned with `outcomes`. Best ask is `asks[-1]` and best bid is `bids[-1]` from the CLOB order book. Prices are converted to decimal via `1 / p`.
+- **SX Bet**: odds are stored as scaled integers (`maker_probability × 10²⁰`). Taker decimal odds are computed as `1 / (1 − maker_probability)`, cross-referencing outcomes (team one's odds are derived from the best maker orders on outcome two, and vice versa). Only markets with `type == 226` (Moneyline Including Overtime) are fetched.
+
+**5. Team name normalisation** (`normalization.py`)
+
+`normalize_team_name(name, league)` lowercases the input, strips non-alphanumeric characters to spaces, collapses whitespace, then looks up the result in a per-league `TEAM_ALIASES` dictionary. This handles common abbreviations ("Cavs" → "Cleveland Cavaliers"), diacritics stripped by provider encoding ("Bayern M nchen" → "Bayern Munich"), suffixes ("Arsenal FC" → "Arsenal"), and shorthand names ("Man Utd" → "Manchester United").
+
+**6. Event matching** (`event_matching.py`)
+
+`match_records_to_canonical_events()` groups records from all providers that refer to the same real-world game:
+
+1. `infer_event_identity()` parses team names from the event description using separators like `" at "`, `" @ "`, `" vs "`, or `" v "` (ordered separators set away/home; unordered do not).
+2. Each team name is normalised through the alias dictionary.
+3. Records are matched to an existing `_MutableGroup` if they share the same league, the same unordered team pair, and a start time within ±30 minutes.
+4. On no match, a new group is created.
+5. The canonical event ID is built as `league|YYYYMMDDTHHMM|home_team|away_team`.
+
+**7. Market filtering** (`market_matching.py`)
+
+`is_game_win_loss_record()` keeps only records where:
+- The market type is `two_way` or `three_way` (moneyline).
+- The selection name is one of the two identified teams, `"draw"`, or `"tie"`.
+
+Exchange-specific data (lay depth, order book levels, commissions) are preserved in each record's `metadata` dict for potential future use.
+
+**8. Aggregation** (`cli.py`)
+
+Filtered records are grouped by canonical event ID. For each game, the best decimal odds per team per provider are computed (highest for back, lowest for lay) and written into a flat dict — the aggregated game entry. Market IDs from each provider are stored alongside odds to enable `--update` mode targeted re-fetching.
+
+**9. Market index** (`*_market_index.json`)
+
+The index is an additive store keyed by `(team1, team2, date_time)`. Full and index-only runs append new entries; they never remove existing ones. Update-mode runs prune entries only when all stored provider IDs return no odds (indicating the market has closed).
+
+## TODO
+
+- **Investigate liquidity numbers** — the `*_back_avail` / `*_lay_avail` fields in the aggregated games output are partially populated. Verify that the available stake figures from each provider (Matchbook order depth, Smarkets contract liquidity, SX Bet taker-available calculation, Polymarket CLOB size) are computed and converted to a common currency (GBP) consistently, and surface them correctly in `arb_finder.py` per-leg output.
+
+- **Investigate SX Bet further** — SX Bet returns `type == 1` for soccer markets but this has not been validated against real EPL/UCL data. The `_process_soccer_markets` grouping logic (using `sportXEventId` with a `gameTime|teamOne|teamTwo` fallback) and the back/lay probability derivation from P2P maker orders need end-to-end verification once live soccer markets are available on SX Bet. Rate-limit handling (HTTP 429 / Cloudflare error 1015) has been mitigated by batching all market-hash requests in update mode, but may still occur during full fetches with many leagues.

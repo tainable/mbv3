@@ -135,68 +135,183 @@ class SxBetProvider(OddsProvider):
             )
         ]
 
-        for game in non_soccer_games:
-            market_hash = game["sx_bet_market_hash"]
-            league = game["league"]
-            self.debug(f"{self.name}: targeted fetch hash={market_hash} league={league}")
+        if non_soccer_games:
+            all_hashes = [g["sx_bet_market_hash"] for g in non_soccer_games]
+            self.debug(f"{self.name}: targeted fetch: batching {len(all_hashes)} market hashes")
+            best_odds_map = self._fetch_best_odds(all_hashes)
+            avail_map = self._fetch_available(all_hashes)
 
-            best_odds_map = self._fetch_best_odds([market_hash])
-            avail_map = self._fetch_available([market_hash])
-            best = best_odds_map.get(market_hash)
-            if best is None:
-                self.debug(f"{self.name}: no best odds for {market_hash}, skipping")
-                continue
+            for game in non_soccer_games:
+                market_hash = game["sx_bet_market_hash"]
+                league = game["league"]
+                best = best_odds_map.get(market_hash)
+                if best is None:
+                    self.debug(f"{self.name}: no best odds for {market_hash}, skipping")
+                    continue
 
-            game_time_iso = game.get("date_time")
-            game_time_unix: int | None = None
-            if game_time_iso:
+                game_time_iso = game.get("date_time")
+                game_time_unix: int | None = None
+                if game_time_iso:
+                    try:
+                        game_time_unix = int(
+                            datetime.fromisoformat(
+                                game_time_iso.replace("Z", "+00:00")
+                            ).timestamp()
+                        )
+                    except (ValueError, AttributeError):
+                        pass
+
+                # SX Bet's outcomeOne/outcomeTwo correspond to the original teamOneName/teamTwoName
+                # from the market, which may differ from the canonical team1/team2 ordering.
+                # Use the stored sx_bet_outcome_one_team to reconstruct the correct order.
+                stored_outcome_one = game.get("sx_bet_outcome_one_team")
+                team1_raw = game.get("team1") or ""
+                team2_raw = game.get("team2") or ""
+                if stored_outcome_one and stored_outcome_one == normalize_team_name(team2_raw, league):
+                    sx_team_one, sx_team_two = team2_raw, team1_raw
+                else:
+                    sx_team_one, sx_team_two = team1_raw, team2_raw
+
+                synthetic_market: dict[str, Any] = {
+                    "marketHash": market_hash,
+                    "teamOneName": sx_team_one,
+                    "teamTwoName": sx_team_two,
+                    "gameTime": game_time_unix,
+                    "sportXEventId": None,
+                    "leagueId": _LEAGUE_IDS.get(league),
+                }
                 try:
-                    game_time_unix = int(
-                        datetime.fromisoformat(
-                            game_time_iso.replace("Z", "+00:00")
-                        ).timestamp()
+                    market_records = self._market_to_records(
+                        synthetic_market, best, league, retrieved_at,
+                        avail=avail_map.get(market_hash),
                     )
-                except (ValueError, AttributeError):
-                    pass
-
-            synthetic_market: dict[str, Any] = {
-                "marketHash": market_hash,
-                "teamOneName": game.get("team1") or "",
-                "teamTwoName": game.get("team2") or "",
-                "gameTime": game_time_unix,
-                "sportXEventId": None,
-                "leagueId": _LEAGUE_IDS.get(league),
-            }
-            try:
-                market_records = self._market_to_records(
-                    synthetic_market, best, league, retrieved_at,
-                    avail=avail_map.get(market_hash),
-                )
-                records.extend(market_records)
-                self.debug(
-                    f"{self.name}: targeted fetch hash={market_hash} -> {len(market_records)} records"
-                )
-            except Exception as exc:
-                warnings.append(f"Skipped SX Bet market {market_hash}: {exc}")
-                self.debug(f"{self.name}: targeted fetch: skipped market {market_hash}: {exc}")
+                    records.extend(market_records)
+                    self.debug(
+                        f"{self.name}: targeted fetch hash={market_hash} -> {len(market_records)} records"
+                    )
+                except Exception as exc:
+                    warnings.append(f"Skipped SX Bet market {market_hash}: {exc}")
+                    self.debug(f"{self.name}: targeted fetch: skipped market {market_hash}: {exc}")
 
         for soccer_league in soccer_leagues_in_scope:
             league_id = _LEAGUE_IDS.get(soccer_league)
             if league_id is None:
                 warnings.append(f"{self.name}: no league ID for {soccer_league}, skipping targeted fetch")
                 continue
-            self.debug(f"{self.name}: targeted fetch: {soccer_league} falling back to full league fetch")
-            soccer_markets = self._fetch_markets(league_id, soccer_league)
-            if soccer_markets:
-                market_hashes = [m["marketHash"] for m in soccer_markets]
-                hash_to_market = {m["marketHash"]: m for m in soccer_markets}
-                best_odds_map = self._fetch_best_odds(market_hashes)
-                avail_map = self._fetch_available(market_hashes)
-                soccer_records, soccer_warnings = self._process_soccer_markets(
-                    hash_to_market, best_odds_map, avail_map, soccer_league, retrieved_at
+
+            soccer_games = [
+                g for g in game_contexts
+                if g.get("league") == soccer_league and g.get("sx_bet_market_hash")
+            ]
+
+            # Partition into games that have stored per-outcome hashes (targeted)
+            # and those that don't (fall back to full league scan).
+            targeted_games = [
+                g for g in soccer_games
+                if g.get("sx_bet_team1_market_hash") and g.get("sx_bet_team2_market_hash")
+            ]
+            fallback_games = [g for g in soccer_games if g not in targeted_games]
+
+            if targeted_games:
+                self.debug(
+                    f"{self.name}: targeted fetch: {soccer_league} using stored slot hashes"
+                    f" for {len(targeted_games)} games"
                 )
-                records.extend(soccer_records)
-                warnings.extend(soccer_warnings)
+                for game in targeted_games:
+                    slot_hashes: dict[str, str] = {}
+                    for slot in ("team1", "draw", "team2"):
+                        h = game.get(f"sx_bet_{slot}_market_hash")
+                        if h:
+                            slot_hashes[slot] = h
+
+                    all_hashes = list(slot_hashes.values())
+                    best_odds_map = self._fetch_best_odds(all_hashes)
+                    avail_map = self._fetch_available(all_hashes)
+
+                    team1_name = normalize_team_name(game.get("team1") or "", soccer_league)
+                    team2_name = normalize_team_name(game.get("team2") or "", soccer_league)
+                    slot_outcome_names = {"team1": team1_name, "draw": "draw", "team2": team2_name}
+
+                    game_time_iso = game.get("date_time")
+                    game_time_unix: int | None = None
+                    if game_time_iso:
+                        try:
+                            game_time_unix = int(
+                                datetime.fromisoformat(
+                                    game_time_iso.replace("Z", "+00:00")
+                                ).timestamp()
+                            )
+                        except (ValueError, AttributeError):
+                            pass
+                    event_start = _unix_to_iso(game_time_unix) if game_time_unix else None
+                    event_name = f"{team1_name} vs {team2_name}"
+
+                    for slot, market_hash in slot_hashes.items():
+                        best = best_odds_map.get(market_hash)
+                        if best is None:
+                            continue
+                        outcome_name = slot_outcome_names[slot]
+                        avail = avail_map.get(market_hash)
+                        avail_by_side = {
+                            "back": round(avail["outcome_one_avail_usd"], 2) if avail else None,
+                            "lay":  round(avail["outcome_two_avail_usd"], 2) if avail else None,
+                        }
+                        outcome_one_data = best.get("outcomeOne", {})
+                        outcome_two_data = best.get("outcomeTwo", {})
+                        for side, maker_data in (("back", outcome_two_data), ("lay", outcome_one_data)):
+                            raw_pct = maker_data.get("percentageOdds")
+                            if raw_pct is None:
+                                continue
+                            try:
+                                maker_prob = int(raw_pct) / _ODDS_SCALE
+                            except (TypeError, ValueError):
+                                continue
+                            prob = (1.0 - maker_prob) if side == "back" else maker_prob
+                            if not (0.0 < prob < 1.0):
+                                continue
+                            records.append(
+                                OddsRecord(
+                                    provider=self.name,
+                                    sport="soccer",
+                                    league=soccer_league,
+                                    event_name=event_name,
+                                    event_start=event_start,
+                                    market_name="Match Result",
+                                    market_type="three_way",
+                                    selection_name=outcome_name,
+                                    selection_side=side,
+                                    decimal_odds=round(1.0 / prob, 6),
+                                    implied_probability=round(prob, 6),
+                                    currency="USD",
+                                    source_market_id=market_hash,
+                                    source_event_id=None,
+                                    retrieved_at=retrieved_at,
+                                    metadata={
+                                        "market_hash": market_hash,
+                                        "game_time": game_time_unix,
+                                        "league_id": league_id,
+                                        "market_type": _SOCCER_RESULT_TYPE,
+                                        "available_usd": avail_by_side[side],
+                                    },
+                                )
+                            )
+
+            if fallback_games:
+                self.debug(
+                    f"{self.name}: targeted fetch: {soccer_league} falling back to full league scan"
+                    f" for {len(fallback_games)} games (no stored slot hashes)"
+                )
+                soccer_markets = self._fetch_markets(league_id, soccer_league)
+                if soccer_markets:
+                    market_hashes = [m["marketHash"] for m in soccer_markets]
+                    hash_to_market = {m["marketHash"]: m for m in soccer_markets}
+                    best_odds_map = self._fetch_best_odds(market_hashes)
+                    avail_map = self._fetch_available(market_hashes)
+                    soccer_records, soccer_warnings = self._process_soccer_markets(
+                        hash_to_market, best_odds_map, avail_map, soccer_league, retrieved_at
+                    )
+                    records.extend(soccer_records)
+                    warnings.extend(soccer_warnings)
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
@@ -515,6 +630,9 @@ class SxBetProvider(OddsProvider):
                         "league_id": market.get("leagueId"),
                         "market_type": _MONEYLINE_TYPE,
                         "available_usd": round(avail_usd, 2) if avail_usd is not None else None,
+                        # Stored so update mode can reconstruct the correct synthetic
+                        # market order without a round-trip to the SX Bet API.
+                        "outcome_one_team": team_one,
                     },
                 )
             )

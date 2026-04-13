@@ -438,40 +438,65 @@ def _polymarket_slot_for_outcome(game: dict, outcome_name: str) -> str:
     return "team1"  # fallback
 
 
-def _fetch_polymarket_leg(game: dict, outcome_name: str, side: str, http) -> float | None:
-    # Use per-slot market ID (UCL has one Yes/No market per outcome)
+def _fetch_polymarket_leg(game: dict, outcome_name: str, side: str, http, settings) -> float | None:
+    """Fetch a single Polymarket leg using the CLOB API for accurate bid/ask prices."""
     slot = _polymarket_slot_for_outcome(game, outcome_name)
+    clob_base = settings.polymarket.clob_base_url
+
+    # Fast path: use stored CLOB token ID (populated since run.py stored clobTokenIds)
+    token_id = game.get(f"polymarket_{slot}_clob_token_id")
+    if token_id:
+        try:
+            book = http.get_json(f"{clob_base}/book", params={"token_id": token_id})
+            levels = book.get("bids" if side == "lay" else "asks", [])
+            if not levels:
+                return None
+            p = float(levels[-1]["price"])
+            return round(1.0 / p, 6) if 0 < p < 1 else None
+        except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+            print(f"WARNING: polymarket CLOB fetch failed for token {token_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return None
+
+    # Fallback: look up clobTokenIds via Gamma (for older data without stored CLOB tokens)
     market_id = game.get(f"polymarket_{slot}_market_id") or game.get("polymarket_market_id")
     if not market_id:
         return None
     try:
-        result = http.get_json(
-            "https://gamma-api.polymarket.com/markets",
-            params={"id": market_id},
-        )
-        market = result[0] if isinstance(result, list) and result else None
-        if not market:
+        gamma_base = settings.polymarket.gamma_base_url
+
+        raw = http.get_json(f"{gamma_base}/markets", params={"id": market_id})
+        market_data = raw[0] if isinstance(raw, list) else raw
+        outcomes_raw = market_data.get("outcomes") or []
+        if isinstance(outcomes_raw, str):
+            outcomes_raw = json.loads(outcomes_raw)
+        clob_ids = market_data.get("clobTokenIds") or []
+        if isinstance(clob_ids, str):
+            clob_ids = json.loads(clob_ids)
+
+        if not clob_ids:
             return None
-        outcomes = _parse_str_json_list(market.get("outcomes"))
-        # Yes/No binary market (UCL): the market IS the outcome — return odds directly
-        if {o.lower() for o in outcomes} <= {"yes", "no"}:
-            if side == "lay":
-                p = float(market["bestBid"])
-            else:
-                p = float(market["bestAsk"])
-            return round(1.0 / p, 6) if p and 0 < p < 1 else None
-        # Standard multi-outcome market: find by name
-        idx = next((i for i, o in enumerate(outcomes) if _names_match(str(o), outcome_name)), None)
-        if idx is None:
-            return None
-        if len(outcomes) == 2:
-            p = float(market["bestAsk"]) if idx == 0 else 1.0 - float(market["bestBid"])
+
+        is_binary = {o.lower() for o in outcomes_raw} <= {"yes", "no"}
+        if is_binary:
+            yes_idx = next((i for i, o in enumerate(outcomes_raw) if o.lower() == "yes"), 0)
+            token_id = clob_ids[yes_idx] if yes_idx < len(clob_ids) else None
         else:
-            prices = _parse_str_json_list(market.get("outcomePrices"))
-            p = float(prices[idx])
-        return round(1.0 / p, 6) if p and p > 0 else None
+            token_id = next(
+                (tid for o, tid in zip(outcomes_raw, clob_ids) if _names_match(str(o), outcome_name)),
+                None,
+            )
+        if not token_id:
+            return None
+
+        book = http.get_json(f"{clob_base}/book", params={"token_id": token_id})
+        levels = book.get("bids" if side == "lay" else "asks", [])
+        if not levels:
+            return None
+        p = float(levels[-1]["price"])
+        return round(1.0 / p, 6) if 0 < p < 1 else None
+
     except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
-        print(f"WARNING: polymarket live fetch failed for market {market_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+        print(f"WARNING: polymarket CLOB fetch failed for market {market_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
         return None
 
 
@@ -570,7 +595,7 @@ def _fetch_sx_bet_leg(game: dict, outcome_name: str, side: str, http, settings) 
 
 def _fetch_leg(provider: str, game: dict, outcome_name: str, side: str, http, settings) -> float | None:
     if provider == "polymarket":
-        return _fetch_polymarket_leg(game, outcome_name, side, http)
+        return _fetch_polymarket_leg(game, outcome_name, side, http, settings)
     if provider == "smarkets":
         return _fetch_smarkets_leg(game, outcome_name, side, http)
     if provider == "matchbook":
@@ -597,9 +622,13 @@ def _refresh_sure_bet(arb: dict, game: dict | None, http, settings, refreshed_at
         return
 
     print("    Refreshing... ", end="", flush=True)
-    fresh_t1 = _fetch_leg(arb["team1_back_provider"], game, arb["team1"], "back", http, settings)
-    fresh_draw = _fetch_leg(arb["draw_back_provider"], game, "Draw", "back", http, settings) if arb.get("draw_back_provider") else None
-    fresh_t2 = _fetch_leg(arb["team2_back_provider"], game, arb["team2"], "back", http, settings)
+    try:
+        fresh_t1 = _fetch_leg(arb["team1_back_provider"], game, arb["team1"], "back", http, settings)
+        fresh_draw = _fetch_leg(arb["draw_back_provider"], game, "Draw", "back", http, settings) if arb.get("draw_back_provider") else None
+        fresh_t2 = _fetch_leg(arb["team2_back_provider"], game, arb["team2"], "back", http, settings)
+    except Exception as exc:
+        print(f"failed\n    [refresh error: {exc}]\n")
+        return
     print(f"done  ({refreshed_at})\n")
 
     t1_str = f"{fresh_t1:.4f}{_delta_str(arb['team1_back_odds'], fresh_t1)}" if fresh_t1 else "N/A"
@@ -624,7 +653,14 @@ def _refresh_sure_bet(arb: dict, game: dict | None, http, settings, refreshed_at
             fresh_net_profit = (1.0 / fresh_net_margin - 1) * 100
             fresh_gross_profit = (1.0 / fresh_gross_margin - 1) * 100
             gross_str = f"  (gross: {fresh_gross_profit:.4f}%)" if abs(fresh_gross_profit - fresh_net_profit) > 0.0001 else ""
-            print(f"    Fresh net profit: {fresh_net_profit:.4f}%{gross_str}  (was {arb['profit_pct']:.4f}%, {fresh_net_profit - arb['profit_pct']:+.4f}pp)  --> ARB STILL VALID")
+            delta = fresh_net_profit - arb['profit_pct']
+            if abs(delta) < 0.0001:
+                status = "ARB UNCHANGED"
+            elif delta > 0:
+                status = "ARB INCREASED"
+            else:
+                status = "ARB DECREASED"
+            print(f"    Fresh net profit: {fresh_net_profit:.4f}%{gross_str}  (was {arb['profit_pct']:.4f}%, {delta:+.4f}pp)  --> {status}")
         else:
             print(f"    Fresh net profit: net margin {fresh_net_margin:.6f} >= 1  --> ARB GONE")
     else:
@@ -643,8 +679,12 @@ def _refresh_back_lay_arb(arb: dict, game: dict | None, http, settings, refreshe
         return
 
     print("    Refreshing... ", end="", flush=True)
-    fresh_back = _fetch_leg(arb["back_provider"], game, arb["arb_outcome"], "back", http, settings)
-    fresh_lay = _fetch_leg(arb["lay_provider"], game, arb["arb_outcome"], "lay", http, settings)
+    try:
+        fresh_back = _fetch_leg(arb["back_provider"], game, arb["arb_outcome"], "back", http, settings)
+        fresh_lay = _fetch_leg(arb["lay_provider"], game, arb["arb_outcome"], "lay", http, settings)
+    except Exception as exc:
+        print(f"failed\n    [refresh error: {exc}]\n")
+        return
     print(f"done  ({refreshed_at})\n")
 
     b_str = f"{fresh_back:.4f}{_delta_str(arb['back_odds'], fresh_back)}" if fresh_back else "N/A"
@@ -659,7 +699,14 @@ def _refresh_back_lay_arb(arb: dict, game: dict | None, http, settings, refreshe
             fresh_net_profit = (eff_b / eff_l - 1) * 100
             fresh_gross_profit = (fresh_back / fresh_lay - 1) * 100
             gross_str = f"  (gross: {fresh_gross_profit:.4f}%)" if abs(fresh_gross_profit - fresh_net_profit) > 0.0001 else ""
-            print(f"    Fresh net profit: {fresh_net_profit:.4f}%{gross_str}  (was {arb['profit_pct']:.4f}%, {fresh_net_profit - arb['profit_pct']:+.4f}pp)  --> ARB STILL VALID")
+            delta = fresh_net_profit - arb['profit_pct']
+            if abs(delta) < 0.0001:
+                status = "ARB UNCHANGED"
+            elif delta > 0:
+                status = "ARB INCREASED"
+            else:
+                status = "ARB DECREASED"
+            print(f"    Fresh net profit: {fresh_net_profit:.4f}%{gross_str}  (was {arb['profit_pct']:.4f}%, {delta:+.4f}pp)  --> {status}")
         else:
             print(f"    Fresh net profit: eff_back {eff_b:.4f} <= eff_lay {eff_l:.4f}  --> ARB GONE")
     else:

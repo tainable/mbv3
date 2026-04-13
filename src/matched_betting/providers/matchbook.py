@@ -22,6 +22,8 @@ class MatchbookProvider(OddsProvider):
         super().__init__(debug_logger)
         self.settings = settings
         self.http_client = http_client
+        self._session_token: str | None = None
+        self._login_lock = __import__("threading").Lock()
 
     def fetch_odds(self, leagues: list[str]) -> ProviderPayload:
         if not (self.settings.username and self.settings.password):
@@ -30,9 +32,7 @@ class MatchbookProvider(OddsProvider):
             )
 
         retrieved_at = utc_now_iso()
-        self.debug(f"{self.name}: logging in")
         self._login()
-        self.debug(f"{self.name}: login successful")
 
         if any(lg in leagues for lg in ("ucl", "epl")):
             self._log_available_sports()
@@ -76,9 +76,7 @@ class MatchbookProvider(OddsProvider):
                 "Matchbook credentials are missing. Add MATCHBOOK_USERNAME and MATCHBOOK_PASSWORD to .env."
             )
         retrieved_at = utc_now_iso()
-        self.debug(f"{self.name}: targeted fetch: logging in")
         self._login()
-        self.debug(f"{self.name}: targeted fetch: login successful")
 
         records: list[OddsRecord] = []
         warnings: list[str] = []
@@ -106,18 +104,23 @@ class MatchbookProvider(OddsProvider):
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
     def _login(self) -> str:
-        response = self.http_client.post_json(
-            f"{self.settings.base_url}/bpapi/rest/security/session",
-            payload={
-                "username": self.settings.username,
-                "password": self.settings.password,
-            },
-            headers={"Accept": "application/json"},
-        )
-        token = response.get("session-token")
-        if not token:
-            raise ProviderNotReadyError("Matchbook login succeeded without a session token.")
-        return str(token)
+        with self._login_lock:
+            if self._session_token:
+                return self._session_token
+            response = self.http_client.post_json(
+                f"{self.settings.base_url}/bpapi/rest/security/session",
+                payload={
+                    "username": self.settings.username,
+                    "password": self.settings.password,
+                },
+                headers={"Accept": "application/json"},
+            )
+            token = response.get("session-token")
+            if not token:
+                raise ProviderNotReadyError("Matchbook login succeeded without a session token.")
+            self._session_token = str(token)
+            self.debug(f"{self.name}: login successful")
+            return self._session_token
 
     def _log_available_sports(self) -> None:
         try:

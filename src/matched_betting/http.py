@@ -68,7 +68,7 @@ class HttpClient:
                     return json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
                 if exc.code == 429 and attempt < self.max_retries:
-                    time.sleep(1 + attempt)
+                    time.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
                     continue
                 try:
                     body = exc.read().decode("utf-8", errors="replace")

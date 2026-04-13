@@ -345,7 +345,7 @@ class SmarketsProvider(OddsProvider):
         return payload
 
     def _pace_market_requests(self) -> None:
-        delay = 0.25+(random.random())*0.05
+        delay = 0.6 + random.random() * 0.4  # 0.6–1.0s
         time.sleep(delay)
 
 
