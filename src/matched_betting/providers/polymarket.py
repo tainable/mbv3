@@ -15,12 +15,15 @@ from matched_betting.providers.base import GameContext, OddsProvider
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
+    "uel": "soccer",
+    "ipl": "cricket",
 }
 
 # Leagues that use Yes/No binary markets per outcome (soccer-style)
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel"})
 
 
 class PolymarketProvider(OddsProvider):
@@ -86,6 +89,14 @@ class PolymarketProvider(OddsProvider):
                             league = 'mlb'
                             candidate_markets.append((market, league))
 
+            _nhl_non_moneyline = {"spread", "total", "over", "under", "puck-line", "puckline"}
+            if "nhl" in leagues and "nhl" in split_slug[0]:
+                if not any(seg in _nhl_non_moneyline for seg in split_slug):
+                    nhl_slugs = team_index.get("nhl", [])
+                    if split_slug[1] in nhl_slugs and split_slug[2] in nhl_slugs:
+                        league = 'nhl'
+                        candidate_markets.append((market, league))
+
             ucl_teams = team_index.get("ucl", [])
             if "ucl" in leagues and ucl_teams:
 
@@ -103,6 +114,23 @@ class PolymarketProvider(OddsProvider):
                     if split_slug[1] in epl_teams and split_slug[2] in epl_teams:
                         if split_slug[-1] in epl_teams or split_slug[-1] == "draw":
                             candidate_markets.append((market, "epl"))
+
+            uel_teams = team_index.get("uel", [])
+            if "uel" in leagues and uel_teams:
+                # Match head-to-head UEL slugs: uel-{team1}-{team2}-{date}-{team_or_draw}
+                if split_slug[0] == "uel" and len(split_slug) >= 3:
+                    if split_slug[1] in uel_teams and split_slug[2] in uel_teams:
+                        if split_slug[-1] in uel_teams or split_slug[-1] == "draw":
+                            candidate_markets.append((market, "uel"))
+
+            _cricket_non_moneyline = {"innings", "runs", "wickets", "fours", "sixes", "total", "over", "under"}
+            if "ipl" in leagues and split_slug[0] == "cricipl":
+                if not any(seg in _cricket_non_moneyline for seg in split_slug):
+                    ipl_slugs = team_index.get("ipl", [])
+                    # Slug format: cricipl-{team1}-{team2} or cricipl-{team1}-{team2}-{date}
+                    # TODO: verify exact Polymarket team slug codes for IPL
+                    if len(split_slug) >= 3 and split_slug[1] in ipl_slugs and split_slug[2] in ipl_slugs:
+                        candidate_markets.append((market, "ipl"))
 
         
         self.debug(f"{self.name}: found {len(candidate_markets)} candidate markets after league filtering")
@@ -214,14 +242,12 @@ class PolymarketProvider(OddsProvider):
                 team1_token = game.get("polymarket_team1_clob_token_id")
                 team2_token = game.get("polymarket_team2_clob_token_id")
 
-                if team1_token or team2_token:
-                    # Use stored CLOB token IDs directly, one book call per outcome
+                if team1_token and team2_token:
+                    # Both token IDs stored — use direct CLOB path, one call per outcome.
                     for outcome_name, clob_token_id, slot_market_id in [
                         (team1_name, team1_token, game.get("polymarket_team1_market_id") or market_id),
                         (team2_name, team2_token, game.get("polymarket_team2_market_id") or market_id),
                     ]:
-                        if not clob_token_id:
-                            continue
                         self.debug(f"{self.name}: CLOB direct token={clob_token_id} outcome={outcome_name!r}")
                         try:
                             slot_records = self._fetch_clob_records_by_token(
@@ -234,7 +260,9 @@ class PolymarketProvider(OddsProvider):
                             warnings.append(f"Skipped Polymarket CLOB token {clob_token_id}: {exc}")
                             self.debug(f"{self.name}: CLOB: skipped token {clob_token_id}: {exc}")
                 elif market_id:
-                    # Fallback: resolve token IDs via Gamma (older aggregated games output)
+                    # Only one token stored (or none) — Gamma resolves both token IDs at once.
+                    # This handles games from before both tokens were stored (e.g. the IPL
+                    # "Indian Premier League" prefix bug that left team1 token null).
                     self.debug(f"{self.name}: CLOB gamma-lookup market_id={market_id} league={league}")
                     try:
                         game_records = self._fetch_clob_moneyline_records(
@@ -433,6 +461,16 @@ class PolymarketProvider(OddsProvider):
                 'cin','bos','laa','hou','det','sd','tex','phi',
                 'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']
 
+            elif league == "nhl":
+                # TODO: verify exact Polymarket team slug codes for NHL.
+                index[league] = [
+                    'min','stl','buf','chi','col','edm',
+                    'lak','sea','wpg','vgk','mon','phi',
+                    'nj','bos','car','nyi','wsh','cbj',
+                'ana','cal','utah','pit'
+                'sjs','nsh','van','dal','buf','nyr','tb',
+                'det','fla','tor','ott']
+
             elif league == "ucl":
                 index[league] = ['rma1','bay1','spo1','ars','psg1','liv1','fcb1','atm1']
 
@@ -442,6 +480,25 @@ class PolymarketProvider(OddsProvider):
                     'ars','che','liv','mac','mun','tot','new','ast',
                     'bri','wes','wol','cry','ful','bre','eve','bou','not',
                     'bur','lee','sun',  # promoted: Burnley, Leeds, Sunderland
+                ]
+
+            elif league == "uel":
+                # TODO: verify exact Polymarket team slug codes for UEL.
+                # Add/remove as the competition progresses each season.
+                index[league] = [
+                    'not', 'por1',
+                    'cel4', 'scf',
+                    'ast4', 'bol',
+                    'bet1', 'scb',
+                ]
+
+            elif league == "ipl":
+                # Polymarket uses short lower-case team codes in IPL slugs.
+                # Format: cricipl-{team1}-{team2}[-{date}]
+                # TODO: verify exact codes once live IPL markets appear on Polymarket.
+                index[league] = [
+                    'mum', 'che', 'raj', 'kol', 'del',
+                    'pun',  'sun', 'luc', 'guj','raj'
                 ]
 
             else:
@@ -504,10 +561,16 @@ class PolymarketProvider(OddsProvider):
             return "nba"
         if "mlb" in question:
             return "mlb"
+        if "nhl" in question or "hockey" in question:
+            return "nhl"
         if "ucl" in question:
             return "ucl"
         if "premier league" in question or "epl" in question:
             return "epl"
+        if "uel" in question or "europa league" in question:
+            return "uel"
+        if "ipl" in question or "cricket" in question or "cricipl" in question:
+            return "ipl"
 
         return None
 
@@ -609,7 +672,7 @@ class PolymarketProvider(OddsProvider):
                     or "Unknown event"
                 )
 
-        if league in ("mlb", "ucl", "epl"):
+        if league in ("mlb", "nhl", "ucl", "epl", "uel", "ipl"):
             event_start = event.get("startTime")
         else:
             event_start = event.get("endDate")

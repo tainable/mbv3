@@ -1,30 +1,31 @@
 """
 scan.py
 -------
-Per-game pipeline: for every multi-provider game in the market index, fetch
-odds from all providers simultaneously, run the arb finder on that game
-immediately, and print any arbs found straight away — without waiting for
-other games to finish.
+Stage 2 of the pipeline: read the IDs JSON produced by ids.py and, for each
+game, fetch live odds from all providers simultaneously, immediately run the
+arb calculator (sure-bets and back-lay arbs including fees), then move to the
+next game.
+
+By default Smarkets is excluded. Pass --providers smarkets to include it.
 
 Usage:
     python scan.py
+    python scan.py --ids outputs/active_game_ids.json
     python scan.py --leagues nba epl
-    python scan.py --providers polymarket smarkets
+    python scan.py --providers matchbook polymarket sx_bet
     python scan.py --min-profit 0.5
-    python scan.py --no-refresh
     python scan.py --debug
-    python scan.py --index outputs/latest_odds_market_index.json
 """
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 import sys
-import threading
+import time
 from typing import Any
 
 _PROJECT_ROOT = Path(__file__).resolve().parent
@@ -40,129 +41,268 @@ from matched_betting.market_matching import is_game_win_loss_record
 from matched_betting.models import OddsRecord
 from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
-from matched_betting.cli import _build_aggregated_games_payload
+from matched_betting.aggregation import build_aggregated_games_payload
+from matched_betting import calculator
 
 import arb_finder as _arb
 
-
-DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl"]
-DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet"]
+DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
+DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet"]  # Smarkets excluded by default
+DEFAULT_IDS = Path("outputs/active_game_ids.json")
 
 _PROVIDER_ID_FIELD = {
+    "matchbook":  "matchbook_event_id",
     "polymarket": "polymarket_market_id",
     "smarkets":   "smarkets_market_id",
-    "matchbook":  "matchbook_event_id",
     "sx_bet":     "sx_bet_market_hash",
 }
 
-# Serialises print output so concurrent game results don't interleave.
-_print_lock = threading.Lock()
+_MONTH = ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
 
 
-def _provider_coverage(game: dict[str, Any], providers: list[str]) -> int:
-    """Count how many requested providers have a stored market ID for this game."""
-    return sum(1 for p in providers if game.get(_PROVIDER_ID_FIELD.get(p, "")))
+# ---------------------------------------------------------------------------
+# Terminal display helpers
+# ---------------------------------------------------------------------------
+
+def _term_width() -> int:
+    try:
+        return os.get_terminal_size().columns
+    except OSError:
+        return 100
 
 
-def _load_game_contexts(
-    index_path: Path,
+def _hr(width: int | None = None) -> str:
+    return "━" * (width or _term_width())
+
+
+def _fmt_date(date_time: str | None) -> str:
+    """Format an ISO timestamp as '13 Apr 19:30' — cross-platform."""
+    if not date_time:
+        return ""
+    try:
+        dt = datetime.fromisoformat(date_time.replace("Z", "+00:00"))
+        return f"{dt.day} {_MONTH[dt.month - 1]} {dt.strftime('%H:%M')}"
+    except ValueError:
+        return ""
+
+
+
+_GAME_BUDGET = 1.5   # seconds per game (rate limiting + animation window)
+_ANIM_TICK   = 1 / 30  # ~30 fps refresh during the animation loop
+
+
+def _progress_line(fill: float, current: int, total: int, game: dict, width: int) -> str:
+    """Build a single-line progress string that fits within `width` columns.
+
+    fill    — continuous bar position in [0, total] (float, drives smooth animation)
+    current — integer game index shown in the X/Y counter
+    """
+    bar_w = 24
+    filled = round(bar_w * fill / total) if total else 0
+    bar = "█" * filled + "░" * (bar_w - filled)
+    team1 = game.get("team1") or ""
+    team2 = game.get("team2") or ""
+    league = (game.get("league") or "").upper()
+    date_s = _fmt_date(game.get("date_time"))
+    line = f"[{bar}] {current}/{total}  {team1} vs {team2}  [{league}]  {date_s}"
+    return line[: width - 1]  # never wrap
+
+
+# ---------------------------------------------------------------------------
+# Game loading
+# ---------------------------------------------------------------------------
+
+def _load_games(
+    ids_path: Path,
     leagues: list[str],
     providers: list[str],
 ) -> list[dict[str, Any]]:
-    """Flatten the market index into game-context dicts, keeping only multi-provider games."""
-    data = json.loads(index_path.read_text(encoding="utf-8"))
-    market_index = data.get("market_index", {})
-    contexts: list[dict[str, Any]] = []
-    for league_key, games in market_index.items():
-        if league_key not in leagues or not isinstance(games, list):
+    """Load game contexts from the IDs JSON, keeping only games with ≥2 provider IDs."""
+    data = json.loads(ids_path.read_text(encoding="utf-8"))
+    result = []
+    for game in data.get("games", []):
+        if game.get("league") not in leagues:
             continue
-        for g in games:
-            ctx = {**g, "league": league_key}
-            if _provider_coverage(ctx, providers) >= 2:
-                contexts.append(ctx)
-    return contexts
+        coverage = sum(1 for p in providers if game.get(_PROVIDER_ID_FIELD.get(p, "")))
+        if coverage >= 2:
+            result.append(game)
+    return result
 
+
+# ---------------------------------------------------------------------------
+# Per-game scan (no stdout side effects — returns arbs only)
+# ---------------------------------------------------------------------------
 
 def _scan_game(
-    game_ctx: dict[str, Any],
+    game: dict[str, Any],
     providers: list[str],
     leagues: list[str],
     registry: dict,
     min_profit_pct: float,
     debug: Any,
 ) -> tuple[list[dict], list[dict], list[dict]]:
-    """Fetch all providers for one game, run the arb finder, print arbs immediately.
+    """Fetch all providers for one game in parallel and run the arb calculator.
 
-    Returns (aggregated_games, sure_bets, back_lay_arbs) so the caller can
-    pass aggregated_games to run_refresh if needed.
+    Returns (sure_bets, back_lay_arbs, games_payload). All stdout printing is
+    handled by the caller so the progress line can be cleared cleanly.
     """
-    # Fetch all providers for this single game in parallel.
+    label = f"{game.get('team1')} vs {game.get('team2')}  [{game.get('league', '').upper()}]"
+
     records: list[OddsRecord] = []
+    game_t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=len(providers)) as executor:
         futures = {
-            executor.submit(registry[name].fetch_odds_by_ids, [game_ctx], leagues): name
+            executor.submit(registry[name].fetch_odds_by_ids, [game], leagues): (name, time.monotonic())
             for name in providers
             if name in registry
         }
         for future in as_completed(futures):
-            provider_name = futures[future]
+            name, t0 = futures[future]
+            elapsed = time.monotonic() - t0
             try:
                 payload = future.result()
                 records.extend(payload.records)
-                debug(
-                    f"  {game_ctx.get('team1')} vs {game_ctx.get('team2')}"
-                    f" [{game_ctx.get('league', '').upper()}]"
-                    f" {provider_name}: {len(payload.records)} records"
-                )
+                debug(f"  {label}  {name}: {len(payload.records)} records  ({elapsed:.1f}s)")
             except ProviderNotReadyError:
                 pass
             except Exception as exc:
-                debug(
-                    f"  {game_ctx.get('team1')} vs {game_ctx.get('team2')}"
-                    f" {provider_name}: failed — {exc}"
-                )
+                debug(f"  {label}  {name}: failed — {exc}  ({elapsed:.1f}s)")
+    game_elapsed = time.monotonic() - game_t0
+    if game_elapsed > 3:
+        debug(f"  {label}  SLOW GAME: total fetch took {game_elapsed:.1f}s")
 
     records = [r for r in records if is_game_win_loss_record(r)]
-    game_league = game_ctx.get("league", "?")
-    provider_hits = {(r.provider, game_league) for r in records}
-
     if not records:
-        return [], [], [], provider_hits
+        return [], [], []
 
     canonical_assignment, canonical_events = match_records_to_canonical_events(records)
-    games = _build_aggregated_games_payload(records, canonical_assignment, canonical_events)
+    games_payload = build_aggregated_games_payload(records, canonical_assignment, canonical_events)
 
-    sure_bets = _arb.find_sure_bets(games, min_profit_pct=min_profit_pct)
-    back_lay_arbs = _arb.find_back_lay_arbs(games, min_profit_pct=min_profit_pct)
+    sure_bets = _arb.find_sure_bets(games_payload, min_profit_pct=min_profit_pct)
+    back_lay_arbs = _arb.find_back_lay_arbs(games_payload, min_profit_pct=min_profit_pct)
 
-    if sure_bets or back_lay_arbs:
-        label = f"{game_ctx.get('team1')} vs {game_ctx.get('team2')}  [{game_ctx.get('league', '').upper()}]"
-        with _print_lock:
-            print(f"\n{'─'*60}")
-            print(f"ARB FOUND  {label}")
-            print(f"{'─'*60}")
-            if sure_bets:
-                print(f"  Sure bets ({len(sure_bets)}):")
-                _arb._print_sure_bets(sure_bets)
-            if back_lay_arbs:
-                print(f"  Back-lay arbs ({len(back_lay_arbs)}):")
-                _arb._print_back_lay_arbs(back_lay_arbs)
+    return sure_bets, back_lay_arbs, games_payload
 
-    return games, sure_bets, back_lay_arbs, provider_hits
 
+# ---------------------------------------------------------------------------
+# Odds display (--show-odds)
+# ---------------------------------------------------------------------------
+
+_PROVIDER_LABEL = {
+    "matchbook":  "Matchbook  ",
+    "smarkets":   "Smarkets   ",
+    "polymarket": "Polymarket ",
+    "sx_bet":     "SX Bet     ",
+}
+
+_PROVIDER_SHORT = {
+    "matchbook":  "MB",
+    "smarkets":   "SM",
+    "polymarket": "PM",
+    "sx_bet":     "SX",
+}
+
+
+def _print_odds_table(
+    i: int,
+    total: int,
+    game: dict[str, Any],
+    games_payload: list[dict[str, Any]],
+    providers: list[str],
+) -> None:
+    """Print a compact odds table for one game after scanning."""
+    team1 = game.get("team1") or "Team1"
+    team2 = game.get("team2") or "Team2"
+    league = (game.get("league") or "").upper()
+    date_s = _fmt_date(game.get("date_time"))
+    print(f"  [{i}/{total}]  {team1} vs {team2}  [{league}]  {date_s}")
+
+    if not games_payload:
+        print("    (no odds returned by any provider)")
+        print()
+        return
+
+    g = games_payload[0]
+    three_way = g.get("market_type") == "three_way"
+    slots = ("team1", "draw", "team2") if three_way else ("team1", "team2")
+    slot_names = {"team1": team1, "draw": "Draw", "team2": team2}
+
+    # Column headers — shorten team names to keep lines tidy
+    def _short(name: str, max_len: int = 14) -> str:
+        return name if len(name) <= max_len else name[:max_len - 1] + "…"
+
+    headers = [_short(slot_names[s]) for s in slots]
+    col_w = max(6, *(len(h) for h in headers))
+
+    header_row = "  ".join(f"{h:<{col_w}}" for h in headers)
+    print(f"    {'':11s}  {header_row}")
+
+    for provider in providers:
+        label = _PROVIDER_LABEL.get(provider, f"{provider:<11s}")
+        cells = []
+        for slot in slots:
+            back = g.get(f"{provider}_{slot}_back_odds")
+            lay  = g.get(f"{provider}_{slot}_lay_odds")
+            if back is not None and lay is not None:
+                cell = f"{back:.3f}/{lay:.3f}"
+            elif back is not None:
+                cell = f"{back:.3f}"
+            else:
+                cell = "—"
+            cells.append(f"{cell:<{col_w}}")
+        print(f"    {label}  {'  '.join(cells)}")
+
+    # Closest arb lines
+    def _sp(name: str) -> str:
+        return _PROVIDER_SHORT.get(name, name[:2].upper())
+
+    def _pct_str(pct: float) -> str:
+        sign = "+" if pct >= 0 else ""
+        flag = "  ✓ ARB" if pct >= 0 else ""
+        return f"{sign}{pct:.2f}%{flag}"
+
+    sb = calculator.best_sure_bet_opportunity(g)
+    bl = calculator.best_back_lay_opportunity(g)
+
+    print(f"    {'':11s}  {'─' * max(20, col_w * len(slots) + 2 * (len(slots) - 1))}")
+
+    if sb:
+        t1n = _short(team1, 12)
+        t2n = _short(team2, 12)
+        t1_part = f"{t1n} @{sb['team1_back_odds']:.3f}({_sp(sb['team1_back_provider'])})"
+        t2_part = f"{t2n} @{sb['team2_back_odds']:.3f}({_sp(sb['team2_back_provider'])})"
+        if sb.get("draw_back_odds") is not None:
+            draw_part = f"Draw @{sb['draw_back_odds']:.3f}({_sp(sb['draw_back_provider'])})  "
+        else:
+            draw_part = ""
+        print(f"    Sure bet:    {t1_part}  {draw_part}{t2_part}  →  {_pct_str(sb['profit_pct'])}")
+
+    if bl:
+        outcome = _short(bl["arb_outcome"], 12)
+        b_part = f"back @{bl['back_odds']:.3f}({_sp(bl['back_provider'])})"
+        l_part = f"lay @{bl['lay_odds']:.3f}({_sp(bl['lay_provider'])})"
+        print(f"    Back-lay:    {outcome}  {b_part} / {l_part}  →  {_pct_str(bl['profit_pct'])}")
+
+    print()
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Fetch live odds per game and check for arbs immediately — "
-            "results print as soon as each game's odds are ready."
+            "Scan live odds game by game using IDs from ids.py, "
+            "reporting arbs immediately as each game is processed."
         )
     )
     parser.add_argument(
-        "--index",
+        "--ids",
         type=Path,
-        default=Path("outputs/latest_odds_market_index.json"),
-        help="Path to the market index JSON (default: outputs/latest_odds_market_index.json).",
+        default=DEFAULT_IDS,
+        help=f"Path to the IDs JSON produced by ids.py (default: {DEFAULT_IDS}).",
     )
     parser.add_argument(
         "--leagues",
@@ -170,15 +310,15 @@ def main() -> None:
         default=DEFAULT_LEAGUES,
         choices=DEFAULT_LEAGUES,
         metavar="LEAGUE",
-        help="Leagues to include: nba mlb ucl epl (default: all).",
+        help="Leagues to scan: nba mlb ucl epl uel nhl ipl (default: all).",
     )
     parser.add_argument(
         "--providers",
         nargs="+",
         default=DEFAULT_PROVIDERS,
-        choices=DEFAULT_PROVIDERS,
+        choices=["matchbook", "smarkets", "polymarket", "sx_bet"],
         metavar="PROVIDER",
-        help="Providers to query: matchbook smarkets polymarket sx_bet (default: all).",
+        help="Providers to query (default: matchbook polymarket sx_bet). Smarkets excluded by default.",
     )
     parser.add_argument(
         "--min-profit",
@@ -188,9 +328,9 @@ def main() -> None:
         help="Minimum net profit %% to report (default: 0.0).",
     )
     parser.add_argument(
-        "--no-refresh",
+        "--show-odds",
         action="store_true",
-        help="Skip the targeted odds re-fetch after all games are scanned.",
+        help="After each game, print the fetched back/lay odds per provider for debugging.",
     )
     parser.add_argument(
         "--debug",
@@ -201,106 +341,120 @@ def main() -> None:
 
     debug = stderr_debug if args.debug else noop_debug
 
-    index_path = args.index
-    if not index_path.is_absolute():
-        index_path = _PROJECT_ROOT / index_path
-
-    if not index_path.exists():
+    ids_path = args.ids if args.ids.is_absolute() else _PROJECT_ROOT / args.ids
+    if not ids_path.exists():
         print(
-            f"ERROR: market index not found at {index_path}\n"
-            "Run  python run.py  first to build the index.",
+            f"ERROR: IDs file not found at {ids_path}\n"
+            "Run  python ids.py  first to build the game ID index.",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    game_contexts = _load_game_contexts(index_path, args.leagues, args.providers)
-
-    run_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-    print(f"Scan started:    {run_at}")
-    print(f"Leagues:         {', '.join(args.leagues)}")
-    print(f"Providers:       {', '.join(args.providers)}")
-    print(f"Games in index:  {len(game_contexts)} multi-provider games")
-
-    if not game_contexts:
-        print(
-            "\nNo multi-provider games found. Run  python run.py  to populate the index."
-        )
-        return
-
-    by_league = Counter(g["league"] for g in game_contexts)
-    for league, count in sorted(by_league.items()):
-        print(f"    {league.upper():<6} {count} games")
-
-    smarkets_note = (
-        "Smarkets: 0% commission (60-day intro)"
-        if _arb.SMARKETS_ZERO_COMMISSION_PERIOD
-        else "Smarkets: 2% standard commission"
-    )
-    print(f"\nCommission: Matchbook 2% | {smarkets_note} | SX Bet 0% | Polymarket dynamic")
-    print("\nScanning — arbs print as they are found...\n")
+    games = _load_games(ids_path, args.leagues, args.providers)
 
     settings = load_settings(_PROJECT_ROOT)
+    calculator.configure(settings.commission)
     http_client = HttpClient()
     registry = build_provider_registry(settings, http_client, debug)
 
-    all_games: list[dict] = []
-    all_sure_bets: list[dict] = []
-    all_back_lay_arbs: list[dict] = []
-    games_scanned = 0
-    provider_hit_counts: Counter = Counter()  # keyed by (provider, league)
-    league_game_counts: Counter = Counter(g["league"] for g in game_contexts)
+    smarkets_note = (
+        "Smarkets 0% (60-day intro)"
+        if calculator.SMARKETS_ZERO_COMMISSION_PERIOD
+        else "Smarkets 2%"
+    )
+    commission_str = (
+        f"Matchbook {settings.commission.matchbook * 100:.0f}%"
+        f" | {smarkets_note}"
+        f" | SX Bet 0%"
+        f" | Polymarket dynamic"
+    )
 
-    # Each game is dispatched as a task. Within each task all providers are
-    # fetched in parallel, the arb finder runs, and any arb is printed
-    # immediately — without waiting for the other game tasks to finish.
-    with ThreadPoolExecutor(max_workers=min(len(game_contexts), 8)) as executor:
-        future_to_ctx = {
-            executor.submit(
-                _scan_game,
-                ctx, args.providers, args.leagues, registry,
-                args.min_profit, debug,
-            ): ctx
-            for ctx in game_contexts
-        }
-        for future in as_completed(future_to_ctx):
-            games_scanned += 1
-            try:
-                games, sure_bets, back_lay_arbs, provider_hits = future.result()
-                all_games.extend(games)
-                all_sure_bets.extend(sure_bets)
-                all_back_lay_arbs.extend(back_lay_arbs)
-                provider_hit_counts.update(provider_hits)
-            except Exception as exc:
-                ctx = future_to_ctx[future]
-                debug(
-                    f"Unhandled error for {ctx.get('team1')} vs {ctx.get('team2')}: {exc}"
-                )
+    started_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+    tw = _term_width()
+    print(_hr(tw))
+    print(f"  Started:    {started_at}")
+    print(f"  Leagues:    {',  '.join(args.leagues)}")
+    print(f"  Providers:  {',  '.join(args.providers)}")
+    print(f"  Games:      {len(games)}  (≥2 provider coverage)")
+    print(f"  Commission: {commission_str}")
+    print(_hr(tw))
+
+    if not games:
+        print("\nNo multi-provider games found. Run  python ids.py  to refresh the ID index.")
+        return
+
+    print()
+
+    total_sure_bets: list[dict] = []
+    total_back_lay_arbs: list[dict] = []
+    progress_on_screen = False
+
+    for i, game in enumerate(games, 1):
+        debug(f"[{i}/{len(games)}] {game.get('team1')} vs {game.get('team2')}")
+        progress_on_screen = True
+        game_start = time.monotonic()
+
+        # Run the scan in a background thread so the main thread can animate
+        # the progress bar smoothly throughout the full _GAME_BUDGET window.
+        with ThreadPoolExecutor(max_workers=1) as _scan_ex:
+            _future = _scan_ex.submit(
+                _scan_game, game, args.providers, args.leagues, registry, args.min_profit, debug
+            )
+            while True:
+                elapsed = time.monotonic() - game_start
+                # smooth_pos moves continuously from (i-1) → i over _GAME_BUDGET seconds
+                smooth_pos = (i - 1) + min(elapsed / _GAME_BUDGET, 1.0)
+                line = _progress_line(smooth_pos, i, len(games), game, tw)
+                sys.stdout.write(f"\r{line:<{tw - 1}}")
+                sys.stdout.flush()
+                if elapsed >= _GAME_BUDGET and _future.done():
+                    break
+                time.sleep(_ANIM_TICK)
+
+        sure_bets, back_lay_arbs, games_payload = _future.result()
+        total_sure_bets.extend(sure_bets)
+        total_back_lay_arbs.extend(back_lay_arbs)
+
+        if sure_bets or back_lay_arbs:
+            # Clear the progress line before printing arb details
+            sys.stdout.write("\r" + " " * (tw - 1) + "\r\n")
+            sys.stdout.flush()
+            progress_on_screen = False
+
+            label = (
+                f"{game.get('team1')} vs {game.get('team2')}"
+                f"  [{(game.get('league') or '').upper()}]"
+            )
+            date_s = _fmt_date(game.get("date_time"))
+            print(_hr(tw))
+            print(f"  ARB FOUND  {label}  {date_s}")
+            print(_hr(tw))
+            if sure_bets:
+                print(f"  Sure bets ({len(sure_bets)}):")
+                _arb._print_sure_bets(sure_bets)
+            if back_lay_arbs:
+                print(f"  Back-lay arbs ({len(back_lay_arbs)}):")
+                _arb._print_back_lay_arbs(back_lay_arbs)
+            print()
+
+        if args.show_odds:
+            if progress_on_screen:
+                sys.stdout.write("\r" + " " * (tw - 1) + "\r\n")
+                sys.stdout.flush()
+                progress_on_screen = False
+            _print_odds_table(i, len(games), game, games_payload, args.providers)
+
+    # End progress line before summary
+    if progress_on_screen:
+        print()
 
     finished_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-    if not args.no_refresh and (all_sure_bets or all_back_lay_arbs):
-        _arb.run_refresh(all_sure_bets, all_back_lay_arbs, all_games)
-
-    print(f"\n{'='*60}")
-    print(f"Summary  ({finished_at})")
-    print(f"  Games scanned: {games_scanned}")
-    print(f"  Sure bets    : {len(all_sure_bets)}")
-    print(f"  Back-lay arbs: {len(all_back_lay_arbs)}")
-    print(f"  Provider coverage (games with odds returned):")
-    for provider in args.providers:
-        total_hits = sum(v for (p, _l), v in provider_hit_counts.items() if p == provider)
-        pct = f"{total_hits / games_scanned * 100:.0f}%" if games_scanned else "n/a"
-        print(f"    {provider:<12} {total_hits:>3} / {games_scanned}  ({pct})")
-        for league in sorted(args.leagues):
-            league_total = league_game_counts.get(league, 0)
-            league_hits = provider_hit_counts.get((provider, league), 0)
-            lpct = f"{league_hits / league_total * 100:.0f}%" if league_total else "n/a"
-            print(f"      {league.upper():<6}  {league_hits:>3} / {league_total}  ({lpct})")
-    if all_sure_bets or all_back_lay_arbs:
-        all_arbs = all_sure_bets + all_back_lay_arbs
-        arb_by_league = Counter(a.get("league", "?") for a in all_arbs)
-        for league, count in sorted(arb_by_league.items()):
-            print(f"    {league.upper():<6} {count} arbs")
+    print(_hr(tw))
+    print(f"  DONE  {finished_at}")
+    print(f"  Games scanned:  {len(games)}")
+    print(f"  Sure bets:      {len(total_sure_bets)}")
+    print(f"  Back-lay arbs:  {len(total_back_lay_arbs)}")
+    print(_hr(tw))
 
 
 if __name__ == "__main__":

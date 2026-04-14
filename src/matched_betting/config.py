@@ -47,6 +47,14 @@ class SxBetSettings:
 
 
 @dataclass(frozen=True)
+class CommissionSettings:
+    matchbook: float
+    smarkets: float
+    sx_bet: float
+    smarkets_zero_commission_period: bool
+
+
+@dataclass(frozen=True)
 class Settings:
     project_root: Path
     default_output_path: Path
@@ -54,12 +62,14 @@ class Settings:
     smarkets: SmarketsSettings
     polymarket: PolymarketSettings
     sx_bet: SxBetSettings
+    commission: CommissionSettings
 
 
 def load_settings(project_root: Path) -> Settings:
     _load_dotenv(project_root / ".env")
 
     output_path = os.getenv("MATCHED_BETTING_OUTPUT_PATH", "outputs/latest_odds.json")
+    smarkets_zero = os.getenv("SMARKETS_ZERO_COMMISSION", "true").lower() in ("true", "1", "yes")
 
     return Settings(
         project_root=project_root,
@@ -89,5 +99,11 @@ def load_settings(project_root: Path) -> Settings:
             base_token=os.getenv(
                 "SX_BET_BASE_TOKEN", "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
             ),
+        ),
+        commission=CommissionSettings(
+            matchbook=float(os.getenv("MATCHBOOK_COMMISSION", "0.02")),
+            smarkets=0.0 if smarkets_zero else float(os.getenv("SMARKETS_COMMISSION", "0.02")),
+            sx_bet=float(os.getenv("SX_BET_COMMISSION", "0.0")),
+            smarkets_zero_commission_period=smarkets_zero,
         ),
     )

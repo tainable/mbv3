@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import sys
 import time
 from typing import Any
 from urllib.parse import urlencode
@@ -68,7 +69,13 @@ class HttpClient:
                     return json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
                 if exc.code == 429 and attempt < self.max_retries:
-                    time.sleep(2 ** (attempt + 1))  # 2s, 4s, 8s
+                    delay = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                    print(
+                        f"  [http] 429 rate-limited by {request_url} — "
+                        f"sleeping {delay}s (attempt {attempt + 1}/{self.max_retries})",
+                        file=sys.stderr,
+                    )
+                    time.sleep(delay)
                     continue
                 try:
                     body = exc.read().decode("utf-8", errors="replace")

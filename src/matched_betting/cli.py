@@ -9,6 +9,12 @@ import sys
 import time
 from typing import Any
 
+from matched_betting.aggregation import (
+    build_aggregated_games_payload,
+    INDEX_ID_FIELDS,
+    INDEX_POLYMARKET_SLOT_FIELDS,
+    INDEX_EXTRA_FIELDS,
+)
 from matched_betting.config import load_settings
 from matched_betting.debug import noop_debug, stderr_debug
 from matched_betting.event_matching import infer_event_identity, match_records_to_canonical_events
@@ -19,8 +25,8 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl"]
-ALL_LEAGUES = ["nba", "mlb", "ucl", "epl"]
+DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl"]
+ALL_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet"]
 
 
@@ -32,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     league_shortcuts.add_argument("--mlb", action="store_true", help="Shortcut for --leagues mlb")
     league_shortcuts.add_argument("--ucl", action="store_true", help="Shortcut for --leagues ucl")
     league_shortcuts.add_argument("--epl", action="store_true", help="Shortcut for --leagues epl")
+    league_shortcuts.add_argument("--ipl", action="store_true", help="Shortcut for --leagues ipl")
     parser.add_argument(
         "--providers",
         nargs="+",
@@ -118,7 +125,7 @@ def fetch_aggregated_games(
 
     records = [r for r in records if is_game_win_loss_record(r)]
     canonical_assignment, canonical_events = match_records_to_canonical_events(records)
-    return _build_aggregated_games_payload(records, canonical_assignment, canonical_events)
+    return build_aggregated_games_payload(records, canonical_assignment, canonical_events)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -252,7 +259,7 @@ def _run_full_fetch(
         }
         for index, record in enumerate(records)
     ]
-    aggregated_games_payload = _build_aggregated_games_payload(
+    aggregated_games_payload = build_aggregated_games_payload(
         records,
         canonical_assignment,
         canonical_events,
@@ -365,7 +372,7 @@ def _run_index_only(
     canonical_assignment, canonical_events = match_records_to_canonical_events(
         records, debug_logger=debug
     )
-    aggregated_games_payload = _build_aggregated_games_payload(
+    aggregated_games_payload = build_aggregated_games_payload(
         records, canonical_assignment, canonical_events
     )
 
@@ -574,7 +581,7 @@ def _run_update(
         {**record.to_dict(), "canonical_event_id": canonical_assignment[index]}
         for index, record in enumerate(records)
     ]
-    aggregated_games_payload = _build_aggregated_games_payload(
+    aggregated_games_payload = build_aggregated_games_payload(
         records, canonical_assignment, canonical_events
     )
 
@@ -660,31 +667,7 @@ def _game_index_key(game: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-_INDEX_ID_FIELDS = (
-    "polymarket_market_id",
-    "matchbook_event_id",
-    "smarkets_market_id",
-    "sx_bet_market_hash",
-)
-
-_INDEX_POLYMARKET_SLOT_FIELDS = (
-    "polymarket_team1_market_id",
-    "polymarket_draw_market_id",
-    "polymarket_team2_market_id",
-    "polymarket_team1_clob_token_id",
-    "polymarket_draw_clob_token_id",
-    "polymarket_team2_clob_token_id",
-)
-
-# Extra per-game metadata stored in the index (not provider IDs, but needed for targeted fetches)
-_INDEX_EXTRA_FIELDS = (
-    "sx_bet_outcome_one_team",      # non-soccer: correct synthetic market ordering
-    "sx_bet_team1_market_hash",     # soccer: per-outcome binary market hashes for targeted fetches
-    "sx_bet_draw_market_hash",
-    "sx_bet_team2_market_hash",
-)
-
-_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "ucl", "epl"]
+_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
 
 
 def _merge_market_index_additive(
@@ -722,7 +705,7 @@ def _merge_market_index_additive(
         for g in new_games:
             k = _game_index_key(g)
             if k in games_by_key:
-                for field in (*_INDEX_ID_FIELDS, *_INDEX_POLYMARKET_SLOT_FIELDS, *_INDEX_EXTRA_FIELDS):
+                for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS):
                     if g.get(field) and not games_by_key[k].get(field):
                         games_by_key[k][field] = g[field]
             else:
@@ -834,10 +817,10 @@ def _build_market_index(aggregated_games: list[dict[str, Any]]) -> dict[str, Any
             "team2": game.get("team2"),
             "date_time": game.get("date_time"),
         }
-        for field in (*_INDEX_ID_FIELDS, *_INDEX_POLYMARKET_SLOT_FIELDS, *_INDEX_EXTRA_FIELDS):
+        for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS):
             entry[field] = game.get(field) or None
         # Only include if the game has at least one provider ID
-        if any(entry[field] for field in _INDEX_ID_FIELDS):
+        if any(entry[field] for field in INDEX_ID_FIELDS):
             index.setdefault(league, []).append(entry)
 
     # Sort leagues predictably: known leagues first, then alphabetical
@@ -861,6 +844,8 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
         return ["ucl"]
     if args.epl:
         return ["epl"]
+    if args.ipl:
+        return ["ipl"]
     return list(args.leagues)
 
 
@@ -869,187 +854,5 @@ def _provider_count(game: dict[str, Any]) -> int:
     fields = ["polymarket_market_id", "smarkets_market_id", "matchbook_event_id", "sx_bet_market_hash"]
     return sum(1 for f in fields if game.get(f))
 
-
-def _extract_available(record: OddsRecord) -> float | None:
-    """Return the available amount (in native currency) for a single odds record."""
-    m = record.metadata
-    if record.provider == "matchbook":
-        return m.get("available_amount")
-    if record.provider == "smarkets":
-        raw = m.get("raw_quantity")
-        return round(raw / 10000, 2) if raw is not None else None
-    if record.provider == "polymarket":
-        liq = m.get("liquidity_usd")
-        return round(liq / 2, 2) if liq is not None else None
-    if record.provider == "sx_bet":
-        return m.get("available_usd")
-
-
-def _build_aggregated_games_payload(
-    records: list[OddsRecord],
-    canonical_event_assignment: dict[int, str],
-    canonical_events: list[Any],
-) -> list[dict[str, Any]]:
-    events_by_id = {event.canonical_event_id: event for event in canonical_events}
-    grouped_indices: dict[str, list[int]] = {}
-    for index, canonical_event_id in canonical_event_assignment.items():
-        grouped_indices.setdefault(canonical_event_id, []).append(index)
-
-    payload: list[dict[str, Any]] = []
-    for canonical_event_id, indices in grouped_indices.items():
-        event_group = events_by_id[canonical_event_id]
-        team1 = _pretty_team(event_group.home_team)
-        team2 = _pretty_team(event_group.away_team)
-        # Derive market_type: prefer three_way if any record has it
-        market_types = {records[i].market_type for i in indices}
-        if "three_way" in market_types:
-            market_type = "three_way"
-        elif "two_way" in market_types:
-            market_type = "two_way"
-        else:
-            market_type = next(iter(market_types), None)
-
-        entry: dict[str, Any] = {
-            "team1": team1,
-            "team2": team2,
-            "date_time": event_group.event_start,
-            "league": event_group.league,
-            "sport": event_group.sport,
-            "market_type": market_type,
-            "polymarket_market_id": None,
-            "smarkets_market_id": None,
-            "matchbook_event_id": None,
-            "sx_bet_market_hash": None,
-            "polymarket_team1_back_odds": None,
-            "polymarket_team1_lay_odds": None,
-            "polymarket_draw_back_odds": None,
-            "polymarket_draw_lay_odds": None,
-            "polymarket_team2_back_odds": None,
-            "polymarket_team2_lay_odds": None,
-            "matchbook_team1_back_odds": None,
-            "matchbook_team1_lay_odds": None,
-            "matchbook_draw_back_odds": None,
-            "matchbook_draw_lay_odds": None,
-            "matchbook_team2_back_odds": None,
-            "matchbook_team2_lay_odds": None,
-            "smarkets_team1_back_odds": None,
-            "smarkets_team1_lay_odds": None,
-            "smarkets_draw_back_odds": None,
-            "smarkets_draw_lay_odds": None,
-            "smarkets_team2_back_odds": None,
-            "smarkets_team2_lay_odds": None,
-            "sx_bet_team1_back_odds": None,
-            "sx_bet_team1_lay_odds": None,
-            "sx_bet_draw_back_odds": None,
-            "sx_bet_draw_lay_odds": None,
-            "sx_bet_team2_back_odds": None,
-            "sx_bet_team2_lay_odds": None,
-        }
-
-        best_by_provider_team: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
-        for index in indices:
-            record = records[index]
-            normalized_selection = record.selection_name
-            team_slot = None
-            if event_group.home_team and normalized_selection == event_group.home_team:
-                team_slot = "team1"
-            elif event_group.away_team and normalized_selection == event_group.away_team:
-                team_slot = "team2"
-            elif normalized_selection in ("draw", "tie"):
-                team_slot = "draw"
-            if team_slot is None:
-                continue
-            side = record.selection_side.lower()
-            key = (record.provider, team_slot, side)
-            current = best_by_provider_team.get(key)
-            try:
-                if current is None:
-                    best_by_provider_team[key] = (index, record)
-                elif side == "lay":
-                    if record.decimal_odds < current[1].decimal_odds:
-                        best_by_provider_team[key] = (index, record)
-                else:
-                    if record.decimal_odds > current[1].decimal_odds:
-                        best_by_provider_team[key] = (index, record)
-            except TypeError:
-                best_by_provider_team[key] = (index, record)
-
-        for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet"):
-            for team_slot in ("team1", "draw", "team2"):
-                for side in ("back", "lay"):
-                    chosen = best_by_provider_team.get((provider_name, team_slot, side))
-                    if chosen is None:
-                        continue
-                    _, record = chosen
-                    odds_key = f"{provider_name}_{team_slot}_{side}_odds"
-                    avail_key = f"{provider_name}_{team_slot}_{side}_avail"
-                    if odds_key in entry:
-                        entry[odds_key] = record.decimal_odds
-                    entry[avail_key] = _extract_available(record)
-
-        # Store market/event IDs for targeted refresh later.
-        # Polymarket UCL: each outcome is a separate Yes/No binary market, so store
-        # per-slot IDs. Other providers use one ID per event/market.
-        for team_slot in ("team1", "draw", "team2"):
-            for side in ("back", "lay"):
-                key = ("polymarket", team_slot, side)
-                if key in best_by_provider_team:
-                    _, record = best_by_provider_team[key]
-                    entry[f"polymarket_{team_slot}_market_id"] = record.source_market_id
-                    clob_token = (record.metadata or {}).get("clob_token_id")
-                    if clob_token:
-                        entry[f"polymarket_{team_slot}_clob_token_id"] = clob_token
-                    # Also set the legacy single-ID field to the first one found
-                    if entry["polymarket_market_id"] is None:
-                        entry["polymarket_market_id"] = record.source_market_id
-                    break
-
-        for provider_name, id_field, id_attr in (
-            ("smarkets",  "smarkets_market_id",  "source_market_id"),
-            ("matchbook", "matchbook_event_id",   "source_event_id"),
-            ("sx_bet",    "sx_bet_market_hash",   "source_market_id"),
-        ):
-            for key in best_by_provider_team:
-                if key[0] == provider_name:
-                    _, record = best_by_provider_team[key]
-                    entry[id_field] = getattr(record, id_attr)
-                    if provider_name == "sx_bet":
-                        outcome_one = (record.metadata or {}).get("outcome_one_team")
-                        if outcome_one:
-                            entry["sx_bet_outcome_one_team"] = outcome_one
-                    break
-
-        # For soccer, store per-outcome SX Bet market hashes so fetch_odds_by_ids can
-        # target specific markets without doing a full league scan.
-        if entry.get("league") in ("ucl", "epl"):
-            for team_slot in ("team1", "draw", "team2"):
-                for side in ("back", "lay"):
-                    chosen = best_by_provider_team.get(("sx_bet", team_slot, side))
-                    if chosen:
-                        _, record = chosen
-                        entry[f"sx_bet_{team_slot}_market_hash"] = record.source_market_id
-                        break
-
-        payload.append(entry)
-
-    payload.sort(key=lambda item: (item["date_time"] or "", item["team1"] or "", item["team2"] or ""))
-    return payload
-
-
-def _pretty_team(team_name: str | None) -> str | None:
-    if team_name is None:
-        return None
-    parts = team_name.split()
-    titled: list[str] = []
-    for part in parts:
-        if part == "la":
-            titled.append("LA")
-        elif part == "okc":
-            titled.append("OKC")
-        elif any(char.isdigit() for char in part):
-            titled.append(part)
-        else:
-            titled.append(part.capitalize())
-    return " ".join(titled)
 
 

@@ -34,7 +34,7 @@ class MatchbookProvider(OddsProvider):
         retrieved_at = utc_now_iso()
         self._login()
 
-        if any(lg in leagues for lg in ("ucl", "epl")):
+        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl")):
             self._log_available_sports()
 
         records: list[OddsRecord] = []
@@ -168,12 +168,33 @@ class MatchbookProvider(OddsProvider):
             # Sport ID 3 already scopes the API response to baseball events, so
             # trust it rather than relying on meta-tag values which vary by market.
             return True
+        if league == "nhl":
+            # Sport ID 6 scopes the response to ice hockey; trust it.
+            return True
         if league == "ucl":
             # TODO: verify the exact url-name Matchbook uses for the Champions League
             return any(tag.get("url-name") in ("champions-league", "ucl", "uefa-champions-league") for tag in meta_tags)
         if league == "epl":
             # ODO: verify the exact url-name Matchbook uses for the Premier League
             return any(tag.get("url-name") in ("premier-league", "epl", "english-premier-league") for tag in meta_tags)
+        if league == "uel":
+            # TODO: verify the exact url-name Matchbook uses for the Europa League
+            return any(tag.get("url-name") in ("europa-league", "uel", "uefa-europa-league") for tag in meta_tags)
+        if league == "ipl":
+            # Sport ID 110 covers all cricket; filter down to IPL specifically.
+            # Try meta-tags first (multiple known url-name variants across seasons).
+            if any(
+                tag.get("url-name") in (
+                    "ipl", "indian-premier-league",
+                    "ipl-2025", "ipl-2026",
+                    "cricket-ipl", "ipl-t20", "t20-ipl",
+                )
+                for tag in meta_tags
+            ):
+                return True
+            # Fallback: meta-tag url-names vary; check event name directly.
+            event_name_lower = str(event.get("name") or "").lower()
+            return "ipl" in event_name_lower or "indian premier league" in event_name_lower
         return False
 
     def _event_to_records(
@@ -195,7 +216,7 @@ class MatchbookProvider(OddsProvider):
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type = "three_way" if league in ("ucl", "epl") else "two_way"
+            market_type = "three_way" if league in ("ucl", "epl", "uel") else "two_way"
             for runner in market.get("runners", []):
                 best_by_side = _best_prices_per_side(runner.get("prices", []))
                 for side, price in best_by_side.items():
@@ -232,12 +253,14 @@ class MatchbookProvider(OddsProvider):
 
 
 _MONEYLINE_MARKET_NAMES = {
-    "match odds",      # Soccer / UCL
-    "match winner",    # Alternative soccer naming
+    "match odds",               # Soccer / UCL and cricket
+    "match winner",             # Alternative soccer naming
     "money line",
     "moneyline",
     "winner (incl. overtime)",
     "winner (including overtime)",
+    "to win the match",         # Cricket (Matchbook)
+    "match result",             # Cricket alternative
 }
 
 
@@ -277,13 +300,19 @@ def _is_moneyline_market(market: dict) -> bool:
 LEAGUE_SPORT_IDS = {
     "nba": 4,
     "mlb": 3,
+    "nhl": 6,
     "ucl": 15,
     "epl": 15,  # Same sport ID as UCL (soccer)
+    "uel": 15,  # Same sport ID (soccer)
+    "ipl": 110,  # Cricket — sport ID 110 covers all cricket; filtered by meta-tag below
 }
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
+    "uel": "soccer",
+    "ipl": "cricket",
 }

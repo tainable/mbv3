@@ -174,7 +174,7 @@ class SmarketsProvider(OddsProvider):
                         event_name=event_name,
                         event_start=event_start,
                         market_name="Match Winner",
-                        market_type="three_way" if league in ("ucl", "epl") else "two_way",
+                        market_type="three_way" if league in ("ucl", "epl", "uel") else "two_way",
                         selection_name=normalize_team_name(
                             str(contract.get("name") or "Unknown selection"), league
                         ),
@@ -290,7 +290,7 @@ class SmarketsProvider(OddsProvider):
                             event_name=str(event.get("name") or "Unknown event"),
                             event_start=event.get("start_datetime"),
                             market_name=str(market.get("name") or "Unknown market"),
-                            market_type="three_way" if league in ("ucl", "epl") else "two_way",
+                            market_type="three_way" if league in ("ucl", "epl", "uel") else "two_way",
                             selection_name=normalize_team_name(str(contract.get("name") or "Unknown selection"), league),
                             selection_side=side,
                             decimal_odds=decimal_from_probability(probability),
@@ -352,15 +352,21 @@ class SmarketsProvider(OddsProvider):
 LEAGUE_ROOT_EVENT_IDS = {
     "nba": 19694311,
     "mlb": 13240353,
+    "nhl": 19232477,
     "ucl": 25363462,
     "epl": 25508311,
+    "uel": 25502999,
+    "ipl": 41842879,
 }
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
+    "uel": "soccer",
+    "ipl": "cricket",
 }
 
 
@@ -373,7 +379,10 @@ _MONEYLINE_MARKET_NAMES = {
     "winner (including overtime)",
     "match winner",
     "winner",  # Smarkets UCL match winner market
-    "full-time result"
+    "full-time result",
+    # Cricket / IPL
+    "to win the match",
+    "match result",
 }
 
 

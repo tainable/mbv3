@@ -14,20 +14,29 @@ from matched_betting.providers.base import GameContext, OddsProvider
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
+    "uel": "soccer",
+    "ipl": "cricket",
 }
 
 # SX Bet league IDs (from GET /leagues)
 _LEAGUE_IDS: dict[str, int | None] = {
     "nba": 1,
     "mlb": 171,
+    "nhl": 3,
     "ucl": 30,
     "epl": 29,
+    "uel": 31,
+    "ipl": 1192,
 }
 
 # Leagues that use binary Yes/No markets per outcome rather than a moneyline
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel"})
+
+# Cricket leagues: two-way match winner markets (no draw, no overtime)
+_CRICKET_LEAGUES: frozenset[str] = frozenset({"ipl"})
 
 # SX Bet stores percentageOdds as an integer representing probability * 10^20
 _ODDS_SCALE = 10**20
@@ -57,7 +66,7 @@ class SxBetProvider(OddsProvider):
         warnings: list[str] = []
         retrieved_at = utc_now_iso()
 
-        if any(lg in leagues for lg in _SOCCER_LEAGUES):
+        if any(lg in leagues for lg in _SOCCER_LEAGUES) or any(lg in leagues for lg in _CRICKET_LEAGUES):
             self._log_soccer_leagues()
 
         for league in leagues:
@@ -345,7 +354,7 @@ class SxBetProvider(OddsProvider):
                 break
             params = {"leagueId": str(league_id), "paginationKey": next_key}
 
-        if league in _SOCCER_LEAGUES:
+        if league in _SOCCER_LEAGUES or league in _CRICKET_LEAGUES:
             type_counts: dict[Any, int] = {}
             for m in all_markets:
                 t = m.get("type")
@@ -355,12 +364,48 @@ class SxBetProvider(OddsProvider):
                 sample = next((m.get("marketName") or m.get("label") or m.get("type") for m in all_markets if m.get("type") == t), "")
                 self.debug(f"{self.name}:   type={t}  count={count}  example={sample!r}")
 
-        market_type = _SOCCER_RESULT_TYPE if league in _SOCCER_LEAGUES else _MONEYLINE_TYPE
-        filtered = [
-            m for m in all_markets
-            if m.get("type") == market_type and m.get("leagueId") == league_id
-        ]
-        self.debug(f"{self.name}: {len(all_markets)} total markets, {len(filtered)} after filtering for type {market_type} and leagueId {league_id}")
+        if league in _CRICKET_LEAGUES:
+            # Cricket match-winner markets are two-way (no draw, no overtime).
+            # SX Bet may use type 226 or a sport-specific type; filter by leagueId
+            # and require both teamOneName and teamTwoName to identify match-winner
+            # markets without depending on a potentially-wrong type constant.
+            # If leagueId 1192 is wrong, run find_sx_bet_league_ids.py --search cricket
+            # to discover the correct ID and update _LEAGUE_IDS["ipl"].
+            filtered = [
+                m for m in all_markets
+                if m.get("leagueId") == league_id
+                and m.get("teamOneName")
+                and m.get("teamTwoName")
+                and m.get("type") == _MONEYLINE_TYPE  # type 226; update if SX Bet uses a different type for cricket
+            ]
+            if not filtered:
+                # Fall back to any two-team market for this league (drop type filter)
+                # so we can at least see what's available in debug output.
+                all_league_markets = [m for m in all_markets if m.get("leagueId") == league_id]
+                self.debug(
+                    f"{self.name}: IPL: 0 markets matched type {_MONEYLINE_TYPE}; "
+                    f"{len(all_league_markets)} total markets for leagueId={league_id}. "
+                    f"If 0 total, league ID may be wrong — run find_sx_bet_league_ids.py --search cricket"
+                )
+                filtered = [
+                    m for m in all_league_markets
+                    if m.get("teamOneName") and m.get("teamTwoName")
+                ]
+                self.debug(f"{self.name}: IPL fallback: {len(filtered)} two-team markets without type filter")
+        elif league in _SOCCER_LEAGUES:
+            market_type = _SOCCER_RESULT_TYPE
+            filtered = [
+                m for m in all_markets
+                if m.get("type") == market_type and m.get("leagueId") == league_id
+            ]
+        else:
+            market_type = _MONEYLINE_TYPE
+            filtered = [
+                m for m in all_markets
+                if m.get("type") == market_type and m.get("leagueId") == league_id
+            ]
+
+        self.debug(f"{self.name}: {len(all_markets)} total markets, {len(filtered)} after filtering for leagueId {league_id}")
         return filtered
 
     def _process_soccer_markets(
