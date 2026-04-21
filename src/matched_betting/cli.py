@@ -25,9 +25,9 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl"]
+DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
 ALL_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
-DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet"]
+DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -43,7 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--providers",
         nargs="+",
         default=DEFAULT_PROVIDERS,
-        choices=["matchbook", "smarkets", "polymarket", "sx_bet"],
+        choices=["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"],
     )
     parser.add_argument("--format", choices=["json"], default="json")
     parser.add_argument("--out", type=Path, help="Optional output path. Defaults to MATCHED_BETTING_OUTPUT_PATH.")
@@ -728,6 +728,7 @@ def _collect_requested_ids(
         ("smarkets",   "smarkets_market_id"),
         ("matchbook",  "matchbook_event_id"),
         ("sx_bet",     "sx_bet_market_hash"),
+        ("azuro",      "azuro_condition_id"),
     ]
     for game in game_contexts:
         league = game.get("league")
@@ -760,6 +761,7 @@ _PROVIDER_ID_FIELD_MAP = [
     ("smarkets",   "smarkets_market_id"),
     ("matchbook",  "matchbook_event_id"),
     ("sx_bet",     "sx_bet_market_hash"),
+    ("azuro",      "azuro_condition_id"),
 ]
 
 
@@ -851,7 +853,7 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
 
 def _provider_count(game: dict[str, Any]) -> int:
     """Count how many providers have a stored market ID for this game."""
-    fields = ["polymarket_market_id", "smarkets_market_id", "matchbook_event_id", "sx_bet_market_hash"]
+    fields = ["polymarket_market_id", "smarkets_market_id", "matchbook_event_id", "sx_bet_market_hash", "azuro_condition_id"]
     return sum(1 for f in fields if game.get(f))
 
 

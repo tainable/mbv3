@@ -38,12 +38,20 @@ class SmarketsSettings:
 class PolymarketSettings:
     gamma_base_url: str
     clob_base_url: str
+    private_key: str | None
+    polygon_rpc_url: str | None
 
 
 @dataclass(frozen=True)
 class SxBetSettings:
     base_url: str
     base_token: str
+    explorer_url: str = "https://explorerl2.sx.technology/api"  # block explorer for balance queries
+
+
+@dataclass(frozen=True)
+class AzuroSettings:
+    subgraph_url: str
 
 
 @dataclass(frozen=True)
@@ -62,7 +70,9 @@ class Settings:
     smarkets: SmarketsSettings
     polymarket: PolymarketSettings
     sx_bet: SxBetSettings
+    azuro: AzuroSettings
     commission: CommissionSettings
+    vpn_proxy_url: str | None = None  # e.g. "socks5h://10.64.0.1:1080" (in-tunnel) or "socks5h://nl-ams-wg-socks5-001.relays.mullvad.net:1080" (multihop)
 
 
 def load_settings(project_root: Path) -> Settings:
@@ -92,14 +102,24 @@ def load_settings(project_root: Path) -> Settings:
             clob_base_url=os.getenv(
                 "POLYMARKET_CLOB_BASE_URL", "https://clob.polymarket.com"
             ),
+            private_key=os.getenv("POLYMARKET_PRIVATE_KEY") or None,
+            polygon_rpc_url=os.getenv("POLYGON_RPC_URL") or None,
         ),
         sx_bet=SxBetSettings(
             base_url=os.getenv("SX_BET_BASE_URL", "https://api.sx.bet"),
-            # USDC on SX Network (Polygon); override with SX_BET_BASE_TOKEN if needed
+            # USDC on SX Network; override with SX_BET_BASE_TOKEN if needed
             base_token=os.getenv(
                 "SX_BET_BASE_TOKEN", "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
             ),
+            explorer_url=os.getenv("SX_EXPLORER_URL") or "https://explorerl2.sx.technology/api",
         ),
+        azuro=AzuroSettings(
+            subgraph_url=os.getenv(
+                "AZURO_SUBGRAPH_URL",
+                "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon",
+            ),
+        ),
+        vpn_proxy_url=os.getenv("VPN_PROXY_URL") or None,
         commission=CommissionSettings(
             matchbook=float(os.getenv("MATCHBOOK_COMMISSION", "0.02")),
             smarkets=0.0 if smarkets_zero else float(os.getenv("SMARKETS_COMMISSION", "0.02")),

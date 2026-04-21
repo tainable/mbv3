@@ -1,13 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import sys
 import time
 from typing import Any
-from urllib.parse import urlencode
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+
+import requests
+from requests.exceptions import HTTPError
 
 
 @dataclass(frozen=True)
@@ -15,6 +14,7 @@ class HttpClient:
     timeout_seconds: int = 30
     user_agent: str = "matched-betting/0.1.0"
     max_retries: int = 3
+    proxy_url: str | None = None  # e.g. "socks5h://user:pass@host:1080"
 
     def get_json(
         self,
@@ -46,49 +46,41 @@ class HttpClient:
         headers: dict[str, str] | None = None,
         payload: dict[str, Any] | None = None,
     ) -> Any:
-        request_url = url
-        if params:
-            query = urlencode(
-                [(key, item) for key, value in params.items() for item in _to_items(value)],
-                doseq=True,
-            )
-            request_url = f"{url}?{query}"
-
         request_headers = {"User-Agent": self.user_agent}
         if headers:
             request_headers.update(headers)
 
-        data = None
-        if payload is not None:
-            data = json.dumps(payload).encode("utf-8")
+        proxies = {"https": self.proxy_url, "http": self.proxy_url} if self.proxy_url else None
 
-        request = Request(request_url, headers=request_headers, method=method, data=data)
         for attempt in range(self.max_retries + 1):
             try:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
-                    return json.loads(response.read().decode("utf-8"))
+                response = requests.request(
+                    method,
+                    url,
+                    params=params,
+                    headers=request_headers,
+                    json=payload,
+                    timeout=self.timeout_seconds,
+                    proxies=proxies,
+                )
+                response.raise_for_status()
+                return response.json()
             except HTTPError as exc:
-                if exc.code == 429 and attempt < self.max_retries:
+                if exc.response is not None and exc.response.status_code == 429 and attempt < self.max_retries:
                     delay = 2 ** (attempt + 1)  # 2s, 4s, 8s
                     print(
-                        f"  [http] 429 rate-limited by {request_url} — "
+                        f"  [http] 429 rate-limited by {url} — "
                         f"sleeping {delay}s (attempt {attempt + 1}/{self.max_retries})",
                         file=sys.stderr,
                     )
                     time.sleep(delay)
                     continue
-                try:
-                    body = exc.read().decode("utf-8", errors="replace")
-                except Exception:
-                    body = "<unreadable>"
+                body = "<unreadable>"
+                if exc.response is not None:
+                    try:
+                        body = exc.response.text
+                    except Exception:
+                        pass
                 raise RuntimeError(
-                    f"HTTP {exc.code} {request_url}: {body}"
+                    f"HTTP {exc.response.status_code if exc.response is not None else '?'} {url}: {body}"
                 ) from exc
-
-
-def _to_items(value: Any) -> list[Any]:
-    if value is None:
-        return []
-    if isinstance(value, (list, tuple, set)):
-        return list(value)
-    return [value]

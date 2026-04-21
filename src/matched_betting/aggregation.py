@@ -19,6 +19,7 @@ INDEX_ID_FIELDS = (
     "matchbook_event_id",
     "smarkets_market_id",
     "sx_bet_market_hash",
+    "azuro_condition_id",
 )
 
 INDEX_POLYMARKET_SLOT_FIELDS = (
@@ -50,6 +51,8 @@ def _extract_available(record: OddsRecord) -> float | None:
         return round(liq / 2, 2) if liq is not None else None
     if record.provider == "sx_bet":
         return m.get("available_usd")
+    if record.provider == "azuro":
+        return m.get("max_stake_usdc")
     return None
 
 
@@ -130,6 +133,13 @@ def build_aggregated_games_payload(
             "sx_bet_draw_lay_odds": None,
             "sx_bet_team2_back_odds": None,
             "sx_bet_team2_lay_odds": None,
+            "azuro_condition_id": None,
+            "azuro_team1_back_odds": None,
+            "azuro_draw_back_odds": None,
+            "azuro_team2_back_odds": None,
+            "azuro_team1_max_stake_usdc": None,
+            "azuro_draw_max_stake_usdc": None,
+            "azuro_team2_max_stake_usdc": None,
         }
 
         best_by_provider_team: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
@@ -160,7 +170,7 @@ def build_aggregated_games_payload(
             except TypeError:
                 best_by_provider_team[key] = (index, record)
 
-        for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet"):
+        for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet", "azuro"):
             for team_slot in ("team1", "draw", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get((provider_name, team_slot, side))
@@ -172,6 +182,9 @@ def build_aggregated_games_payload(
                     if odds_key in entry:
                         entry[odds_key] = record.decimal_odds
                     entry[avail_key] = _extract_available(record)
+                    if provider_name == "azuro" and side == "back":
+                        max_stake = (record.metadata or {}).get("max_stake_usdc") or 0.0
+                        entry[f"azuro_{team_slot}_max_stake_usdc"] = max_stake
 
         # Polymarket per-slot market / CLOB token IDs
         for team_slot in ("team1", "draw", "team2"):
@@ -192,6 +205,7 @@ def build_aggregated_games_payload(
             ("smarkets",  "smarkets_market_id",  "source_market_id"),
             ("matchbook", "matchbook_event_id",   "source_event_id"),
             ("sx_bet",    "sx_bet_market_hash",   "source_market_id"),
+            ("azuro",     "azuro_condition_id",   "source_market_id"),
         ):
             for key in best_by_provider_team:
                 if key[0] == provider_name:
@@ -204,7 +218,7 @@ def build_aggregated_games_payload(
                     break
 
         # Soccer: per-outcome SX Bet market hashes for targeted re-fetching
-        if entry.get("league") in ("ucl", "epl", "uel"):
+        if entry.get("league") in ("ucl", "epl", "uel", "seria"):
             for team_slot in ("team1", "draw", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get(("sx_bet", team_slot, side))

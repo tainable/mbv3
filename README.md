@@ -87,6 +87,12 @@ POLYMARKET_CLOB_BASE_URL=https://clob.polymarket.com
 # SX Bet (public, no credentials required)
 SX_BET_BASE_URL=https://api.sx.bet
 SX_BET_BASE_TOKEN=0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B
+# Block explorer for on-chain USDC balance queries (portfolio.py).
+# Leave blank to use the default: https://explorerl2.sx.technology/api
+SX_EXPLORER_URL=
+
+# VPN proxy (optional — see VPN routing section below)
+VPN_PROXY_URL=
 
 # Commission rates
 # Set SMARKETS_ZERO_COMMISSION=false once the 60-day intro period ends
@@ -97,6 +103,32 @@ SX_BET_COMMISSION=0.00
 ```
 
 Providers without credentials will be skipped with a warning rather than crashing.
+
+### VPN / Proxy routing
+
+Polymarket and SX Bet are geo-restricted in some regions. The pipeline supports routing their traffic through Mullvad's SOCKS5 proxy while keeping Matchbook, Smarkets, and Azuro on a direct connection.
+
+Set `VPN_PROXY_URL` in `.env`. When Mullvad VPN is connected, use the in-tunnel address — no credentials required:
+
+```
+VPN_PROXY_URL=socks5h://10.64.0.1:1080
+```
+
+The `socks5h` scheme sends hostnames to the proxy for DNS resolution, preventing DNS leaks.
+
+**Provider routing:**
+
+| Provider | Connection |
+|---|---|
+| Matchbook | Direct (always) |
+| Smarkets | Direct (always) |
+| Azuro | Direct (always) |
+| Polymarket | Proxied if `VPN_PROXY_URL` is set, otherwise direct |
+| SX Bet | Proxied if `VPN_PROXY_URL` is set, otherwise direct |
+
+Before scanning, `scan.py` tests that the proxy is reachable via a TCP connect. If it is not, you are warned and asked whether to continue — requests to Polymarket and SX Bet will fail or expose your real IP if you proceed without the proxy running.
+
+Leave `VPN_PROXY_URL` blank to disable proxying entirely.
 
 ## Running the pipeline
 
@@ -128,7 +160,52 @@ python scan.py --ids outputs/active_game_ids.json
 python scan.py --leagues nba epl
 python scan.py --providers matchbook polymarket sx_bet
 python scan.py --min-profit 0.5            # only show arbs ≥ 0.5% profit
+python scan.py --show-odds                 # print back/lay odds table per game
+python scan.py --azuro-cap                 # show max profit constrained by Azuro pool size
+python scan.py --polymarket-debug          # detailed Polymarket diagnostics per game
 python scan.py --debug
+```
+
+### Auto-betting
+
+Pass `--auto-bet` to automatically place every arb found. Requires `--budget` (stake per arb in USDC). Supported providers: Matchbook, Polymarket, SX Bet.
+
+```bash
+python scan.py --auto-bet --budget 50
+python scan.py --auto-bet --budget 50 --bet-dry-run   # build and sign orders but do not submit
+```
+
+When both a sure bet and a back-lay arb are found on the same game, `--auto-bet` places only the **single highest-profit arb** across both lists. Lower-profit arbs for the same game are skipped and a count is printed.
+
+### Portfolio monitor
+
+`portfolio.py` checks wallet balances and active bets across all three platforms concurrently. It is a standalone file — it does not depend on the scan pipeline.
+
+```bash
+python portfolio.py                  # summary — balances + counts
+python portfolio.py --detail         # summary + every active bet/order/position
+python portfolio.py --matchbook      # Matchbook only (full detail)
+python portfolio.py --polymarket     # Polymarket only (full detail)
+python portfolio.py --sx-bet         # SX Bet only (full detail)
+```
+
+**What each platform shows:**
+
+| Platform | Balance source | Active bets |
+|---|---|---|
+| Matchbook | `/edge/rest/account` (GBP) | Open offers (unmatched/partial), matched (awaiting settlement), settled (recent) |
+| Polymarket | CLOB USDC balance + MATIC gas | Open orders, active positions with PnL, recent trades |
+| SX Bet | SX Network block explorer `tokenbalance` API (on-chain USDC) | Open maker orders with fill ratio, recent trades |
+
+SX Bet's on-chain USDC balance is queried via `https://explorerl2.sx.technology/api` using the `tokenbalance` action against the USDC contract (`SX_BET_BASE_TOKEN`). Override the endpoint with `SX_EXPLORER_URL` in `.env` if needed.
+
+**Cancel actions:**
+
+```bash
+python portfolio.py --cancel-mb OFFER_ID
+python portfolio.py --cancel-pm                    # cancel all open Polymarket orders
+python portfolio.py --cancel-pm --order-id ID      # cancel one Polymarket order
+python portfolio.py --cancel-sx ORDER_HASH
 ```
 
 ### Standalone arb finder

@@ -18,6 +18,7 @@ LEAGUE_TO_SPORT = {
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
+    "seria": "soccer",
     "ipl": "cricket",
 }
 
@@ -29,11 +30,12 @@ _LEAGUE_IDS: dict[str, int | None] = {
     "ucl": 30,
     "epl": 29,
     "uel": 31,
+    "seria": 1113,
     "ipl": 1192,
 }
 
 # Leagues that use binary Yes/No markets per outcome rather than a moneyline
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria"})
 
 # Cricket leagues: two-way match winner markets (no draw, no overtime)
 _CRICKET_LEAGUES: frozenset[str] = frozenset({"ipl"})

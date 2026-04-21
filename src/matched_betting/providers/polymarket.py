@@ -19,11 +19,12 @@ LEAGUE_TO_SPORT = {
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
+    "seria": "soccer",
     "ipl": "cricket",
 }
 
 # Leagues that use Yes/No binary markets per outcome (soccer-style)
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria"})
 
 
 class PolymarketProvider(OddsProvider):
@@ -54,6 +55,11 @@ class PolymarketProvider(OddsProvider):
         half_segments = {"1h", "2h", "1st-half", "2nd-half", "first-half", "second-half", "halftime"}
 
         candidate_markets: list[tuple[dict[str, Any], str]] = []
+        # Tracks {frozenset(team_a, team_b)} for leagues that list both directions
+        # of a matchup (e.g. cricipl-rcb-lsg AND cricipl-lsg-rcb). Keeping both
+        # creates phantom arbs because the system picks the best ask from each
+        # direction independently, summing to < 1.
+        _seen_ipl_pairs: set[frozenset] = set()
         for market in all_markets:
             league = self._infer_league(market, team_index)
 
@@ -123,6 +129,14 @@ class PolymarketProvider(OddsProvider):
                         if split_slug[-1] in uel_teams or split_slug[-1] == "draw":
                             candidate_markets.append((market, "uel"))
 
+            seria_teams = team_index.get("seria", [])
+            if "seria" in leagues and seria_teams:
+                # Match head-to-head Serie A slugs: sea-{team1}-{team2}-{date}-{team_or_draw}
+                if split_slug[0] == "sea" and len(split_slug) >= 3:
+                    if split_slug[1] in seria_teams and split_slug[2] in seria_teams:
+                        if split_slug[-1] in seria_teams or split_slug[-1] == "draw":
+                            candidate_markets.append((market, "seria"))
+
             _cricket_non_moneyline = {"innings", "runs", "wickets", "fours", "sixes", "total", "over", "under"}
             if "ipl" in leagues and split_slug[0] == "cricipl":
                 if not any(seg in _cricket_non_moneyline for seg in split_slug):
@@ -130,7 +144,10 @@ class PolymarketProvider(OddsProvider):
                     # Slug format: cricipl-{team1}-{team2} or cricipl-{team1}-{team2}-{date}
                     # TODO: verify exact Polymarket team slug codes for IPL
                     if len(split_slug) >= 3 and split_slug[1] in ipl_slugs and split_slug[2] in ipl_slugs:
-                        candidate_markets.append((market, "ipl"))
+                        pair = frozenset({split_slug[1], split_slug[2]})
+                        if pair not in _seen_ipl_pairs:
+                            _seen_ipl_pairs.add(pair)
+                            candidate_markets.append((market, "ipl"))
 
         
         self.debug(f"{self.name}: found {len(candidate_markets)} candidate markets after league filtering")
@@ -216,6 +233,7 @@ class PolymarketProvider(OddsProvider):
                                 clob_token_id, market_id or "", league, outcome_name,
                                 market_type, event_name, event_start, retrieved_at,
                             )
+                            #print(slot_records)
                             records.extend(slot_records)
                             self.debug(f"{self.name}: CLOB token={clob_token_id} -> {len(slot_records)} records")
                         except Exception as exc:
@@ -316,7 +334,11 @@ class PolymarketProvider(OddsProvider):
                 decimal_odds=decimal_from_probability(best_ask),
                 implied_probability=round(best_ask, 6),
             ))
-        if best_bid and 0 < best_bid < 1:
+        # Only emit a lay record for three-way (soccer) markets where buying the NO
+        # token genuinely covers multiple outcomes (draw + loss).  For two-way markets
+        # (NBA/NHL/IPL) the NO token is identical to backing the other team — treat it
+        # as a back bet in the surebet detector, not a lay.
+        if best_bid and 0 < best_bid < 1 and market_type != "two_way":
             result.append(OddsRecord(
                 **shared,
                 selection_side="lay",
@@ -462,20 +484,20 @@ class PolymarketProvider(OddsProvider):
                 'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']
 
             elif league == "nhl":
-                # TODO: verify exact Polymarket team slug codes for NHL.
+
                 index[league] = [
                     'min','stl','buf','chi','col','edm',
-                    'lak','sea','wpg','vgk','mon','phi',
+                    'lak','sea','wpg','vgk','las','mon','phi',
                     'nj','bos','car','nyi','wsh','cbj',
-                'ana','cal','utah','pit'
-                'sjs','nsh','van','dal','buf','nyr','tb',
+                'ana','cal','utah','pit',
+                'sj','sjs','nsh','van','dal','buf','nyr','tb',
                 'det','fla','tor','ott']
 
             elif league == "ucl":
                 index[league] = ['rma1','bay1','spo1','ars','psg1','liv1','fcb1','atm1']
 
             elif league == "epl":
-                # ODO: verify exact Polymarket team slug codes for EPL
+
                 index[league] = [
                     'ars','che','liv','mac','mun','tot','new','ast',
                     'bri','wes','wol','cry','ful','bre','eve','bou','not',
@@ -483,7 +505,7 @@ class PolymarketProvider(OddsProvider):
                 ]
 
             elif league == "uel":
-                # TODO: verify exact Polymarket team slug codes for UEL.
+
                 # Add/remove as the competition progresses each season.
                 index[league] = [
                     'not', 'por1',
@@ -492,12 +514,22 @@ class PolymarketProvider(OddsProvider):
                     'bet1', 'scb',
                 ]
 
+            elif league == "seria":
+                # Polymarket slug prefix: sea-{team1}-{team2}-{date}-{team_or_draw}
+
+                index[league] = [
+                    'udi', 'par', 'laz', 'nap', 'rom',
+                    'ata', 'cre', 'tor', 'ver', 'mil',
+                    'gen', 'pis', 'juv', 'bol', 'lec',
+                    'fio', 'int', 'cag', 'com', 'sas',
+                ]
+
             elif league == "ipl":
                 # Polymarket uses short lower-case team codes in IPL slugs.
                 # Format: cricipl-{team1}-{team2}[-{date}]
-                # TODO: verify exact codes once live IPL markets appear on Polymarket.
+
                 index[league] = [
-                    'mum', 'che', 'raj', 'kol', 'del',
+                    'mum', 'che', 'roy', 'kol', 'del',
                     'pun',  'sun', 'luc', 'guj','raj'
                 ]
 
@@ -602,14 +634,13 @@ class PolymarketProvider(OddsProvider):
             except (TypeError, ValueError):
                 best_bid = None
 
-            # bestAsk/bestBid refer to the YES (primary) outcome of this market,
-            # which Polymarket identifies via groupItemTitle. Find which outcomes
-            # index that team sits at and assign prices accordingly.
-            yes_idx = _yes_outcome_index(outcomes, market.get("groupItemTitle"), league)
-            no_idx = 1 - yes_idx
-            back_probs = [None, None]
-            back_probs[yes_idx] = best_ask
-            back_probs[no_idx] = (1.0 - best_bid) if best_bid is not None else None
+            # bestAsk/bestBid in the Gamma API always track outcomes[0] (the first
+            # token), regardless of groupItemTitle. Assigning by groupItemTitle caused
+            # swapped prices when groupItemTitle matched outcomes[1] (observed on IPL).
+            back_probs = [
+                best_ask,
+                (1.0 - best_bid) if best_bid is not None else None,
+            ]
             lay_probs = [None, None]
         else:
             raise ValueError(f"unexpected outcome count: {len(outcomes)}")

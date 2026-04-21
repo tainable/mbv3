@@ -365,6 +365,56 @@ TEAM_ALIASES = {
         # Nice
         "ogc nice": "nice",
     },
+    "seria": {
+        # Napoli
+        "ssc napoli": "napoli",
+        # Lazio
+        "ss lazio": "lazio",
+        # Roma
+        "as roma": "roma",
+        # Udinese
+        "udinese calcio": "udinese",
+        # Parma
+        "parma calcio 1913": "parma",
+        # Atalanta
+        "atalanta bc": "atalanta",
+        # Cremonese
+        "unione sportiva cremonese": "cremonese",
+        "us cremonese": "cremonese",
+        # Torino
+        "torino fc": "torino",
+        # Hellas Verona
+        "hellas verona fc": "hellas verona",
+        "verona": "hellas verona",
+        # AC Milan
+        "milan": "ac milan",
+        # Pisa
+        "ac pisa 1909": "pisa",
+        "pisa sc": "pisa",
+        # Genoa
+        "genoa cfc": "genoa",
+        # Juventus
+        "juventus fc": "juventus",
+        # Bologna
+        "bologna fc": "bologna",
+        "bologna fc 1909": "bologna",
+        # Lecce
+        "us lecce": "lecce",
+        # Fiorentina
+        "ac fiorentina": "fiorentina",
+        "acf fiorentina": "fiorentina",
+        # Sassuolo
+        "us sassuolo calcio": "sassuolo",
+        # Como
+        "como 1907": "como",
+        # Inter Milan
+        "fc internazionale milano": "inter milan",
+        "inter": "inter milan",
+        "internazionale": "inter milan",
+        "fc inter": "inter milan",
+        # Cagliari
+        "cagliari calcio": "cagliari",
+    },
     "ipl": {
         # Keys must be already-normalized (lowercase, non-alphanumeric → space, no double spaces).
         # Polymarket uses short two/three-letter codes; Matchbook/SX Bet/Smarkets use full names.

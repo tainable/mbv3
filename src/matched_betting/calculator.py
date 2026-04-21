@@ -64,6 +64,7 @@ PROVIDER_COMMISSION: dict[str, float] = {
     "smarkets":   0.00,  # overridden by configure()
     "sx_bet":     0.00,
     "polymarket": 0.00,
+    "azuro":      0.00,
 }
 
 
@@ -86,18 +87,21 @@ BACK_ODDS_FIELDS: dict[str, list[str]] = {
         "matchbook_team1_back_odds",
         "smarkets_team1_back_odds",
         "sx_bet_team1_back_odds",
+        "azuro_team1_back_odds",
     ],
     "draw": [
         "polymarket_draw_back_odds",
         "matchbook_draw_back_odds",
         "smarkets_draw_back_odds",
         "sx_bet_draw_back_odds",
+        "azuro_draw_back_odds",
     ],
     "team2": [
         "polymarket_team2_back_odds",
         "matchbook_team2_back_odds",
         "smarkets_team2_back_odds",
         "sx_bet_team2_back_odds",
+        "azuro_team2_back_odds",
     ],
 }
 
@@ -135,9 +139,7 @@ def _polymarket_fee_rate(decimal_odds: float) -> float:
 
 def _eff_back_odds(odds: float, provider: str) -> float:
     """Effective back odds after provider commission."""
-    if provider == "polymarket":
-        return odds - _polymarket_fee_rate(odds)
-    c = PROVIDER_COMMISSION.get(provider, 0.0)
+    c = _polymarket_fee_rate(odds) if provider == "polymarket" else PROVIDER_COMMISSION.get(provider, 0.0)
     return 1.0 + (odds - 1.0) * (1.0 - c)
 
 
@@ -211,7 +213,7 @@ def _avail_str(game: dict, provider: str, slot: str, side: str) -> str:
     val = game.get(f"{provider}_{slot}_{side}_avail")
     if val is None:
         return ""
-    currency = "USD" if provider == "polymarket" else "GBP"
+    currency = "USD" if provider in ("polymarket", "azuro") else "GBP"
     gbp = _to_gbp(val, currency)
     return f"  [max ~£{gbp:,.0f}]" if gbp is not None else ""
 
@@ -312,6 +314,7 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
                 "date_time": game.get("date_time"),
                 "team1": game.get("team1"),
                 "team2": game.get("team2"),
+                "outcome_slot": slot,
                 "arb_outcome": _outcome_label(game, slot),
                 "back_odds": back_odds,
                 "back_provider": back_provider,

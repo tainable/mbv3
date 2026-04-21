@@ -36,10 +36,112 @@ find_back_lay_arbs = calculator.find_back_lay_arbs
 
 
 # ---------------------------------------------------------------------------
+# Azuro pool-size helpers
+# ---------------------------------------------------------------------------
+
+def _azuro_sure_bet_cap_line(arb: dict, game: dict | None, gbp_rate: float | None) -> str | None:
+    """Return a display line showing max sure-bet profit constrained by Azuro's pool, or None."""
+    if game is None:
+        return None
+    slots = [s for s in ("team1", "draw", "team2") if arb.get(f"{s}_back_provider") == "azuro"]
+    if not slots:
+        return None
+
+    net_margin = 1.0 / (1.0 + arb["profit_pct"] / 100.0)
+    parts = []
+    for slot in slots:
+        max_stake_usdc = game.get(f"azuro_{slot}_max_stake_usdc") or 0.0
+        if max_stake_usdc <= 0:
+            continue
+        slot_odds = arb.get(f"{slot}_back_odds")
+        if slot_odds is None:
+            continue
+        eff_e = calculator._eff_back_odds(slot_odds, "azuro")
+        profit_usdc = max_stake_usdc * eff_e * (1.0 - net_margin)
+        total_stake_usdc = max_stake_usdc * eff_e * net_margin
+        outcome_label = "Draw" if slot == "draw" else (game.get(slot) or slot)
+        if gbp_rate:
+            parts.append(
+                f"stake £{max_stake_usdc * gbp_rate:,.0f} on {outcome_label}"
+                f"  →  profit £{profit_usdc * gbp_rate:,.0f}"
+                f"  (total stake £{total_stake_usdc * gbp_rate:,.0f})"
+            )
+        else:
+            parts.append(
+                f"stake USDC {max_stake_usdc:,.0f} on {outcome_label}"
+                f"  →  profit USDC {profit_usdc:,.0f}"
+                f"  (total stake USDC {total_stake_usdc:,.0f})"
+            )
+    if not parts:
+        return None
+    return "    Azuro cap:  " + "  |  ".join(parts)
+
+
+def _azuro_back_lay_cap_line(arb: dict, game: dict | None, gbp_rate: float | None) -> str | None:
+    """Return a display line showing max back-lay profit constrained by Azuro's pool, or None."""
+    if game is None or arb.get("back_provider") != "azuro":
+        return None
+
+    outcome_lower = (arb.get("arb_outcome") or "").lower()
+    if outcome_lower in ("draw", "tie"):
+        slot = "draw"
+    elif _names_match(outcome_lower, (game.get("team1") or "").lower()):
+        slot = "team1"
+    elif _names_match(outcome_lower, (game.get("team2") or "").lower()):
+        slot = "team2"
+    else:
+        slot = "team1"
+
+    max_stake_usdc = game.get(f"azuro_{slot}_max_stake_usdc") or 0.0
+    if max_stake_usdc <= 0:
+        return None
+
+    profit_usdc = max_stake_usdc * arb["profit_pct"] / 100.0
+    if gbp_rate:
+        return (
+            f"    Azuro cap:  back stake £{max_stake_usdc * gbp_rate:,.0f}"
+            f"  →  profit £{profit_usdc * gbp_rate:,.0f}"
+        )
+    return (
+        f"    Azuro cap:  back stake USDC {max_stake_usdc:,.0f}"
+        f"  →  profit USDC {profit_usdc:,.0f}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Display helpers
 # ---------------------------------------------------------------------------
 
-def _print_sure_bets(arbs: list[dict]) -> None:
+def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, float, float]]:
+    """
+    Return per-leg stakes for a sure bet given a USDC budget.
+
+    Stakes are proportional to 1/eff_odds so every outcome returns equal
+    net profit after commission.
+
+    Returns a list of (outcome_name, provider, raw_odds, stake_usdc).
+    """
+    legs = [
+        (arb["team1"],  arb["team1_back_provider"], arb["team1_back_odds"]),
+    ]
+    if arb.get("market_type") == "three_way" and arb.get("draw_back_odds"):
+        legs.append(("Draw", arb["draw_back_provider"], arb["draw_back_odds"]))
+    legs.append((arb["team2"], arb["team2_back_provider"], arb["team2_back_odds"]))
+
+    eff = [(name, prov, odds, calculator._eff_back_odds(odds, prov)) for name, prov, odds in legs]
+    margin = sum(1.0 / e for *_, e in eff)
+    return [
+        (name, prov, odds, round(budget_usdc / (e * margin), 2))
+        for name, prov, odds, e in eff
+    ]
+
+
+def _print_sure_bets(
+    arbs: list[dict],
+    game: dict | None = None,
+    gbp_rate: float | None = None,
+    budget: float | None = None,
+) -> None:
     if not arbs:
         print("  None found.\n")
         return
@@ -49,17 +151,34 @@ def _print_sure_bets(arbs: list[dict]) -> None:
         def _avail(val, provider) -> str:
             if val is None:
                 return ""
-            cur = "USD" if provider == "polymarket" else "GBP"
+            cur = "USD" if provider in ("polymarket", "azuro") else "GBP"
             gbp = calculator._to_gbp(val, cur)
             return f"  [max ~£{gbp:,.0f}]" if gbp is not None else ""
 
+        # Pre-compute stakes so they can be shown next to each leg
+        stakes: dict[str, float] = {}
+        if budget is not None:
+            for name, _prov, _odds, stake in _sure_bet_stakes(arb, budget):
+                stakes[name] = stake
+
+        def _stake_str(name: str, provider: str) -> str:
+            if name not in stakes:
+                return ""
+            s = stakes[name]
+            if provider in ("polymarket", "sx_bet", "azuro"):
+                return f"  stake: ${s:.2f}"
+            # GBP provider — show both USD and GBP equivalent
+            gbp = round(s * gbp_rate, 2) if gbp_rate else None
+            gbp_part = f" / £{gbp:.2f}" if gbp is not None else ""
+            return f"  stake: ${s:.2f}{gbp_part}"
+
         lines = [
             f"  [{arb['league'].upper()}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
-            f"    Back {arb['team1']:<30} {arb['team1_back_odds']:.4f}  ({arb['team1_back_provider']}){_avail(arb.get('team1_back_avail'), arb['team1_back_provider'])}",
+            f"    Back {arb['team1']:<30} {arb['team1_back_odds']:.4f}  ({arb['team1_back_provider']}){_avail(arb.get('team1_back_avail'), arb['team1_back_provider'])}{_stake_str(arb['team1'], arb['team1_back_provider'])}",
         ]
         if arb["market_type"] == "three_way":
             lines.append(
-                f"    Back {'Draw':<30} {arb['draw_back_odds']:.4f}  ({arb['draw_back_provider']}){_avail(arb.get('draw_back_avail'), arb['draw_back_provider'])}"
+                f"    Back {'Draw':<30} {arb['draw_back_odds']:.4f}  ({arb['draw_back_provider']}){_avail(arb.get('draw_back_avail'), arb['draw_back_provider'])}{_stake_str('Draw', arb['draw_back_provider'])}"
             )
         gross_str = (
             f"  (gross: {arb['gross_profit_pct']:.4f}%)"
@@ -67,14 +186,17 @@ def _print_sure_bets(arbs: list[dict]) -> None:
             else ""
         )
         lines += [
-            f"    Back {arb['team2']:<30} {arb['team2_back_odds']:.4f}  ({arb['team2_back_provider']}){_avail(arb.get('team2_back_avail'), arb['team2_back_provider'])}",
+            f"    Back {arb['team2']:<30} {arb['team2_back_odds']:.4f}  ({arb['team2_back_provider']}){_avail(arb.get('team2_back_avail'), arb['team2_back_provider'])}{_stake_str(arb['team2'], arb['team2_back_provider'])}",
             f"    Margin: {arb['margin']:.6f}  |  Net profit: {arb['profit_pct']:.4f}%{gross_str}",
             "",
         ]
+        az_line = _azuro_sure_bet_cap_line(arb, game, gbp_rate)
+        if az_line:
+            lines.insert(-1, az_line)
         print("\n".join(lines))
 
 
-def _print_back_lay_arbs(arbs: list[dict]) -> None:
+def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: float | None = None) -> None:
     if not arbs:
         print("  None found.\n")
         return
@@ -84,7 +206,7 @@ def _print_back_lay_arbs(arbs: list[dict]) -> None:
         def _avail(val, provider) -> str:
             if val is None:
                 return ""
-            cur = "USD" if provider == "polymarket" else "GBP"
+            cur = "USD" if provider in ("polymarket", "azuro") else "GBP"
             gbp = calculator._to_gbp(val, cur)
             return f"  [max ~£{gbp:,.0f}]" if gbp is not None else ""
 
@@ -93,12 +215,17 @@ def _print_back_lay_arbs(arbs: list[dict]) -> None:
             if arb.get("gross_profit_pct") != arb.get("profit_pct")
             else ""
         )
-        print(
-            f"  [{arb['league'].upper()}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}\n"
-            f"    Back {arb['arb_outcome']:<30} {arb['back_odds']:.4f}  ({arb['back_provider']}){_avail(arb.get('back_avail'), arb['back_provider'])}\n"
-            f"    Lay  {arb['arb_outcome']:<30} {arb['lay_odds']:.4f}  ({arb['lay_provider']}){_avail(arb.get('lay_avail'), arb['lay_provider'])}\n"
-            f"    Net profit: {arb['profit_pct']:.4f}%{gross_str}\n"
-        )
+        az_line = _azuro_back_lay_cap_line(arb, game, gbp_rate)
+        lines = [
+            f"  [{arb['league'].upper()}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
+            f"    Back {arb['arb_outcome']:<30} {arb['back_odds']:.4f}  ({arb['back_provider']}){_avail(arb.get('back_avail'), arb['back_provider'])}",
+            f"    Lay  {arb['arb_outcome']:<30} {arb['lay_odds']:.4f}  ({arb['lay_provider']}){_avail(arb.get('lay_avail'), arb['lay_provider'])}",
+            f"    Net profit: {arb['profit_pct']:.4f}%{gross_str}",
+        ]
+        if az_line:
+            lines.append(az_line)
+        lines.append("")
+        print("\n".join(lines))
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +412,61 @@ def _fetch_sx_bet_leg(game: dict, outcome_name: str, side: str, http, settings) 
         return None
 
 
+def _fetch_azuro_leg(game: dict, outcome_name: str, side: str, http, settings) -> float | None:
+    """Re-fetch current Azuro odds for one outcome via the subgraph condition query."""
+    condition_id = game.get("azuro_condition_id")
+    if not condition_id or side == "lay":
+        return None
+    # Determine which slot we're re-fetching so we know which outcomeId to read
+    league = game.get("league", "")
+    if outcome_name.lower() in ("draw", "tie"):
+        slot = "draw"
+    elif _names_match(game.get("team1", ""), outcome_name):
+        slot = "team1"
+    else:
+        slot = "team2"
+    try:
+        resp = http.post_json(
+            settings.azuro.subgraph_url,
+            payload={
+                "query": """
+query FetchCondition($id: String!) {
+  condition(id: $id) {
+    state
+    outcomes(orderBy: sortOrder) { outcomeId currentOdds sortOrder }
+    game { participants { name } }
+  }
+}""",
+                "variables": {"id": condition_id},
+            },
+        )
+        condition = (resp.get("data") or {}).get("condition")
+        if not condition or condition.get("state") != "Active":
+            return None
+        participants = [
+            p.get("name", "") for p in
+            (condition.get("game") or {}).get("participants", [])
+        ]
+        outcomes = condition.get("outcomes", [])
+        for o in outcomes:
+            sort_order = o.get("sortOrder")
+            # Map sortOrder to slot: 0=team1, 1=draw (3-way) or team2 (2-way), 2=team2
+            if len(outcomes) == 3:
+                outcome_slot = {0: "team1", 1: "draw", 2: "team2"}.get(sort_order)
+            else:
+                outcome_slot = {0: "team1", 1: "team2"}.get(sort_order)
+            if outcome_slot != slot:
+                continue
+            raw = o.get("currentOdds")
+            if raw is None:
+                return None
+            odds = float(raw)
+            return odds if odds > 1.0 else None
+    except (OSError, KeyError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: azuro live fetch failed for condition {condition_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
+    return None
+
+
 def _fetch_leg(provider: str, game: dict, outcome_name: str, side: str, http, settings) -> float | None:
     if provider == "polymarket":
         return _fetch_polymarket_leg(game, outcome_name, side, http, settings)
@@ -294,6 +476,8 @@ def _fetch_leg(provider: str, game: dict, outcome_name: str, side: str, http, se
         return _fetch_matchbook_leg(game, outcome_name, side, http, settings)
     if provider == "sx_bet":
         return _fetch_sx_bet_leg(game, outcome_name, side, http, settings)
+    if provider == "azuro":
+        return _fetch_azuro_leg(game, outcome_name, side, http, settings)
     return None
 
 
@@ -456,6 +640,13 @@ def main() -> None:
         action="store_true",
         help="Skip the odds refresh check after identifying arbs.",
     )
+    parser.add_argument(
+        "--budget",
+        type=float,
+        default=None,
+        metavar="USDC",
+        help="Show per-leg stake sizes for this USDC budget alongside each sure bet.",
+    )
     args = parser.parse_args()
 
     # Load commission settings from .env before running any calculations.
@@ -481,7 +672,7 @@ def main() -> None:
     print(f"Arb finder run:  {run_at}")
     print(f"Commission: Matchbook 2% | {smarkets_note} | SX Bet 0% | Polymarket dynamic\n")
     print(f"=== Sure bets: {len(sure_bets)} found ===\n")
-    _print_sure_bets(sure_bets)
+    _print_sure_bets(sure_bets, budget=args.budget)
 
     print(f"=== Back-lay arbs: {len(back_lay_arbs)} found ===\n")
     _print_back_lay_arbs(back_lay_arbs)

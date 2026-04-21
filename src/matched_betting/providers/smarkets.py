@@ -174,7 +174,7 @@ class SmarketsProvider(OddsProvider):
                         event_name=event_name,
                         event_start=event_start,
                         market_name="Match Winner",
-                        market_type="three_way" if league in ("ucl", "epl", "uel") else "two_way",
+                        market_type="three_way" if league in ("ucl", "epl", "uel", "seria") else "two_way",
                         selection_name=normalize_team_name(
                             str(contract.get("name") or "Unknown selection"), league
                         ),
@@ -290,7 +290,7 @@ class SmarketsProvider(OddsProvider):
                             event_name=str(event.get("name") or "Unknown event"),
                             event_start=event.get("start_datetime"),
                             market_name=str(market.get("name") or "Unknown market"),
-                            market_type="three_way" if league in ("ucl", "epl", "uel") else "two_way",
+                            market_type="three_way" if league in ("ucl", "epl", "uel", "seria") else "two_way",
                             selection_name=normalize_team_name(str(contract.get("name") or "Unknown selection"), league),
                             selection_side=side,
                             decimal_odds=decimal_from_probability(probability),
@@ -356,6 +356,7 @@ LEAGUE_ROOT_EVENT_IDS = {
     "ucl": 25363462,
     "epl": 25508311,
     "uel": 25502999,
+    "seria": 30371165,
     "ipl": 41842879,
 }
 
@@ -366,6 +367,7 @@ LEAGUE_TO_SPORT = {
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
+    "seria": "soccer",
     "ipl": "cricket",
 }
 

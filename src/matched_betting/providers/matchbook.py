@@ -34,7 +34,7 @@ class MatchbookProvider(OddsProvider):
         retrieved_at = utc_now_iso()
         self._login()
 
-        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl")):
+        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria")):
             self._log_available_sports()
 
         records: list[OddsRecord] = []
@@ -180,6 +180,9 @@ class MatchbookProvider(OddsProvider):
         if league == "uel":
             # TODO: verify the exact url-name Matchbook uses for the Europa League
             return any(tag.get("url-name") in ("europa-league", "uel", "uefa-europa-league") for tag in meta_tags)
+        if league == "seria":
+            # TODO: verify the exact url-name Matchbook uses for Serie A
+            return any(tag.get("url-name") in ("serie-a", "seria", "italian-serie-a", "italy-serie-a") for tag in meta_tags)
         if league == "ipl":
             # Sport ID 110 covers all cricket; filter down to IPL specifically.
             # Try meta-tags first (multiple known url-name variants across seasons).
@@ -216,7 +219,7 @@ class MatchbookProvider(OddsProvider):
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type = "three_way" if league in ("ucl", "epl", "uel") else "two_way"
+            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria") else "two_way"
             for runner in market.get("runners", []):
                 best_by_side = _best_prices_per_side(runner.get("prices", []))
                 for side, price in best_by_side.items():
@@ -304,6 +307,7 @@ LEAGUE_SPORT_IDS = {
     "ucl": 15,
     "epl": 15,  # Same sport ID as UCL (soccer)
     "uel": 15,  # Same sport ID (soccer)
+    "seria": 15,  # Same sport ID (soccer)
     "ipl": 110,  # Cricket — sport ID 110 covers all cricket; filtered by meta-tag below
 }
 
@@ -314,5 +318,6 @@ LEAGUE_TO_SPORT = {
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
+    "seria": "soccer",
     "ipl": "cricket",
 }
