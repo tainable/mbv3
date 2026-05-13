@@ -126,6 +126,8 @@ def _build_scan_cmd(args: argparse.Namespace) -> list[str]:
     if args.leagues:
         cmd += ["--leagues"] + args.leagues
     cmd += ["--min-profit", str(args.min_profit)]
+    if args.bet_dry_run:
+        cmd.append("--bet-dry-run")
     return cmd
 
 
@@ -144,8 +146,8 @@ def main() -> None:
                         help="Minutes between ids.py re-runs (default: 360).")
     parser.add_argument("--scan-timeout", type=int, default=600, metavar="SECS",
                         help="Kill scan.py after this many seconds (default: 600).")
-    parser.add_argument("--ids-timeout", type=int, default=300, metavar="SECS",
-                        help="Kill ids.py after this many seconds (default: 300).")
+    parser.add_argument("--ids-timeout", type=int, default=600, metavar="SECS",
+                        help="Kill ids.py after this many seconds (default: 600).")
     parser.add_argument("--max-restarts", type=int, default=10, metavar="N",
                         help="Consecutive crash limit before circuit-breaker pause (default: 10).")
     parser.add_argument("--pause-on-max-restarts", type=int, default=3600, metavar="SECS",
@@ -158,6 +160,10 @@ def main() -> None:
                         help="Providers passed to ids.py and scan.py.")
     parser.add_argument("--leagues", nargs="+", metavar="LEAGUE",
                         help="Leagues passed to ids.py and scan.py.")
+    parser.add_argument("--bet-dry-run", action="store_true",
+                        help="Pass --bet-dry-run to every scan.py run (simulate bets, no real placement).")
+    parser.add_argument("--skip-initial-ids", action="store_true",
+                        help="Skip the ids.py run at startup and use the existing IDs file.")
     parser.add_argument("--log", metavar="FILE", default=None,
                         help="Write all output to FILE (headless mode). "
                              "Monitor with: Get-Content FILE -Wait -Tail 30")
@@ -180,12 +186,15 @@ def main() -> None:
     started_at = _now()
     scan_count = 0
     crash_count = 0
-    last_ids_refresh: float | None = None
+    last_ids_refresh: float | None = time.monotonic() if args.skip_initial_ids else None
 
+    mode = "DRY RUN" if args.bet_dry_run else "LIVE"
     _log(_SEP)
-    _log(f"  watch_bet daemon starting")
+    _log(f"  watch_bet daemon starting  [{mode}]")
     _log(f"  budget={args.budget} USDC  min-profit={args.min_profit}%  "
          f"interval={args.interval}s  ids-refresh={args.ids_refresh_interval}m")
+    if args.skip_initial_ids:
+        _log(f"  --skip-initial-ids: using existing IDs file, next refresh in {args.ids_refresh_interval}m")
     _log(_SEP)
 
     while True:

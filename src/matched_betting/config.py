@@ -66,6 +66,12 @@ class KellySettings:
 
 
 @dataclass(frozen=True)
+class RebalancerSettings:
+    enabled: bool
+    min_balance_usdc: float
+
+
+@dataclass(frozen=True)
 class CommissionSettings:
     matchbook: float
     smarkets: float
@@ -87,6 +93,7 @@ class Settings:
     alert_webhook_url: str | None = None
     alert_enabled: bool = True
     kelly: KellySettings = None  # type: ignore[assignment]  populated by load_settings
+    rebalancer: RebalancerSettings = None  # type: ignore[assignment]  populated by load_settings
 
 
 def load_settings(project_root: Path) -> Settings:
@@ -150,5 +157,9 @@ def load_settings(project_root: Path) -> Settings:
             smarkets=0.0 if smarkets_zero else float(os.getenv("SMARKETS_COMMISSION", "0.02")),
             sx_bet=float(os.getenv("SX_BET_COMMISSION", "0.0")),
             smarkets_zero_commission_period=smarkets_zero,
+        ),
+        rebalancer=RebalancerSettings(
+            enabled=os.getenv("REBALANCER_ENABLED", "true").lower() in ("true", "1", "yes"),
+            min_balance_usdc=float(os.getenv("MIN_BALANCE_USDC", "50")),
         ),
     )

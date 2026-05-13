@@ -737,6 +737,9 @@ def main() -> None:
                 if _exec._HALT:
                     print("  ⛔  AUTO-BET HALTED after a leg failure — restart process to resume.")
                     continue
+                if not args.bet_dry_run and _exec.game_already_bet(game):
+                    print("  ⚠  Skipping — a bet has already been placed on this game.")
+                    continue
                 mode = "DRY RUN" if args.bet_dry_run else "LIVE"
                 print(f"  AUTO-BET [{mode}]  budget: ${args.budget:.2f} USDC per arb")
 
@@ -796,6 +799,10 @@ def main() -> None:
                             _exec.print_bet_results(results)
                             if _exec.all_legs_placed(results):
                                 print("  [WATCH] ALL LEGS PLACED")
+                                if not args.bet_dry_run:
+                                    _exec.log_arb_success(best_type, best_arb, game)
+                                from matched_betting import rebalancer as _rebalancer
+                                _rebalancer.run_post_bet_rebalance(settings, dry_run=args.bet_dry_run)
 
                     else:
                         lay_note = ""
@@ -825,6 +832,10 @@ def main() -> None:
                             _exec.print_bet_results(results)
                             if _exec.all_legs_placed(results):
                                 print("  [WATCH] ALL LEGS PLACED")
+                                if not args.bet_dry_run:
+                                    _exec.log_arb_success(best_type, best_arb, game)
+                                from matched_betting import rebalancer as _rebalancer
+                                _rebalancer.run_post_bet_rebalance(settings, dry_run=args.bet_dry_run)
 
                 print()
 

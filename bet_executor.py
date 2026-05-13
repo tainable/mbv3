@@ -229,6 +229,72 @@ def _resolve_mb_runner(
 
 
 # ---------------------------------------------------------------------------
+# Placed-game tracking — prevent duplicate bets on the same match
+# ---------------------------------------------------------------------------
+
+def log_arb_success(arb_type: str, arb: dict, game: dict) -> None:
+    """Append a PLACED entry to bet_log.jsonl so game_already_bet() can block duplicates."""
+    from datetime import datetime, timezone
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "status":    "PLACED",
+        "arb_type":  arb_type,
+        "team1":     game.get("team1"),
+        "team2":     game.get("team2"),
+        "league":    game.get("league"),
+        "date_time": game.get("date_time"),
+        "profit_pct": arb.get("profit_pct"),
+    }
+    _BET_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with _BET_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def game_already_bet(game: dict, window_hours: float = 36.0) -> bool:
+    """
+    Return True if bet_log.jsonl contains a PLACED entry for this game within
+    window_hours.  Matches on normalised team names so minor spelling differences
+    across providers don't create false negatives.
+    """
+    if not _BET_LOG.exists():
+        return False
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    t1 = _norm(game.get("team1") or "")
+    t2 = _norm(game.get("team2") or "")
+    if not t1 or not t2:
+        return False
+    try:
+        with _BET_LOG.open(encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("status") != "PLACED":
+                    continue
+                try:
+                    ts = datetime.fromisoformat(
+                        entry.get("timestamp", "").replace("Z", "+00:00")
+                    )
+                    if ts < cutoff:
+                        continue
+                except ValueError:
+                    continue
+                if (
+                    _norm(entry.get("team1") or "") == t1
+                    and _norm(entry.get("team2") or "") == t2
+                ):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Failed-leg handling: log, cancel, alert, halt
 # ---------------------------------------------------------------------------
 

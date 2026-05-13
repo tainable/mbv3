@@ -8,6 +8,7 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -116,8 +117,16 @@ _cfg: dict = {
     "dry_run":          False,
     "scan_interval":    300,
     "max_runtime":      0,   # 0 = unlimited
-    "skip_imminent":    True, # False = pass --no-skip-imminent
-    "imminent_minutes": 10,   # games kicking off within this many minutes are skipped
+    "skip_imminent":    True,
+    "imminent_minutes": 10,
+    # Daemon (watch_bet.py) settings
+    "daemon_interval":      300,   # seconds between scan.py runs
+    "daemon_ids_refresh":   360,   # minutes between ids.py re-runs
+    "daemon_scan_timeout":  600,   # kill scan.py after N seconds
+    "daemon_ids_timeout":   600,   # kill ids.py after N seconds
+    "daemon_max_restarts":  10,    # consecutive crash limit before circuit-breaker pause
+    "daemon_log":           "",    # path to log file; empty = stream to stdout
+    "daemon_skip_initial_ids": False,  # skip ids.py at startup and use existing file
 }
 
 
@@ -494,6 +503,138 @@ def run_polymarket_setup() -> None:
             _pause()
 
 
+# ─── Daemon (watch_bet.py) ────────────────────────────────────────────────────
+
+_HEARTBEAT = _ROOT / "outputs" / "heartbeat.txt"
+
+
+def _heartbeat_summary() -> str:
+    """One-line daemon status from the heartbeat file, or a short 'not running' note."""
+    if not _HEARTBEAT.exists():
+        return "not running"
+    try:
+        hb = json.loads(_HEARTBEAT.read_text(encoding="utf-8"))
+        last = hb.get("last_scan_at", "?")
+        scans = hb.get("scan_count", "?")
+        crashes = hb.get("consecutive_crashes", 0)
+        crash_s = f"  crashes={crashes}" if crashes else ""
+        # Age of the heartbeat file
+        age_s = int(time.time() - _HEARTBEAT.stat().st_mtime)
+        if age_s < 60:
+            age_label = f"{age_s}s ago"
+        elif age_s < 3600:
+            age_label = f"{age_s // 60}m ago"
+        else:
+            age_label = f"{age_s / 3600:.1f}h ago"
+        return f"last scan {last}  ({age_label})  scans={scans}{crash_s}"
+    except Exception:
+        return "heartbeat unreadable"
+
+
+def _build_daemon_cmd() -> list[str]:
+    cmd = [
+        _PY, "watch_bet.py",
+        "--budget",               str(_cfg["budget"]),
+        "--min-profit",           str(_cfg["min_profit"]),
+        "--interval",             str(_cfg["daemon_interval"]),
+        "--ids-refresh-interval", str(_cfg["daemon_ids_refresh"]),
+        "--scan-timeout",         str(_cfg["daemon_scan_timeout"]),
+        "--ids-timeout",          str(_cfg["daemon_ids_timeout"]),
+        "--max-restarts",         str(_cfg["daemon_max_restarts"]),
+    ]
+    if _cfg["providers"]:
+        cmd += ["--providers"] + _cfg["providers"]
+    if _cfg["leagues"]:
+        cmd += ["--leagues"] + _cfg["leagues"]
+    if _cfg["dry_run"]:
+        cmd.append("--bet-dry-run")
+    if _cfg["daemon_skip_initial_ids"]:
+        cmd.append("--skip-initial-ids")
+    if _cfg["daemon_log"]:
+        cmd += ["--log", _cfg["daemon_log"]]
+    return cmd
+
+
+def _daemon_summary() -> None:
+    print(f"  Leagues      : {_ls()}")
+    print(f"  Providers    : {_ps()}")
+    print(f"  Budget       : ${_cfg['budget']:.2f} USDC  |  Min profit: {_cfg['min_profit']:.1f}%")
+    print(f"  Interval     : {_fmt_duration(_cfg['daemon_interval'])} between scans")
+    skip_s = "yes (use existing file)" if _cfg["daemon_skip_initial_ids"] else "no (run ids.py first)"
+    print(f"  IDs refresh  : every {_cfg['daemon_ids_refresh']}m  |  skip initial: {skip_s}")
+    print(f"  Scan timeout : {_cfg['daemon_scan_timeout']}s")
+    print(f"  Max restarts : {_cfg['daemon_max_restarts']} before circuit-breaker pause")
+    log_s = _cfg["daemon_log"] or "(stdout)"
+    print(f"  Log file     : {log_s}")
+    print(f"  Heartbeat    : {_heartbeat_summary()}")
+
+
+def run_daemon() -> None:
+    while True:
+        _header("Daemon  (24/7 autonomous)")
+        _daemon_summary()
+        print()
+        mode_s = "DRY RUN" if _cfg["dry_run"] else "LIVE"
+        print(f"  [1]  Start daemon          — launches watch_bet.py [{mode_s}]  (Ctrl+C to stop)")
+        print(f"  [d]  Toggle dry run        — currently: {mode_s}")
+        print("  [2]  Providers")
+        print("  [3]  Leagues")
+        print("  [4]  Budget / min-profit")
+        print("  [5]  Scan interval")
+        print("  [6]  IDs refresh interval  (minutes)")
+        print("  [7]  Scan timeout          (seconds before killing a hung scan.py)")
+        print("  [8]  Max restarts          (circuit-breaker threshold)")
+        skip_ids_s = "yes" if _cfg["daemon_skip_initial_ids"] else "no"
+        print(f"  [s]  Skip initial IDs scan — currently: {skip_ids_s}")
+        print("  [9]  Log file              (empty = stream to terminal)")
+        print()
+        print("  [0]  Back")
+        print()
+        c = _ask("Choice")
+        if c == "0":
+            break
+        elif c == "d":
+            _cfg["dry_run"] = not _cfg["dry_run"]
+        elif c == "s":
+            _cfg["daemon_skip_initial_ids"] = not _cfg["daemon_skip_initial_ids"]
+        elif c == "2":
+            _toggle_list("providers", _ALL_PROVIDERS, "Providers — Daemon")
+        elif c == "3":
+            _toggle_list("leagues", _ALL_LEAGUES, "Leagues — Daemon")
+        elif c == "4":
+            _cfg["budget"]     = _ask_float("Budget per arb (USDC)", _cfg["budget"])
+            _cfg["min_profit"] = _ask_float("Min profit %", _cfg["min_profit"])
+        elif c == "5":
+            _cfg["daemon_interval"] = max(30, _ask_int("Seconds between scans", _cfg["daemon_interval"]))
+        elif c == "6":
+            _cfg["daemon_ids_refresh"] = max(1, _ask_int("Minutes between IDs refresh", _cfg["daemon_ids_refresh"]))
+        elif c == "7":
+            _cfg["daemon_scan_timeout"] = max(60, _ask_int("Scan timeout (seconds)", _cfg["daemon_scan_timeout"]))
+        elif c == "8":
+            _cfg["daemon_max_restarts"] = max(1, _ask_int("Max consecutive crashes", _cfg["daemon_max_restarts"]))
+        elif c == "9":
+            raw = _ask("Log file path (leave blank for stdout)", _cfg["daemon_log"])
+            _cfg["daemon_log"] = raw.strip()
+        elif c == "1":
+            cmd = _build_daemon_cmd()
+            print()
+            print(_hr("─"))
+            print(f"  $ {' '.join(cmd)}")
+            if _cfg["daemon_log"]:
+                print(f"  Output → {_cfg['daemon_log']}")
+                print(f"  Follow with:  Get-Content \"{_cfg['daemon_log']}\" -Wait -Tail 30")
+            print(_hr("─"))
+            print()
+            print("  Daemon running — press Ctrl+C to stop.")
+            print()
+            try:
+                subprocess.run(cmd, cwd=_ROOT)
+            except KeyboardInterrupt:
+                print("\n  Daemon stopped.")
+            _pause()
+            break
+
+
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -508,6 +649,11 @@ def main() -> None:
         print("  [1]  Refresh IDs          — discover markets  (Stage 1)")
         print("  [2]  Scan  (single pass)  — check for arbs   (Stage 2)")
         print("  [3]  Scan  (loop)         — repeat every N seconds")
+        print()
+        print("  Autonomous")
+        print("  " + "─" * 48)
+        print("  [7]  Daemon (24/7)        — watch_bet.py  (IDs refresh + backoff + alerts)")
+        print(f"       {_heartbeat_summary()}")
         print()
         print("  Portfolio")
         print("  " + "─" * 48)
@@ -536,6 +682,7 @@ def main() -> None:
         elif c == "4": run_portfolio()
         elif c == "5": settings_menu()
         elif c == "6": run_polymarket_setup()
+        elif c == "7": run_daemon()
 
 
 if __name__ == "__main__":
