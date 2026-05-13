@@ -854,6 +854,9 @@ def main() -> None:
     print(f"  Back-lay arbs:  {len(total_back_lay_arbs)}")
     print(_hr(tw))
 
+    if args.auto_bet and _exec._HALT:
+        sys.exit(2)
+
 
 if __name__ == "__main__":
     main()

@@ -1,123 +1,289 @@
 """
 watch_bet.py
 ------------
-Runs the scan every INTERVAL seconds until all legs of an arb are placed live,
-then exits automatically.
+Autonomous 24/7 daemon: runs ids.py then scan.py in a loop forever.
 
-Usage:
-    py watch_bet.py                          # interactive, every 5 minutes
-    py watch_bet.py --interval 120           # every 2 minutes
-    pythonw watch_bet.py --log out.log       # fully headless — no window, output to file
-    Get-Content out.log -Wait -Tail 20       # follow the log from another terminal
+Features
+--------
+- Periodic ids.py refresh to keep market IDs current
+- Per-process timeout: kills a hung scan.py or ids.py
+- Exponential backoff after crashes: 30s → 60s → 120s → 300s (capped)
+- Circuit breaker: alert + extended pause after N consecutive crashes
+- Graceful halt on FAILED_LEG: scan.py exits 2 when bet_executor._HALT is set;
+  the daemon stops and alerts rather than restarting into a broken state
+- Heartbeat file (outputs/heartbeat.txt) updated after every scan cycle
+
+Exit codes from scan.py that the daemon treats specially:
+  0 → success (keep running)
+  1 → crash (backoff + retry)
+  2 → HALT (failed-leg incident — stop and alert, require human restart)
+
+Usage
+-----
+    py watch_bet.py --budget 50 --providers polymarket sx_bet --min-profit 0.5
+    py watch_bet.py --budget 50 --log daemon.log --interval 180
+    Get-Content daemon.log -Wait -Tail 30    # follow log on Windows
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import subprocess
 import sys
+import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
-_SCAN_BASE = [
-    sys.executable, "scan.py",
-    "--provider", "sx_bet", "polymarket",
-    "--auto-bet",
-    "--budget", "5",
-]
+_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_ROOT / "src"))
 
+_HEARTBEAT = _ROOT / "outputs" / "heartbeat.txt"
 _SEP = "─" * 60
+
+# Backoff schedule (seconds) indexed by consecutive crash count (capped at last value)
+_BACKOFF = [30, 60, 120, 300]
+
+# scan.py exit code that signals a halted state requiring human review
+_EXIT_HALT = 2
 
 
 def _now() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _run_once(min_profit: float) -> bool:
+def _log(msg: str) -> None:
+    print(f"[{_now()}] {msg}", flush=True)
+
+
+def _run_subprocess(
+    cmd: list[str],
+    timeout_secs: int,
+    label: str,
+) -> tuple[int, bool]:
     """
-    Run one scan pass.  Returns True when scan.py confirms every leg of an arb
-    was placed live by printing the sentinel "[WATCH] ALL LEGS PLACED".
-    That line is only emitted after all_legs_placed() passes — i.e. every
-    executable leg returned ok=True with no dry_run flag.
+    Run a subprocess with real-time stdout streaming and a hard timeout.
+    Returns (exit_code, timed_out).
     """
-    placed = False
-    cmd = _SCAN_BASE + ["--min-profit", str(min_profit)]
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
-        env={**os.environ, "PYTHONUTF8": "1"},
         bufsize=1,
+        env={**os.environ, "PYTHONUTF8": "1"},
     )
     assert proc.stdout is not None
-    for line in proc.stdout:
-        print(line, end="", flush=True)
-        if "[WATCH] ALL LEGS PLACED" in line:
-            placed = True
-    proc.wait()
-    return placed
+
+    def _stream() -> None:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            print(line, end="", flush=True)
+
+    reader = threading.Thread(target=_stream, daemon=True)
+    reader.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout_secs)
+    except subprocess.TimeoutExpired:
+        _log(f"  ⚠  {label} timed out after {timeout_secs}s — killing process")
+        proc.kill()
+        timed_out = True
+
+    reader.join(timeout=5)
+    return proc.returncode or 0, timed_out
+
+
+def _write_heartbeat(state: dict) -> None:
+    _HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+    _HEARTBEAT.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+
+
+def _send_alert(subject: str, body: str, settings) -> None:
+    try:
+        from matched_betting import notifier
+        notifier.send_alert(subject, body, settings)
+    except Exception as exc:
+        _log(f"  (alert delivery failed: {exc})")
+        _log(f"  ALERT: {subject} — {body}")
+
+
+def _build_ids_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = [sys.executable, "ids.py"]
+    if args.providers:
+        cmd += ["--providers"] + args.providers
+    if args.leagues:
+        cmd += ["--leagues"] + args.leagues
+    return cmd
+
+
+def _build_scan_cmd(args: argparse.Namespace) -> list[str]:
+    cmd = [sys.executable, "scan.py", "--auto-bet", "--budget", str(args.budget)]
+    if args.providers:
+        cmd += ["--providers"] + args.providers
+    if args.leagues:
+        cmd += ["--leagues"] + args.leagues
+    cmd += ["--min-profit", str(args.min_profit)]
+    return cmd
+
+
+def _backoff_secs(crash_count: int) -> int:
+    idx = min(crash_count - 1, len(_BACKOFF) - 1)
+    return _BACKOFF[idx]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Poll scan.py until a bet is placed.")
-    parser.add_argument(
-        "--interval",
-        type=int,
-        default=300,
-        metavar="SECONDS",
-        help="Seconds between scans (default: 300).",
+    parser = argparse.ArgumentParser(
+        description="24/7 matched-betting daemon: runs ids.py + scan.py in a loop."
     )
-    parser.add_argument(
-        "--min-profit",
-        type=float,
-        default=1.0,
-        metavar="PCT",
-        help="Minimum net profit %% to act on (default: 1.0).",
-    )
-    parser.add_argument(
-        "--log",
-        metavar="FILE",
-        default=None,
-        help=(
-            "Write all output to FILE instead of the console. "
-            "Combine with `pythonw watch_bet.py --log out.log` for fully headless operation "
-            "(no window). Monitor with: Get-Content out.log -Wait -Tail 20"
-        ),
-    )
+    parser.add_argument("--interval", type=int, default=300, metavar="SECS",
+                        help="Seconds between scan.py runs (default: 300).")
+    parser.add_argument("--ids-refresh-interval", type=int, default=30, metavar="MINS",
+                        help="Minutes between ids.py re-runs (default: 30).")
+    parser.add_argument("--scan-timeout", type=int, default=600, metavar="SECS",
+                        help="Kill scan.py after this many seconds (default: 600).")
+    parser.add_argument("--ids-timeout", type=int, default=300, metavar="SECS",
+                        help="Kill ids.py after this many seconds (default: 300).")
+    parser.add_argument("--max-restarts", type=int, default=10, metavar="N",
+                        help="Consecutive crash limit before circuit-breaker pause (default: 10).")
+    parser.add_argument("--pause-on-max-restarts", type=int, default=3600, metavar="SECS",
+                        help="How long to pause after hitting the crash limit (default: 3600).")
+    parser.add_argument("--budget", type=float, default=50.0, metavar="USDC",
+                        help="Max stake budget passed to scan.py --budget (default: 50).")
+    parser.add_argument("--min-profit", type=float, default=0.5, metavar="PCT",
+                        help="Min net profit %% passed to scan.py (default: 0.5).")
+    parser.add_argument("--providers", nargs="+", metavar="PROVIDER",
+                        help="Providers passed to ids.py and scan.py.")
+    parser.add_argument("--leagues", nargs="+", metavar="LEAGUE",
+                        help="Leagues passed to ids.py and scan.py.")
+    parser.add_argument("--log", metavar="FILE", default=None,
+                        help="Write all output to FILE (headless mode). "
+                             "Monitor with: Get-Content FILE -Wait -Tail 30")
     args = parser.parse_args()
 
+    # ── Headless mode ─────────────────────────────────────────────────────
     if args.log:
-        # Headless mode: redirect stdout to the log file.
-        # line-buffered (buffering=1) so each print flushes immediately.
         sys.stdout = open(args.log, "w", encoding="utf-8", buffering=1)
     elif hasattr(sys.stdout, "reconfigure"):
-        # Interactive mode: force UTF-8 so box-drawing chars render correctly.
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-    attempt = 0
+    # ── Load settings for notifications ───────────────────────────────────
+    try:
+        from matched_betting.config import load_settings
+        settings = load_settings(_ROOT)
+    except Exception as exc:
+        _log(f"  ⚠  Could not load settings for notifications: {exc}")
+        settings = None
+
+    started_at = _now()
+    scan_count = 0
+    crash_count = 0
+    last_ids_refresh: float | None = None
+
+    _log(_SEP)
+    _log(f"  watch_bet daemon starting")
+    _log(f"  budget={args.budget} USDC  min-profit={args.min_profit}%  "
+         f"interval={args.interval}s  ids-refresh={args.ids_refresh_interval}m")
+    _log(_SEP)
+
     while True:
-        attempt += 1
-        print(f"\n{_SEP}")
-        print(f"  [watch_bet] Attempt #{attempt}  —  {_now()}")
-        print(_SEP)
+        now = time.monotonic()
 
-        placed = _run_once(args.min_profit)
+        # ── 1. Refresh IDs if stale ────────────────────────────────────────
+        ids_age_mins = (now - last_ids_refresh) / 60 if last_ids_refresh is not None else None
+        ids_stale = last_ids_refresh is None or ids_age_mins >= args.ids_refresh_interval
+        if ids_stale:
+            _log(_SEP)
+            _log(f"  IDS REFRESH (age={ids_age_mins:.0f}m)" if ids_age_mins else "  IDS REFRESH (startup)")
+            _log(_SEP)
+            ids_cmd = _build_ids_cmd(args)
+            ids_rc, ids_timeout = _run_subprocess(ids_cmd, args.ids_timeout, "ids.py")
+            if ids_timeout or ids_rc != 0:
+                _log(f"  ⚠  ids.py finished with issues (exit={ids_rc}, timeout={ids_timeout}) — "
+                     f"continuing with existing IDs")
+            else:
+                _log(f"  ✓  IDs refreshed")
+            last_ids_refresh = time.monotonic()
 
-        if placed:
-            print(f"\n{_SEP}")
-            print(f"  [watch_bet] Bet placed — stopping.  {_now()}")
-            print(_SEP)
+        # ── 2. Run scan ────────────────────────────────────────────────────
+        _log(_SEP)
+        _log(f"  SCAN #{scan_count + 1}")
+        _log(_SEP)
+        scan_cmd = _build_scan_cmd(args)
+        scan_rc, scan_timeout = _run_subprocess(scan_cmd, args.scan_timeout, "scan.py")
+        scan_count += 1
+
+        # ── 3. Update heartbeat ────────────────────────────────────────────
+        _write_heartbeat({
+            "pid":                  os.getpid(),
+            "started_at":           started_at,
+            "last_scan_at":         _now(),
+            "last_ids_refresh_at":  datetime.fromtimestamp(
+                                        last_ids_refresh, tz=timezone.utc
+                                    ).isoformat().replace("+00:00", "Z"),
+            "scan_count":           scan_count,
+            "consecutive_crashes":  crash_count,
+        })
+
+        # ── 4. Handle halt (failed-leg incident) ──────────────────────────
+        if scan_rc == _EXIT_HALT:
+            _log("  ⛔  scan.py exited with HALT code — a leg placement failed.")
+            _log("  ⛔  Daemon stopping. Review outputs/bet_log.jsonl, then restart manually.")
+            if settings:
+                _send_alert(
+                    "⛔ watch_bet DAEMON STOPPED — FAILED LEG",
+                    "scan.py exited with halt code 2. "
+                    "Check outputs/bet_log.jsonl for the unhedged position.",
+                    settings,
+                )
             break
 
-        print(f"\n  [watch_bet] No bet placed. Next scan in {args.interval}s  "
-              f"(~{_now()} + {args.interval // 60}m)  —  Ctrl-C to stop.")
+        # ── 5. Handle crash / timeout ─────────────────────────────────────
+        if scan_timeout or scan_rc != 0:
+            crash_count += 1
+            backoff = _backoff_secs(crash_count)
+            reason = f"timeout after {args.scan_timeout}s" if scan_timeout else f"exit code {scan_rc}"
+            _log(f"  ⚠  scan.py failed ({reason}) — crash #{crash_count}, backing off {backoff}s")
+
+            if crash_count > args.max_restarts:
+                pause = args.pause_on_max_restarts
+                _log(f"  ⛔  Circuit breaker: {crash_count} consecutive crashes — pausing {pause}s")
+                if settings:
+                    _send_alert(
+                        f"⛔ watch_bet circuit breaker: {crash_count} crashes",
+                        f"scan.py has crashed {crash_count} times in a row ({reason}). "
+                        f"Pausing {pause}s before resuming.",
+                        settings,
+                    )
+                try:
+                    time.sleep(pause)
+                except KeyboardInterrupt:
+                    _log("  Interrupted during pause.")
+                    break
+                crash_count = 0
+                last_ids_refresh = None  # force IDs re-fetch after long pause
+            else:
+                try:
+                    time.sleep(backoff)
+                except KeyboardInterrupt:
+                    _log("  Interrupted.")
+                    break
+            continue
+
+        # ── 6. Success — sleep until next scan ────────────────────────────
+        crash_count = 0
+        _log(f"  ✓  Scan #{scan_count} complete. Next scan in {args.interval}s.")
         try:
             time.sleep(args.interval)
         except KeyboardInterrupt:
-            print("\n  [watch_bet] Interrupted.")
+            _log("  Interrupted.")
             break
+
+    _log(_SEP)
+    _log("  watch_bet daemon stopped.")
+    _log(_SEP)
 
 
 if __name__ == "__main__":
