@@ -734,6 +734,9 @@ def main() -> None:
 
             # ── Auto-bet ──────────────────────────────────────────────────
             if args.auto_bet:
+                if _exec._HALT:
+                    print("  ⛔  AUTO-BET HALTED after a leg failure — restart process to resume.")
+                    continue
                 mode = "DRY RUN" if args.bet_dry_run else "LIVE"
                 print(f"  AUTO-BET [{mode}]  budget: ${args.budget:.2f} USDC per arb")
 

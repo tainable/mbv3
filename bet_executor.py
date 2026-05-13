@@ -54,6 +54,12 @@ _SUPPORTED = {"polymarket", "matchbook", "sx_bet"}
 # Legs are placed in this order and aborted on first failure to avoid uncovered positions.
 _PLATFORM_ORDER = ["matchbook", "sx_bet", "polymarket"]
 
+# Set to True when a leg fails after a prior leg succeeded.
+# Persists until process restart — requires human review before resuming.
+_HALT: bool = False
+
+_BET_LOG = _ROOT / "outputs" / "bet_log.jsonl"
+
 
 def _platform_rank(label: str) -> int:
     for i, p in enumerate(_PLATFORM_ORDER):
@@ -220,6 +226,106 @@ def _resolve_mb_runner(
             return int(market["id"]), int(runner["id"]), best_back
 
     return 0, 0, None
+
+
+# ---------------------------------------------------------------------------
+# Failed-leg handling: log, cancel, alert, halt
+# ---------------------------------------------------------------------------
+
+def _log_arb_failure(
+    arb_type: str,
+    arb: dict,
+    game: dict,
+    placed: list[dict],
+    failed: dict,
+) -> None:
+    from datetime import datetime, timezone
+    entry = {
+        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "status": "FAILED_LEG",
+        "arb_type": arb_type,
+        "game": f"{game.get('team1')} vs {game.get('team2')}",
+        "league": game.get("league"),
+        "profit_pct": arb.get("profit_pct"),
+        "placed_legs": [r.get("_leg") for r in placed if r.get("ok")],
+        "failed_leg": failed.get("_leg", failed.get("platform", "unknown")),
+        "failed_error": failed.get("error", "unknown"),
+    }
+    _BET_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with _BET_LOG.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(entry) + "\n")
+
+
+def _cancel_placed_legs(placed: list[dict], settings, dry_run: bool) -> list[str]:
+    """
+    Attempt to cancel every successfully placed leg where possible.
+    Matchbook LIMIT offers can be cancelled by offer_id.
+    SX Bet taker orders and Polymarket FOK orders execute immediately — nothing to cancel.
+    """
+    from bet import mb_cancel_offer
+    outcomes: list[str] = []
+    for r in placed:
+        if not r.get("ok"):
+            continue
+        leg = r.get("_leg", r.get("platform", ""))
+
+        if "matchbook" in leg.lower():
+            offer_id = r.get("offer_id")
+            if not offer_id:
+                outcomes.append("Matchbook — no offer_id in result, cannot cancel")
+            elif dry_run:
+                outcomes.append(f"Matchbook offer {offer_id} — dry run, not cancelled")
+            else:
+                try:
+                    mb_cancel_offer(settings, int(offer_id))
+                    outcomes.append(f"Matchbook offer {offer_id} — cancel requested")
+                except Exception as exc:
+                    outcomes.append(f"Matchbook offer {offer_id} — cancel FAILED: {exc}")
+
+        elif "sx_bet" in leg.lower():
+            outcomes.append("SX Bet taker order — already executed, cannot cancel")
+
+        elif "polymarket" in leg.lower():
+            outcomes.append("Polymarket FOK order — already executed, cannot cancel")
+
+    return outcomes
+
+
+def _on_leg_failure(
+    arb_type: str,
+    arb: dict,
+    game: dict,
+    placed: list[dict],
+    failed: dict,
+    settings,
+    dry_run: bool,
+) -> None:
+    """Log, attempt cancellation of placed legs, send alert, and set the halt flag."""
+    global _HALT
+
+    _log_arb_failure(arb_type, arb, game, placed, failed)
+    cancel_results = _cancel_placed_legs(placed, settings, dry_run)
+
+    from matched_betting import notifier
+    placed_labels = [r.get("_leg", "?") for r in placed if r.get("ok")]
+    cancel_str = "\n".join(f"  {c}" for c in cancel_results) if cancel_results else "  Nothing to cancel"
+    profit = arb.get("profit_pct")
+    profit_str = f"{profit:.2f}%" if profit is not None else "?"
+    body = (
+        f"Game:       {game.get('team1')} vs {game.get('team2')} ({game.get('league', '?')})\n"
+        f"Arb type:   {arb_type}  ({profit_str} net)\n"
+        f"Failed leg: {failed.get('_leg', failed.get('platform', '?'))}\n"
+        f"Error:      {failed.get('error', '?')}\n"
+        f"Placed ({len(placed_labels)}): {', '.join(placed_labels) or 'none'}\n"
+        f"Cancels:\n{cancel_str}"
+    )
+    notifier.send_alert("⛔ FAILED LEG — AUTO-BET HALTED", body, settings)
+
+    _HALT = True
+    print(
+        "\n  ⛔  FAILED LEG — auto-bet HALTED. Restart the process after reviewing bet_log.jsonl.",
+        file=sys.stderr,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +606,9 @@ def place_sure_bet(
         r["_leg"] = label
         results.append(r)
         if not r.get("ok"):
+            placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
+            if placed:
+                _on_leg_failure("sure_bet", arb, game, placed, r, settings, dry_run)
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
     return results
@@ -716,6 +825,9 @@ def place_back_lay_arb(
         r["_leg"] = label
         results.append(r)
         if not r.get("ok"):
+            placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
+            if placed:
+                _on_leg_failure("back_lay", arb, game, placed, r, settings, dry_run)
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
     return results

@@ -73,6 +73,8 @@ class Settings:
     azuro: AzuroSettings
     commission: CommissionSettings
     vpn_proxy_url: str | None = None  # e.g. "socks5h://10.64.0.1:1080" (in-tunnel) or "socks5h://nl-ams-wg-socks5-001.relays.mullvad.net:1080" (multihop)
+    alert_webhook_url: str | None = None
+    alert_enabled: bool = True
 
 
 def load_settings(project_root: Path) -> Settings:
@@ -120,6 +122,8 @@ def load_settings(project_root: Path) -> Settings:
             ),
         ),
         vpn_proxy_url=os.getenv("VPN_PROXY_URL") or None,
+        alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
+        alert_enabled=os.getenv("ALERT_ENABLED", "true").lower() in ("true", "1", "yes"),
         commission=CommissionSettings(
             matchbook=float(os.getenv("MATCHBOOK_COMMISSION", "0.02")),
             smarkets=0.0 if smarkets_zero else float(os.getenv("SMARKETS_COMMISSION", "0.02")),
