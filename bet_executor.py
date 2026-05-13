@@ -47,7 +47,7 @@ _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT / "src"))
 
 from matched_betting.http import HttpClient
-from matched_betting import calculator
+from matched_betting import calculator, kelly
 
 _SUPPORTED = {"polymarket", "matchbook", "sx_bet"}
 
@@ -329,6 +329,146 @@ def _on_leg_failure(
 
 
 # ---------------------------------------------------------------------------
+# Kelly bet sizing
+# ---------------------------------------------------------------------------
+
+def _fetch_all_balances(settings) -> dict[str, float | None]:
+    """Fetch PM, SX Bet, and Matchbook balances concurrently."""
+    from bet import pm_get_balance, mb_get_balance, sx_get_balance
+    _getters = {
+        "polymarket": pm_get_balance,
+        "sx_bet":     sx_get_balance,
+        "matchbook":  mb_get_balance,
+    }
+    result: dict[str, float | None] = {k: None for k in _getters}
+    with ThreadPoolExecutor(max_workers=3) as ex:
+        futs = {ex.submit(fn, settings): name for name, fn in _getters.items()}
+        for f in as_completed(futs):
+            name = futs[f]
+            try:
+                result[name] = f.result()
+            except Exception:
+                result[name] = None
+    return result
+
+
+def _provider_max_budgets(
+    arb: dict,
+    arb_type: str,
+    balances: dict[str, float | None],
+    gbp_rate: float | None,
+) -> list[float]:
+    """
+    For each provider leg, compute the maximum total USDC budget that provider
+    can support given its current balance.
+
+    Matchbook balance (GBP) is converted to USD via gbp_rate.
+    Polymarket lay outlay accounts for the NO-token cost formula.
+    """
+    rate = gbp_rate or 0.79
+    mb_gbp = balances.get("matchbook")
+    balances_usd: dict[str, float | None] = {
+        "polymarket": balances.get("polymarket"),
+        "sx_bet":     balances.get("sx_bet"),
+        "matchbook":  mb_gbp / rate if mb_gbp is not None else None,
+    }
+
+    # Compute each provider's USDC fraction of a unit budget
+    if arb_type == "sure_bet":
+        usdc_fractions: dict[str, float] = {}
+        for _slot, provider, _name, _odds, fraction in _sure_bet_stakes(arb, 1.0):
+            usdc_fractions[provider] = usdc_fractions.get(provider, 0.0) + fraction
+    else:
+        back_frac, lay_frac = _back_lay_stakes(arb, 1.0)
+        back_prov = arb["back_provider"]
+        lay_prov  = arb["lay_provider"]
+        usdc_fractions = {back_prov: back_frac}
+        if lay_prov == "polymarket":
+            _pm_f = calculator._polymarket_fee_rate(arb["lay_odds"])
+            pm_frac = lay_frac * (arb["lay_odds"] - 1) * (1 + _pm_f)
+            usdc_fractions[lay_prov] = usdc_fractions.get(lay_prov, 0.0) + pm_frac
+        else:
+            usdc_fractions[lay_prov] = usdc_fractions.get(lay_prov, 0.0) + lay_frac
+
+    max_budgets: list[float] = []
+    for provider, frac in usdc_fractions.items():
+        if frac <= 0:
+            continue
+        bal = balances_usd.get(provider)
+        if bal is None or bal <= 0:
+            continue
+        max_budgets.append(bal / frac)
+    return max_budgets
+
+
+def _compute_kelly_budget(
+    arb: dict,
+    arb_type: str,
+    settings,
+    gbp_rate: float | None,
+    max_budget_usdc: float,
+) -> float:
+    """
+    Compute the Kelly-sized stake for this arb.
+
+    Steps:
+      1. Fetch all platform balances
+      2. Compute bankroll = min(pm, sx, mb_usd) × 3
+      3. Apply profit-scaled fraction → kelly_stake
+      4. Constrain by per-provider balance limits
+      5. Enforce max_stake_usdc and min_stake_usdc caps
+      6. Return 0.0 if stake falls below minimum (caller should skip the arb)
+
+    Returns max_budget_usdc unchanged when Kelly is disabled or balances unavailable.
+    """
+    ks = getattr(settings, "kelly", None)
+    if ks is None or not ks.enabled:
+        return max_budget_usdc
+
+    balances = _fetch_all_balances(settings)
+    bankroll = kelly.compute_bankroll(
+        balances.get("polymarket"),
+        balances.get("sx_bet"),
+        balances.get("matchbook"),
+        gbp_rate,
+    )
+
+    if bankroll is None:
+        print(
+            "  ⚠  Kelly: could not fetch all balances — using --budget as stake.",
+            file=sys.stderr,
+        )
+        return max_budget_usdc
+
+    frac = kelly.kelly_fraction(
+        arb.get("profit_pct", 0.0),
+        ks.low_profit, ks.high_profit, ks.low_fraction, ks.high_fraction,
+    )
+    stake = frac * bankroll
+
+    # Constrain by what each provider can actually cover
+    provider_maxes = _provider_max_budgets(arb, arb_type, balances, gbp_rate)
+    if provider_maxes:
+        stake = min(stake, min(provider_maxes))
+
+    final = min(stake, ks.max_stake_usdc, max_budget_usdc)
+
+    if final < ks.min_stake_usdc:
+        print(
+            f"  ⚠  Kelly stake ${final:.2f} below minimum ${ks.min_stake_usdc:.2f} — skipping arb.",
+            file=sys.stderr,
+        )
+        return 0.0
+
+    profit_pct = arb.get("profit_pct", 0.0)
+    print(
+        f"  Kelly: bankroll=${bankroll:.0f}  edge={profit_pct:.2f}%  "
+        f"fraction={frac:.1%}  stake=${final:.2f}"
+    )
+    return final
+
+
+# ---------------------------------------------------------------------------
 # Stake calculators
 # ---------------------------------------------------------------------------
 
@@ -522,6 +662,10 @@ def place_sure_bet(
     """
     from bet import pm_place_bet, mb_place_bet, sx_place_bet  # lazy import
 
+    budget_usdc = _compute_kelly_budget(arb, "sure_bet", settings, gbp_rate, budget_usdc)
+    if budget_usdc == 0.0:
+        return [{"ok": False, "skipped": True, "error": "Kelly stake below minimum — arb skipped"}]
+
     legs = _sure_bet_stakes(arb, budget_usdc)
     providers = [prov for _, prov, *_ in legs]
     bad = _unsupported_providers(providers)
@@ -648,6 +792,10 @@ def place_back_lay_arb(
     if bad:
         return [{"ok": False, "skipped": True,
                  "error": f"Auto-bet skipped: provider(s) {bad} not supported."}]
+
+    budget_usdc = _compute_kelly_budget(arb, "back_lay", settings, gbp_rate, budget_usdc)
+    if budget_usdc == 0.0:
+        return [{"ok": False, "skipped": True, "error": "Kelly stake below minimum — arb skipped"}]
 
     back_stake, lay_stake = _back_lay_stakes(arb, budget_usdc)
 

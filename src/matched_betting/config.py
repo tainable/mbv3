@@ -55,6 +55,17 @@ class AzuroSettings:
 
 
 @dataclass(frozen=True)
+class KellySettings:
+    enabled: bool
+    low_profit: float
+    high_profit: float
+    low_fraction: float
+    high_fraction: float
+    max_stake_usdc: float
+    min_stake_usdc: float
+
+
+@dataclass(frozen=True)
 class CommissionSettings:
     matchbook: float
     smarkets: float
@@ -75,6 +86,7 @@ class Settings:
     vpn_proxy_url: str | None = None  # e.g. "socks5h://10.64.0.1:1080" (in-tunnel) or "socks5h://nl-ams-wg-socks5-001.relays.mullvad.net:1080" (multihop)
     alert_webhook_url: str | None = None
     alert_enabled: bool = True
+    kelly: KellySettings = None  # type: ignore[assignment]  populated by load_settings
 
 
 def load_settings(project_root: Path) -> Settings:
@@ -124,6 +136,15 @@ def load_settings(project_root: Path) -> Settings:
         vpn_proxy_url=os.getenv("VPN_PROXY_URL") or None,
         alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,
         alert_enabled=os.getenv("ALERT_ENABLED", "true").lower() in ("true", "1", "yes"),
+        kelly=KellySettings(
+            enabled=os.getenv("KELLY_ENABLED", "true").lower() in ("true", "1", "yes"),
+            low_profit=float(os.getenv("KELLY_LOW_PROFIT", "0.2")),
+            high_profit=float(os.getenv("KELLY_HIGH_PROFIT", "1.5")),
+            low_fraction=float(os.getenv("KELLY_LOW_FRACTION", "0.10")),
+            high_fraction=float(os.getenv("KELLY_HIGH_FRACTION", "0.25")),
+            max_stake_usdc=float(os.getenv("MAX_STAKE_USDC", "200")),
+            min_stake_usdc=float(os.getenv("MIN_STAKE_USDC", "5")),
+        ),
         commission=CommissionSettings(
             matchbook=float(os.getenv("MATCHBOOK_COMMISSION", "0.02")),
             smarkets=0.0 if smarkets_zero else float(os.getenv("SMARKETS_COMMISSION", "0.02")),

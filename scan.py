@@ -776,9 +776,13 @@ def main() -> None:
                             providers_in_arb.add(best_arb["draw_back_provider"])
                         print(f"    Placing sure-bet ({best_pct:.2f}% net)  "
                               f"legs: {' | '.join(providers_in_arb)}")
-                        bal_issues, bal_warns = _exec.check_balances_for_arb(
-                            "sure_bet", best_arb, args.budget, settings, gbp_rate,
-                        )
+                        kelly_on = getattr(settings, "kelly", None) and settings.kelly.enabled
+                        if kelly_on:
+                            bal_issues, bal_warns = [], []
+                        else:
+                            bal_issues, bal_warns = _exec.check_balances_for_arb(
+                                "sure_bet", best_arb, args.budget, settings, gbp_rate,
+                            )
                         for w in bal_warns:
                             print(f"    ⚠  Balance: {w}")
                         if bal_issues:
@@ -801,9 +805,13 @@ def main() -> None:
                                 lay_note = "  ⚠ SX Bet lay = back-opposite only (draw not covered)"
                         print(f"    Placing back-lay ({best_pct:.2f}% net)  "
                               f"back: {best_arb['back_provider']} / lay: {best_arb['lay_provider']}{lay_note}")
-                        bal_issues, bal_warns = _exec.check_balances_for_arb(
-                            "back_lay", best_arb, args.budget, settings, gbp_rate,
-                        )
+                        kelly_on = getattr(settings, "kelly", None) and settings.kelly.enabled
+                        if kelly_on:
+                            bal_issues, bal_warns = [], []
+                        else:
+                            bal_issues, bal_warns = _exec.check_balances_for_arb(
+                                "back_lay", best_arb, args.budget, settings, gbp_rate,
+                            )
                         for w in bal_warns:
                             print(f"    ⚠  Balance: {w}")
                         if bal_issues:
