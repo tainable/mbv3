@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import random
 import sys
 import time
 from typing import Any
 
 import requests
+from requests.exceptions import ConnectionError as _ConnError
 from requests.exceptions import HTTPError, Timeout
 
 
@@ -65,12 +67,13 @@ class HttpClient:
                 )
                 response.raise_for_status()
                 return response.json()
-            except Timeout:
+            except (Timeout, _ConnError) as exc:
                 if attempt < self.max_retries:
-                    delay = 2 ** (attempt + 1)
+                    delay = 2 ** (attempt + 1) + random.uniform(0, 0.5)
+                    kind = "timeout" if isinstance(exc, Timeout) else "connection error"
                     print(
-                        f"  [http] read timeout on {url} — "
-                        f"retrying in {delay}s (attempt {attempt + 1}/{self.max_retries})",
+                        f"  [http] {kind} on {url} — "
+                        f"retrying in {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})",
                         file=sys.stderr,
                     )
                     time.sleep(delay)
@@ -78,10 +81,10 @@ class HttpClient:
                 raise
             except HTTPError as exc:
                 if exc.response is not None and exc.response.status_code == 429 and attempt < self.max_retries:
-                    delay = 2 ** (attempt + 1)  # 2s, 4s, 8s
+                    delay = 2 ** (attempt + 1) + random.uniform(0, 0.5)
                     print(
                         f"  [http] 429 rate-limited by {url} — "
-                        f"sleeping {delay}s (attempt {attempt + 1}/{self.max_retries})",
+                        f"sleeping {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})",
                         file=sys.stderr,
                     )
                     time.sleep(delay)

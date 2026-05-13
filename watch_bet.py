@@ -140,8 +140,8 @@ def main() -> None:
     )
     parser.add_argument("--interval", type=int, default=300, metavar="SECS",
                         help="Seconds between scan.py runs (default: 300).")
-    parser.add_argument("--ids-refresh-interval", type=int, default=30, metavar="MINS",
-                        help="Minutes between ids.py re-runs (default: 30).")
+    parser.add_argument("--ids-refresh-interval", type=int, default=360, metavar="MINS",
+                        help="Minutes between ids.py re-runs (default: 360).")
     parser.add_argument("--scan-timeout", type=int, default=600, metavar="SECS",
                         help="Kill scan.py after this many seconds (default: 600).")
     parser.add_argument("--ids-timeout", type=int, default=300, metavar="SECS",

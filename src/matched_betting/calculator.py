@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.request import urlopen
@@ -22,18 +23,21 @@ if TYPE_CHECKING:
 # FX helper (USD → GBP for display purposes)
 # ---------------------------------------------------------------------------
 
-_usd_to_gbp_cache: float | None = None
+_usd_to_gbp_cache: tuple[float, float] | None = None  # (rate, monotonic_ts)
+_FX_TTL = 1800  # 30 minutes
 
 
 def _usd_to_gbp() -> float:
     global _usd_to_gbp_cache
     if _usd_to_gbp_cache is not None:
-        return _usd_to_gbp_cache
+        rate, fetched_at = _usd_to_gbp_cache
+        if time.monotonic() - fetched_at < _FX_TTL:
+            return rate
     try:
         with urlopen("https://open.er-api.com/v6/latest/GBP", timeout=5) as r:
             data = json.loads(r.read())
         rate = 1.0 / data["rates"]["USD"]
-        _usd_to_gbp_cache = rate
+        _usd_to_gbp_cache = (rate, time.monotonic())
         return rate
     except Exception as exc:
         print(
