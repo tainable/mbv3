@@ -60,7 +60,7 @@ except ImportError:
 import arb_finder as _arb
 import bet_executor as _exec
 
-DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl", "seria"]
+DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga"]
 DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro"]  # Smarkets excluded by default
 DEFAULT_IDS = Path("outputs/active_game_ids.json")
 
@@ -244,6 +244,22 @@ def _scan_game(
     canonical_assignment, canonical_events = match_records_to_canonical_events(records)
     games_payload = build_aggregated_games_payload(records, canonical_assignment, canonical_events)
 
+    # When SX Bet (or any provider) returns a full-league scan instead of a
+    # single game, multiple canonical events land in games_payload.  Narrow to
+    # the entry whose teams match the requested game so arb detection and the
+    # odds table show the right row.
+    if len(games_payload) > 1:
+        ctx_t1 = (game.get("team1") or "").lower()
+        ctx_t2 = (game.get("team2") or "").lower()
+        if ctx_t1 and ctx_t2:
+            matched = [
+                g for g in games_payload
+                if (g.get("team1") or "").lower() == ctx_t1
+                and (g.get("team2") or "").lower() == ctx_t2
+            ]
+            if matched:
+                games_payload = matched
+
     sure_bets = _arb.find_sure_bets(games_payload, min_profit_pct=min_profit_pct)
     back_lay_arbs = _arb.find_back_lay_arbs(games_payload, min_profit_pct=min_profit_pct)
 
@@ -294,7 +310,9 @@ def _print_odds_table(
     team2 = game.get("team2") or "Team2"
     league = (game.get("league") or "").upper()
     date_s = _fmt_date(game.get("date_time"))
-    print(f"  [{i}/{total}]  {team1} vs {team2}  [{league}]  {date_s}")
+    spread = games_payload[0].get("spread") if games_payload else game.get("spread")
+    spread_s = f" {spread:+.1f}" if spread is not None else ""
+    print(f"  [{i}/{total}]  {team1} vs {team2}  [{league}{spread_s}]  {date_s}")
 
     if not games_payload:
         print("    (no odds returned by any provider)")
@@ -501,7 +519,7 @@ def main() -> None:
         default=DEFAULT_LEAGUES,
         choices=DEFAULT_LEAGUES,
         metavar="LEAGUE",
-        help="Leagues to scan: nba mlb ucl epl uel nhl ipl (default: all).",
+        help="Leagues to scan: nba mlb mlb_spread ucl epl uel nhl ipl seria laliga (default: all).",
     )
     parser.add_argument(
         "--providers",
@@ -522,9 +540,16 @@ def main() -> None:
         "--no-skip-imminent",
         action="store_true",
         help=(
-            "Include games that kick off within 10 minutes or are already in-play. "
+            "Include games that kick off within --imminent-minutes or are already in-play. "
             "By default these are excluded to avoid placing bets on live/imminent markets."
         ),
+    )
+    parser.add_argument(
+        "--imminent-minutes",
+        type=int,
+        default=10,
+        metavar="MINUTES",
+        help="Games kicking off within this many minutes are treated as imminent and skipped (default: 10).",
     )
     parser.add_argument(
         "--show-odds",
@@ -592,7 +617,7 @@ def main() -> None:
     imminent_skipped = 0
     if not args.no_skip_imminent:
         now = datetime.now(timezone.utc)
-        cutoff = now + timedelta(minutes=10)
+        cutoff = now + timedelta(minutes=args.imminent_minutes)
         filtered = []
         for g in games:
             ko = _parse_kickoff(g.get("date_time"))
@@ -637,8 +662,8 @@ def main() -> None:
     print(f"  Leagues:    {',  '.join(args.leagues)}")
     print(f"  Providers:  {',  '.join(args.providers)}")
     imminent_note = (
-        f"  ({imminent_skipped} imminent/in-play skipped)" if imminent_skipped
-        else "  (--no-skip-imminent to include)" if not args.no_skip_imminent
+        f"  ({imminent_skipped} imminent/in-play skipped, cutoff={args.imminent_minutes}m)" if imminent_skipped
+        else f"  (--no-skip-imminent to include; cutoff={args.imminent_minutes}m)" if not args.no_skip_imminent
         else ""
     )
     print(f"  Games:      {len(games)}  (≥2 provider coverage){imminent_note}")
@@ -748,13 +773,22 @@ def main() -> None:
                             providers_in_arb.add(best_arb["draw_back_provider"])
                         print(f"    Placing sure-bet ({best_pct:.2f}% net)  "
                               f"legs: {' | '.join(providers_in_arb)}")
-                        results = _exec.place_sure_bet(
-                            best_arb, game, args.budget, settings, gbp_rate, args.bet_dry_run,
-                            sx_first=True,  # TODO: revert to parallel once SX Bet fill is verified
+                        bal_issues, bal_warns = _exec.check_balances_for_arb(
+                            "sure_bet", best_arb, args.budget, settings, gbp_rate,
                         )
-                        _exec.print_bet_results(results)
-                        if _exec.all_legs_placed(results):
-                            print("  [WATCH] ALL LEGS PLACED")
+                        for w in bal_warns:
+                            print(f"    ⚠  Balance: {w}")
+                        if bal_issues:
+                            for issue in bal_issues:
+                                print(f"    ✗  Balance: {issue}")
+                            print("    Arb skipped — insufficient funds to cover all legs.")
+                        else:
+                            results = _exec.place_sure_bet(
+                                best_arb, game, args.budget, settings, gbp_rate, args.bet_dry_run,
+                            )
+                            _exec.print_bet_results(results)
+                            if _exec.all_legs_placed(results):
+                                print("  [WATCH] ALL LEGS PLACED")
 
                     else:
                         lay_note = ""
@@ -764,13 +798,22 @@ def main() -> None:
                                 lay_note = "  ⚠ SX Bet lay = back-opposite only (draw not covered)"
                         print(f"    Placing back-lay ({best_pct:.2f}% net)  "
                               f"back: {best_arb['back_provider']} / lay: {best_arb['lay_provider']}{lay_note}")
-                        results = _exec.place_back_lay_arb(
-                            best_arb, game, args.budget, settings, gbp_rate, args.bet_dry_run,
-                            sx_first=True,  # TODO: revert to parallel once SX Bet fill is verified
+                        bal_issues, bal_warns = _exec.check_balances_for_arb(
+                            "back_lay", best_arb, args.budget, settings, gbp_rate,
                         )
-                        _exec.print_bet_results(results)
-                        if _exec.all_legs_placed(results):
-                            print("  [WATCH] ALL LEGS PLACED")
+                        for w in bal_warns:
+                            print(f"    ⚠  Balance: {w}")
+                        if bal_issues:
+                            for issue in bal_issues:
+                                print(f"    ✗  Balance: {issue}")
+                            print("    Arb skipped — insufficient funds to cover all legs.")
+                        else:
+                            results = _exec.place_back_lay_arb(
+                                best_arb, game, args.budget, settings, gbp_rate, args.bet_dry_run,
+                            )
+                            _exec.print_bet_results(results)
+                            if _exec.all_legs_placed(results):
+                                print("  [WATCH] ALL LEGS PLACED")
 
                 print()
 

@@ -28,6 +28,7 @@ class EventIdentity:
     order_known: bool
     start_time: datetime | None
     display_name: str
+    spread: float | None = None
 
 
 @dataclass
@@ -90,6 +91,27 @@ def match_records_to_canonical_events(
 
 def infer_event_identity(record: OddsRecord) -> EventIdentity:
     home_team, away_team, order_known = _parse_teams(record.event_name, record.league)
+    spread: float | None = None
+    raw_spread = (record.metadata or {}).get("spread")
+    if raw_spread is not None:
+        try:
+            spread = float(raw_spread)
+        except (TypeError, ValueError):
+            pass
+
+    # Normalise spread to the home-team's perspective.
+    # spread_favourite names the team at the negative end of the spread (the market favourite).
+    # Canonical convention: negative = home team must cover (home favoured),
+    #                       positive = away team must cover (home is the underdog).
+    if spread is not None and home_team and away_team:
+        spread_favourite_raw = (record.metadata or {}).get("spread_favourite")
+        if spread_favourite_raw:
+            favourite_norm = normalize_team_name(str(spread_favourite_raw), record.league)
+            if favourite_norm == home_team:
+                spread = -abs(spread)
+            elif favourite_norm == away_team:
+                spread = abs(spread)
+
     return EventIdentity(
         league=record.league,
         sport=record.sport,
@@ -98,6 +120,7 @@ def infer_event_identity(record: OddsRecord) -> EventIdentity:
         order_known=order_known,
         start_time=_parse_datetime(record.event_start),
         display_name=record.event_name,
+        spread=spread,
     )
 
 
@@ -156,6 +179,7 @@ class _MutableGroup:
         order_known: bool,
         start_time: datetime | None,
         display_name: str,
+        spread: float | None = None,
     ) -> None:
         self.canonical_event_id = canonical_event_id
         self.league = league
@@ -164,6 +188,7 @@ class _MutableGroup:
         self.away_team = away_team
         self.order_known = order_known
         self.start_time = start_time
+        self.spread = spread
         self.source_event_names: set[str] = {display_name}
         self.providers: set[str] = set()
         self.records: list[int] = []
@@ -179,10 +204,13 @@ class _MutableGroup:
             order_known=identity.order_known,
             start_time=identity.start_time,
             display_name=identity.display_name,
+            spread=identity.spread,
         )
 
     def matches(self, identity: EventIdentity, tolerance_minutes: int) -> bool:
         if self.league != identity.league:
+            return False
+        if self.spread is not None and identity.spread is not None and self.spread != identity.spread:
             return False
 
         if self.home_team and self.away_team and identity.home_team and identity.away_team:
@@ -205,10 +233,18 @@ class _MutableGroup:
         self.source_event_names.add(record.event_name)
         if self.start_time is None and identity.start_time is not None:
             self.start_time = identity.start_time
-        if (self.home_team is None or self.away_team is None) and identity.home_team and identity.away_team:
-            self.home_team = identity.home_team
-            self.away_team = identity.away_team
-            self.order_known = identity.order_known
+        if identity.home_team and identity.away_team:
+            if self.home_team is None or self.away_team is None:
+                self.home_team = identity.home_team
+                self.away_team = identity.away_team
+                self.order_known = identity.order_known
+            elif identity.order_known and not self.order_known:
+                # A record with a known ordering (e.g. "away at home") is more
+                # authoritative than an assumed one (e.g. "home vs away").
+                # Upgrade so aggregation uses the correct home/away slots.
+                self.home_team = identity.home_team
+                self.away_team = identity.away_team
+                self.order_known = True
 
     def to_public(self) -> CanonicalEventGroup:
         event_start = None
@@ -235,4 +271,5 @@ def _build_canonical_event_id(identity: EventIdentity) -> str:
         start_key = identity.start_time.strftime("%Y%m%dT%H%M")
     home = identity.home_team or "unknown-home"
     away = identity.away_team or "unknown-away"
-    return f"{identity.league}|{start_key}|{home}|{away}"
+    spread_key = f"|spread{identity.spread:+.1f}" if identity.spread is not None else ""
+    return f"{identity.league}|{start_key}|{home}|{away}{spread_key}"

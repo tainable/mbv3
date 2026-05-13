@@ -39,7 +39,7 @@ from matched_betting.providers.registry import build_provider_registry
 from matched_betting.aggregation import build_aggregated_games_payload
 from matched_betting import calculator
 
-DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl", "seria"]
+DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga"]
 DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro"]  # Smarkets excluded by default
 DEFAULT_OUT = Path("outputs/active_game_ids.json")
 
@@ -57,7 +57,7 @@ def main() -> None:
         default=DEFAULT_LEAGUES,
         choices=DEFAULT_LEAGUES,
         metavar="LEAGUE",
-        help="Leagues to include: nba mlb ucl epl uel nhl ipl (default: all).",
+        help="Leagues to include: nba mlb mlb_spread ucl epl uel nhl ipl seria laliga (default: all).",
     )
     parser.add_argument(
         "--providers",

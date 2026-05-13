@@ -405,6 +405,7 @@ TEAM_ALIASES = {
         "acf fiorentina": "fiorentina",
         # Sassuolo
         "us sassuolo calcio": "sassuolo",
+        "sassuolo calcio": "sassuolo",
         # Como
         "como 1907": "como",
         # Inter Milan
@@ -460,6 +461,38 @@ TEAM_ALIASES = {
         "indian premier league gujarat titans":               "gujarat titans",
     },
     "mlb": {
+        # 3-letter Polymarket slug codes (same mapping as mlb_spread)
+        "ari": "arizona diamondbacks",
+        "atl": "atlanta braves",
+        "bal": "baltimore orioles",
+        "bos": "boston red sox",
+        "chc": "chicago cubs",
+        "cws": "chicago white sox",
+        "cin": "cincinnati reds",
+        "cle": "cleveland guardians",
+        "col": "colorado rockies",
+        "det": "detroit tigers",
+        "hou": "houston astros",
+        "kc":  "kansas city royals",
+        "laa": "los angeles angels",
+        "lad": "los angeles dodgers",
+        "mia": "miami marlins",
+        "mil": "milwaukee brewers",
+        "min": "minnesota twins",
+        "nym": "new york mets",
+        "nyy": "new york yankees",
+        "oak": "oakland athletics",
+        "phi": "philadelphia phillies",
+        "pit": "pittsburgh pirates",
+        "sd":  "san diego padres",
+        "sf":  "san francisco giants",
+        "sea": "seattle mariners",
+        "stl": "st louis cardinals",
+        "tb":  "tampa bay rays",
+        "tex": "texas rangers",
+        "tor": "toronto blue jays",
+        "wsh": "washington nationals",
+        # Nicknames
         "d backs": "arizona diamondbacks",
         "diamondbacks": "arizona diamondbacks",
         "white sox": "chicago white sox",
@@ -492,6 +525,139 @@ TEAM_ALIASES = {
         "braves": "atlanta braves",
         "orioles": "baltimore orioles",
         "cardinals": "st louis cardinals",
+    },
+    "laliga": {
+        # Atletico Madrid — accent on 'e' strips to space in all three providers
+        "atl tico de madrid":      "atletico de madrid",   # Matchbook
+        "atletico madrid":         "atletico de madrid",   # SX Bet
+        "club atl tico de madrid": "atletico de madrid",   # Polymarket
+
+        # Athletic Club — Matchbook/SX Bet use city name, Polymarket uses official name
+        "athletic bilbao": "athletic club",
+
+        # Barcelona
+        "fc barcelona": "barcelona",
+
+        # Celta de Vigo
+        "rc celta de vigo": "celta de vigo",
+
+        # Deportivo Alavés — é strips to space
+        "deportivo alav s": "deportivo alaves",
+
+        # Elche
+        "elche cf": "elche",
+
+        # Espanyol
+        "rcd espanyol de barcelona": "espanyol",
+
+        # Getafe
+        "getafe cf": "getafe",
+
+        # Girona
+        "girona fc": "girona",
+
+        # Levante
+        "levante ud": "levante",
+
+        # Mallorca
+        "rcd mallorca": "real mallorca",
+
+        # Osasuna
+        "ca osasuna": "osasuna",
+
+        # Rayo Vallecano
+        "rayo vallecano de madrid": "rayo vallecano",
+
+        # Real Betis — Balompié: 'é' strips to space then trailing space trimmed
+        "real betis balompi":  "real betis",
+        "real betis balompie": "real betis",    # fallback if é encodes as e
+
+        # Real Madrid
+        "real madrid cf": "real madrid",
+
+        # Real Sociedad — Fútbol: ú strips to space
+        "real sociedad de f tbol": "real sociedad",
+
+        # Sevilla
+        "sevilla fc": "sevilla",
+
+        # Valencia
+        "valencia cf": "valencia",
+
+        # Villarreal
+        "villarreal cf": "villarreal",
+    },
+    # mlb_spread uses the same full canonical team names as mlb moneyline.
+    # Maps 3-letter Polymarket slug codes and common nicknames → full names so
+    # that normalize_team_name() produces identical tokens regardless of whether
+    # the input came from a Polymarket slug code ("bos"), a full outcome name
+    # ("Boston Red Sox"), or a nickname ("red sox").
+    # Full names already normalise to themselves (lowercase), so no alias needed.
+    "mlb_spread": {
+        # 3-letter slug codes → full names
+        "ari": "arizona diamondbacks",
+        "atl": "atlanta braves",
+        "bal": "baltimore orioles",
+        "bos": "boston red sox",
+        "chc": "chicago cubs",
+        "cws": "chicago white sox",
+        "cin": "cincinnati reds",
+        "cle": "cleveland guardians",
+        "col": "colorado rockies",
+        "det": "detroit tigers",
+        "hou": "houston astros",
+        "kc":  "kansas city royals",
+        "laa": "los angeles angels",
+        "lad": "los angeles dodgers",
+        "mia": "miami marlins",
+        "mil": "milwaukee brewers",
+        "min": "minnesota twins",
+        "nym": "new york mets",
+        "nyy": "new york yankees",
+        "oak": "oakland athletics",
+        "phi": "philadelphia phillies",
+        "pit": "pittsburgh pirates",
+        "sd":  "san diego padres",
+        "sf":  "san francisco giants",
+        "sea": "seattle mariners",
+        "stl": "st louis cardinals",
+        "tb":  "tampa bay rays",
+        "tex": "texas rangers",
+        "tor": "toronto blue jays",
+        "wsh": "washington nationals",
+        # Nicknames (same as mlb)
+        "d backs":    "arizona diamondbacks",
+        "diamondbacks": "arizona diamondbacks",
+        "braves":     "atlanta braves",
+        "orioles":    "baltimore orioles",
+        "red sox":    "boston red sox",
+        "cubs":       "chicago cubs",
+        "white sox":  "chicago white sox",
+        "reds":       "cincinnati reds",
+        "guardians":  "cleveland guardians",
+        "rockies":    "colorado rockies",
+        "tigers":     "detroit tigers",
+        "astros":     "houston astros",
+        "royals":     "kansas city royals",
+        "angels":     "los angeles angels",
+        "dodgers":    "los angeles dodgers",
+        "marlins":    "miami marlins",
+        "brewers":    "milwaukee brewers",
+        "twins":      "minnesota twins",
+        "mets":       "new york mets",
+        "yankees":    "new york yankees",
+        "athletics":  "oakland athletics",
+        "a s":        "oakland athletics",  # "a's" → apostrophe stripped → "a s"
+        "phillies":   "philadelphia phillies",
+        "pirates":    "pittsburgh pirates",
+        "padres":     "san diego padres",
+        "giants":     "san francisco giants",
+        "mariners":   "seattle mariners",
+        "cardinals":  "st louis cardinals",
+        "rays":       "tampa bay rays",
+        "rangers":    "texas rangers",
+        "blue jays":  "toronto blue jays",
+        "nationals":  "washington nationals",
     },
 }
 

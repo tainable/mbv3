@@ -25,8 +25,8 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
-ALL_LEAGUES = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
+DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl"]
+ALL_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"]
 
 
@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     league_shortcuts = parser.add_mutually_exclusive_group()
     league_shortcuts.add_argument("--nba", action="store_true", help="Shortcut for --leagues nba")
     league_shortcuts.add_argument("--mlb", action="store_true", help="Shortcut for --leagues mlb")
+    league_shortcuts.add_argument("--mlb-spread", action="store_true", dest="mlb_spread", help="Shortcut for --leagues mlb_spread")
     league_shortcuts.add_argument("--ucl", action="store_true", help="Shortcut for --leagues ucl")
     league_shortcuts.add_argument("--epl", action="store_true", help="Shortcut for --leagues epl")
     league_shortcuts.add_argument("--ipl", action="store_true", help="Shortcut for --leagues ipl")
@@ -667,7 +668,7 @@ def _game_index_key(game: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
-_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "ucl", "epl", "uel", "nhl", "ipl"]
+_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl"]
 
 
 def _merge_market_index_additive(
@@ -818,6 +819,7 @@ def _build_market_index(aggregated_games: list[dict[str, Any]]) -> dict[str, Any
             "team1": game.get("team1"),
             "team2": game.get("team2"),
             "date_time": game.get("date_time"),
+            "spread": game.get("spread"),
         }
         for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS):
             entry[field] = game.get(field) or None
@@ -842,6 +844,8 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
         return ["nba"]
     if args.mlb:
         return ["mlb"]
+    if args.mlb_spread:
+        return ["mlb_spread"]
     if args.ucl:
         return ["ucl"]
     if args.epl:

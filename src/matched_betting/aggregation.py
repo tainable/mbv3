@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from matched_betting.models import OddsRecord
+from matched_betting.normalization import normalize_team_name
 
 
 # Fields stored in the market/IDs index for targeted re-fetching.
@@ -98,6 +99,30 @@ def build_aggregated_games_payload(
         else:
             market_type = next(iter(market_types), None)
 
+        spread: float | None = None
+        spread_favourite: str | None = None
+        for i in indices:
+            meta = records[i].metadata or {}
+            if spread is None:
+                s = meta.get("spread")
+                if s is not None:
+                    try:
+                        spread = float(s)
+                    except (TypeError, ValueError):
+                        pass
+            if spread_favourite is None:
+                spread_favourite = meta.get("spread_favourite") or None
+
+        # Normalise spread to home-team perspective.
+        # Canonical convention: negative = home team must cover, positive = home is underdog.
+        # Use abs() so the result is sign-correct regardless of each provider's raw convention.
+        if spread is not None and spread_favourite is not None:
+            favourite_norm = normalize_team_name(str(spread_favourite), event_group.league)
+            if event_group.home_team and favourite_norm == event_group.home_team:
+                spread = -abs(spread)
+            elif event_group.away_team and favourite_norm == event_group.away_team:
+                spread = abs(spread)
+
         entry: dict[str, Any] = {
             "team1": team1,
             "team2": team2,
@@ -105,6 +130,8 @@ def build_aggregated_games_payload(
             "league": event_group.league,
             "sport": event_group.sport,
             "market_type": market_type,
+            "spread": spread,
+            "spread_favourite": spread_favourite,
             "polymarket_market_id": None,
             "smarkets_market_id": None,
             "matchbook_event_id": None,
@@ -218,7 +245,7 @@ def build_aggregated_games_payload(
                     break
 
         # Soccer: per-outcome SX Bet market hashes for targeted re-fetching
-        if entry.get("league") in ("ucl", "epl", "uel", "seria"):
+        if entry.get("league") in ("ucl", "epl", "uel", "seria", "laliga"):
             for team_slot in ("team1", "draw", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get(("sx_bet", team_slot, side))

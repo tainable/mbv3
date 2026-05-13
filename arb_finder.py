@@ -172,8 +172,10 @@ def _print_sure_bets(
             gbp_part = f" / £{gbp:.2f}" if gbp is not None else ""
             return f"  stake: ${s:.2f}{gbp_part}"
 
+        spread = arb.get("spread")
+        spread_s = f" {spread:+.1f}" if spread is not None else ""
         lines = [
-            f"  [{arb['league'].upper()}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
+            f"  [{arb['league'].upper()}{spread_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
             f"    Back {arb['team1']:<30} {arb['team1_back_odds']:.4f}  ({arb['team1_back_provider']}){_avail(arb.get('team1_back_avail'), arb['team1_back_provider'])}{_stake_str(arb['team1'], arb['team1_back_provider'])}",
         ]
         if arb["market_type"] == "three_way":
@@ -216,8 +218,10 @@ def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: f
             else ""
         )
         az_line = _azuro_back_lay_cap_line(arb, game, gbp_rate)
+        spread = arb.get("spread")
+        spread_s = f" {spread:+.1f}" if spread is not None else ""
         lines = [
-            f"  [{arb['league'].upper()}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
+            f"  [{arb['league'].upper()}{spread_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
             f"    Back {arb['arb_outcome']:<30} {arb['back_odds']:.4f}  ({arb['back_provider']}){_avail(arb.get('back_avail'), arb['back_provider'])}",
             f"    Lay  {arb['arb_outcome']:<30} {arb['lay_odds']:.4f}  ({arb['lay_provider']}){_avail(arb.get('lay_avail'), arb['lay_provider'])}",
             f"    Net profit: {arb['profit_pct']:.4f}%{gross_str}",

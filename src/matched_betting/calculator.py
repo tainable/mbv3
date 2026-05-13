@@ -146,8 +146,10 @@ def _eff_back_odds(odds: float, provider: str) -> float:
 def _eff_lay_odds(odds: float, provider: str) -> float:
     """Effective lay cost after provider commission (higher = worse for the arb)."""
     if provider == "polymarket":
+        # Polymarket fee is charged on stake (order size), not on net winnings.
+        # Correct break-even: eff_lay = L / (1 - (L-1)*f), not the Matchbook formula.
         fee = _polymarket_fee_rate(odds)
-        return 1.0 + (odds - 1.0) / (1.0 - fee)
+        return odds / (1.0 - (odds - 1.0) * fee)
     c = PROVIDER_COMMISSION.get(provider, 0.0)
     if c == 0.0:
         return odds
@@ -264,6 +266,7 @@ def find_sure_bets(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]
             "date_time": game.get("date_time"),
             "team1": game.get("team1"),
             "team2": game.get("team2"),
+            "spread": game.get("spread"),
             "team1_back_odds": team1_odds,
             "team1_back_provider": team1_provider,
             "team1_back_avail": game.get(f"{team1_provider}_team1_back_avail"),
@@ -314,6 +317,7 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
                 "date_time": game.get("date_time"),
                 "team1": game.get("team1"),
                 "team2": game.get("team2"),
+                "spread": game.get("spread"),
                 "outcome_slot": slot,
                 "arb_outcome": _outcome_label(game, slot),
                 "back_odds": back_odds,

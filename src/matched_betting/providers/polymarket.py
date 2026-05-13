@@ -15,16 +15,18 @@ from matched_betting.providers.base import GameContext, OddsProvider
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
+    "mlb_spread": "baseball",
     "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
     "seria": "soccer",
+    "laliga": "soccer",
     "ipl": "cricket",
 }
 
 # Leagues that use Yes/No binary markets per outcome (soccer-style)
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga"})
 
 
 class PolymarketProvider(OddsProvider):
@@ -95,6 +97,17 @@ class PolymarketProvider(OddsProvider):
                             league = 'mlb'
                             candidate_markets.append((market, league))
 
+            _mlb_run_line_keywords = {"spread"}
+            if "mlb_spread" in leagues and split_slug[0] == "mlb":
+                if any(seg in _mlb_run_line_keywords for seg in split_slug):
+                    if split_slug[1] in ['cws','mil','wsh','chc','min','bal',
+                    'cin','bos','laa','hou','det','sd','tex','phi',
+                    'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
+                        if split_slug[2] in ['cws','mil','wsh','chc','min','bal',
+                    'cin','bos','laa','hou','det','sd','tex','phi',
+                    'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
+                            candidate_markets.append((market, 'mlb_spread'))
+
             _nhl_non_moneyline = {"spread", "total", "over", "under", "puck-line", "puckline"}
             if "nhl" in leagues and "nhl" in split_slug[0]:
                 if not any(seg in _nhl_non_moneyline for seg in split_slug):
@@ -137,12 +150,19 @@ class PolymarketProvider(OddsProvider):
                         if split_slug[-1] in seria_teams or split_slug[-1] == "draw":
                             candidate_markets.append((market, "seria"))
 
+            laliga_teams = team_index.get("laliga", [])
+            if "laliga" in leagues and laliga_teams:
+                # Match head-to-head La Liga slugs: lal-{team1}-{team2}-{date}-{team_or_draw}
+                if split_slug[0] == "lal" and len(split_slug) >= 3:
+                    if split_slug[1] in laliga_teams and split_slug[2] in laliga_teams:
+                        if split_slug[-1] in laliga_teams or split_slug[-1] == "draw":
+                            candidate_markets.append((market, "laliga"))
+
             _cricket_non_moneyline = {"innings", "runs", "wickets", "fours", "sixes", "total", "over", "under"}
             if "ipl" in leagues and split_slug[0] == "cricipl":
                 if not any(seg in _cricket_non_moneyline for seg in split_slug):
                     ipl_slugs = team_index.get("ipl", [])
                     # Slug format: cricipl-{team1}-{team2} or cricipl-{team1}-{team2}-{date}
-                    # TODO: verify exact Polymarket team slug codes for IPL
                     if len(split_slug) >= 3 and split_slug[1] in ipl_slugs and split_slug[2] in ipl_slugs:
                         pair = frozenset({split_slug[1], split_slug[2]})
                         if pair not in _seen_ipl_pairs:
@@ -152,20 +172,24 @@ class PolymarketProvider(OddsProvider):
         
         self.debug(f"{self.name}: found {len(candidate_markets)} candidate markets after league filtering")
 
+        if "mlb_spread" in leagues:
+            spread_slugs = [m.get("slug", "?") for m, lg in candidate_markets if lg == "mlb_spread"]
+            print(f"  [polymarket] mlb_spread filter: {len(spread_slugs)} markets selected")
+            for slug in spread_slugs:
+                print(f"    {slug}")
+
         for market_index, (market, league) in enumerate(candidate_markets, start=1):
             self.debug(
                 f"{self.name}: market {market_index}/{len(candidate_markets)} id={market.get('id', 'unknown')} league={league}"
             )
             #print(market['question'])
             try:
-                market_records = self._market_to_records(market, league, retrieved_at)
+                market_records, market_warnings = self._market_to_records(market, league, retrieved_at)
                 records.extend(market_records)
+                warnings.extend(market_warnings)
                 self.debug(
                     f"{self.name}: {league} market {market.get('id', 'unknown')} -> {len(market_records)} records"
-                
                 )
-                #print(market_records)
-                
             except Exception as exc:
                 market_id = str(market.get("id", "unknown"))
                 slug = str(market.get("slug", "unknown"))
@@ -478,7 +502,7 @@ class PolymarketProvider(OddsProvider):
                 'okc','bos','mia','cle','sas','mem','was','uta',
                 'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']
 
-            elif league == "mlb":
+            elif league in ("mlb", "mlb_spread"):
                 index[league] = ['cws','mil','wsh','chc','min','bal',
                 'cin','bos','laa','hou','det','sd','tex','phi',
                 'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']
@@ -522,6 +546,12 @@ class PolymarketProvider(OddsProvider):
                     'ata', 'cre', 'tor', 'ver', 'mil',
                     'gen', 'pis', 'juv', 'bol', 'lec',
                     'fio', 'int', 'cag', 'com', 'sas',
+                ]
+            elif league == "laliga":
+                index[league] = [
+                    'ray','rso','mad','bil','ovi','elc','osa','sev',
+                    'vil','cel','esp','lev','gir','mal','val','ala',
+                    'bar','rea','bet','get'
                 ]
 
             elif league == "ipl":
@@ -611,11 +641,25 @@ class PolymarketProvider(OddsProvider):
         market: dict[str, Any],
         league: str,
         retrieved_at: str,
-    ) -> list[OddsRecord]:
+    ) -> tuple[list[OddsRecord], list[str]]:
         outcomes = _parse_stringified_json_list(market.get("outcomes"))
         clob_token_ids = _parse_stringified_json_list(market.get("clobTokenIds"))
 
+        method_warnings: list[str] = []
+        _spread_value: float | None = None
+        _spread_favourite: str | None = None
+        if league == "mlb_spread":
+            _spread_value, _spread_found = _extract_spread(market)
+            _spread_favourite = _extract_spread_favourite(market)
+            if not _spread_found:
+                slug = market.get("slug", "unknown")
+                market_id = market.get("id", "unknown")
+                method_warnings.append(
+                    f"mlb_spread market {market_id} ({slug}): spread not found in market data, defaulted to -1.5"
+                )
+
         lay_probs: list[float | None] = []
+        token_liq_usd: list[float | None] = []  # per-token liquidity; empty = use market aggregate
 
         if len(outcomes) == 3:
             # Three-way market: use outcomePrices for all three outcomes
@@ -642,6 +686,18 @@ class PolymarketProvider(OddsProvider):
                 (1.0 - best_bid) if best_bid is not None else None,
             ]
             lay_probs = [None, None]
+
+            # Fetch per-token ask-side depth from CLOB so each outcome gets its own
+            # liquidity figure. Gamma's liquidityNum is an aggregate and identical for
+            # both outcomes, which hides the real per-side imbalance.
+            token_liq_usd = [None, None]
+            for _i, _token in enumerate(clob_token_ids[:2]):
+                if _token:
+                    try:
+                        _, _, _ask_size = self._fetch_clob_book(_token)
+                        token_liq_usd[_i] = _ask_size * 2  # matches CLOB-path convention
+                    except Exception:
+                        pass
         else:
             raise ValueError(f"unexpected outcome count: {len(outcomes)}")
 
@@ -686,24 +742,38 @@ class PolymarketProvider(OddsProvider):
                     or f"{outcomes[0]} vs {outcomes[-1]}"
                 )
         else:
-            title = event.get("title") or ""
-            _separators = (" vs ", " vs. ", " v ", " at ", " @ ")
-            if any(sep in title.lower() for sep in _separators):
-                event_name = title
-            elif len(outcomes) == 2:
-                # Build a parseable "X vs Y" from normalized outcomes so canonical
-                # matching works even when the event title is absent or unparseable.
-                t0 = normalize_team_name(str(outcomes[0]), league)
-                t1 = normalize_team_name(str(outcomes[1]), league)
-                event_name = f"{t0} vs {t1}"
-            else:
-                event_name = (
-                    market.get("groupItemTitle")
-                    or market.get("question")
-                    or "Unknown event"
-                )
+            # For US sports, Polymarket slugs follow "{sport}-{away_slug}-{home_slug}[-extra]"
+            # (away team first). Build "away at home" so _parse_teams assigns home correctly,
+            # matching the ordering used by SX Bet (which lists home first as teamOneName).
+            # Only use slug ordering when normalization resolves the codes to full names —
+            # if the code isn't in the alias table it returns unchanged, signalling a miss.
+            _SLUG_ORDERED_LEAGUES = frozenset({"mlb", "mlb_spread", "nba", "nhl"})
+            slug = market.get("slug", "")
+            slug_parts = slug.split("-")
+            event_name_set = False
+            if league in _SLUG_ORDERED_LEAGUES and len(slug_parts) >= 3:
+                away_from_slug = normalize_team_name(slug_parts[1], league)
+                home_from_slug = normalize_team_name(slug_parts[2], league)
+                if away_from_slug != slug_parts[1] and home_from_slug != slug_parts[2]:
+                    event_name = f"{away_from_slug} at {home_from_slug}"
+                    event_name_set = True
+            if not event_name_set:
+                title = event.get("title") or ""
+                _separators = (" vs ", " vs. ", " v ", " at ", " @ ")
+                if any(sep in title.lower() for sep in _separators):
+                    event_name = title
+                elif len(outcomes) == 2:
+                    t0 = normalize_team_name(str(outcomes[0]), league)
+                    t1 = normalize_team_name(str(outcomes[1]), league)
+                    event_name = f"{t0} vs {t1}"
+                else:
+                    event_name = (
+                        market.get("groupItemTitle")
+                        or market.get("question")
+                        or "Unknown event"
+                    )
 
-        if league in ("mlb", "nhl", "ucl", "epl", "uel", "ipl"):
+        if league in ("mlb", "mlb_spread", "nhl", "ucl", "epl", "uel", "ipl"):
             event_start = event.get("startTime")
         else:
             event_start = event.get("endDate")
@@ -712,13 +782,19 @@ class PolymarketProvider(OddsProvider):
             # For soccer, market_name should describe the game so each record is self-describing
             # alongside selection_name (which identifies the specific team/draw outcome)
             market_name = event_name
+        elif league == "mlb_spread":
+            market_name = "Run Line"
         else:
             market_name = market.get("groupItemTitle") or market.get("question") or "Unknown market"
 
         # For single-outcome Yes/No remapped markets, infer_market_type would return "multi_way"
         # (only 1 outcome left). UCL markets are three-way (home/draw/away); all other
         # single-outcome remapped markets fall back to two_way for the moneyline filter.
-        if len(outcomes) == 1:
+        if league == "mlb_spread":
+            # Run-line is always a two-outcome market; _infer_market_type would return
+            # "handicap" from the slug keyword, which the moneyline filter would drop.
+            market_type = "two_way"
+        elif len(outcomes) == 1:
             market_type = "three_way" if league in _SOCCER_LEAGUES else "two_way"
         else:
             market_type = self._infer_market_type(
@@ -746,6 +822,8 @@ class PolymarketProvider(OddsProvider):
                 "market_type_raw": market.get("marketType"),
                 "sports_market_type_raw": market.get("sportsMarketType"),
                 "liquidity_usd": market.get("liquidityNum"),
+                "spread": _spread_value if league == "mlb_spread" else None,
+                "spread_favourite": _spread_favourite if league == "mlb_spread" else None,
             },
         )
 
@@ -762,7 +840,9 @@ class PolymarketProvider(OddsProvider):
                 iprob = None
 
             clob_token = clob_token_ids[i] if i < len(clob_token_ids) else None
-            record_kw = {**shared, "metadata": {**shared["metadata"], "clob_token_id": clob_token}}
+            per_token_liq = token_liq_usd[i] if i < len(token_liq_usd) else None
+            record_liq = per_token_liq if per_token_liq is not None else shared["metadata"]["liquidity_usd"]
+            record_kw = {**shared, "metadata": {**shared["metadata"], "clob_token_id": clob_token, "liquidity_usd": record_liq}}
 
             records.append(
                 OddsRecord(
@@ -789,7 +869,7 @@ class PolymarketProvider(OddsProvider):
                         implied_probability=round(explicit_lay, 6),
                     )
                 )
-        return records
+        return records, method_warnings
 
     @staticmethod
     def _infer_market_type(
@@ -808,6 +888,42 @@ class PolymarketProvider(OddsProvider):
         if len(outcomes) == 3:
             return "three_way"
         return "multi_way"
+
+
+def _extract_spread_favourite(market: dict) -> str | None:
+    """Return the team name at the spread value in a run-line market, or None.
+
+    Polymarket formats the question as 'Spread: {Team Name} ({value})', where the
+    named team is always the one at the spread (e.g. -1.5).  Falls back to checking
+    outcomes for embedded spread markers (e.g. 'NYY -1.5').
+    """
+    import re as _re
+
+    # Primary: "Spread: Boston Red Sox (-1.5)" → "Boston Red Sox"
+    question = str(market.get("question") or "")
+    m = _re.match(r"^Spread:\s*(.+?)\s*\(", question)
+    if m:
+        return m.group(1).strip()
+
+    # Fallback: outcome strings that embed the spread, e.g. ["NYY -1.5", "BOS +1.5"]
+    outcomes = _parse_stringified_json_list(market.get("outcomes"))
+    for outcome in outcomes:
+        out_str = str(outcome)
+        if _re.search(r"[-−]\d+\.5", out_str):
+            return _re.sub(r"\s*[-−]\d+\.5.*$", "", out_str).strip() or None
+
+    return None
+
+
+def _extract_spread(market: dict) -> tuple[float, bool]:
+    """Return (spread, found). found=False means no explicit line was detected and -1.5 is the default."""
+    import re as _re
+    for field in ("question", "slug", "groupItemTitle"):
+        text = str(market.get(field) or "")
+        m = _re.search(r"([+-]?\d+\.5)", text)
+        if m:
+            return float(m.group(1)), True
+    return -1.5, False
 
 
 def _yes_outcome_index(outcomes: list[str], group_item_title: str | None, league: str) -> int:
