@@ -1,0 +1,26 @@
+# Secrets
+.env
+
+# Runtime outputs
+outputs/
+vpn_bridge.log
+vpn_setup_log.txt
+vpn_test.txt
+10.64.0.1
+scan_stdout.txt
+scan_stderr.txt
+scan_test_stderr.txt
+watch_bet_output.txt
+watch_bet_stderr.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+.idea/
