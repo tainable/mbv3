@@ -1,8 +1,8 @@
 # matched_betting
 
-Odds ingestion and arbitrage detection system for matched betting on NBA, MLB, UCL, and EPL games.
+Odds ingestion and arbitrage detection system for matched betting on NBA, MLB, MLB spread, UCL, EPL, UEL, NHL, IPL, Serie A, and La Liga games.
 
-Fetches live odds from Matchbook, Smarkets, Polymarket, and SX Bet, normalises them into a unified schema, matches records for the same game across providers, and scans for sure bets and back-lay arbs (after commission).
+Fetches live odds from Matchbook, Smarkets, Polymarket, SX Bet, and Azuro, normalises them into a unified schema, matches records for the same game across providers, and scans for sure bets and back-lay arbs (after commission).
 
 The system runs as a two-stage pipeline:
 
@@ -12,11 +12,12 @@ The system runs as a two-stage pipeline:
 ## Project layout
 
 ```
-mbv1/
+mbv2-Default/
 ├── ids.py                          # Stage 1: discover active games → outputs/active_game_ids.json
 ├── scan.py                         # Stage 2: live scan, per-game parallel fetch + arb detection
 ├── arb_finder.py                   # Standalone arb finder (reads a pre-built aggregated games JSON)
 ├── run.py                          # Legacy launcher (full fetch → JSON outputs)
+├── portfolio.py                    # Wallet balance and active bet monitor
 ├── find_smarkets_event_ids.py      # Dev utility: discover Smarkets competition IDs
 ├── find_sx_bet_league_ids.py       # Dev utility: discover SX Bet league IDs
 ├── src/matched_betting/
@@ -24,6 +25,9 @@ mbv1/
 │   ├── cli.py                      # Argument parsing and orchestration (used by run.py)
 │   ├── config.py                   # Settings and CommissionSettings loaded from .env
 │   ├── calculator.py               # Pure arb maths: commission helpers, find_sure_bets, find_back_lay_arbs
+│   ├── kelly.py                    # Profit-scaled bet sizing (Kelly-inspired bankroll fraction)
+│   ├── notifier.py                 # Webhook alert delivery (ntfy.sh, Telegram, Discord, Slack, generic)
+│   ├── rebalancer.py               # Post-bet balance monitor: alerts when USDC drops below threshold
 │   ├── aggregation.py              # Builds per-game aggregated odds payload from OddsRecord objects
 │   ├── http.py                     # HTTP client with retry logic
 │   ├── models.py                   # OddsRecord and ProviderPayload dataclasses
@@ -36,8 +40,9 @@ mbv1/
 │       ├── registry.py             # Provider factory
 │       ├── matchbook.py            # Matchbook authenticated API adapter
 │       ├── smarkets.py             # Smarkets authenticated API adapter
-│       ├── polymarket.py           # Polymarket public API adapter
-│       └── sx_bet.py               # SX Bet public API adapter (P2P, no credentials required)
+│       ├── polymarket.py           # Polymarket public API adapter (CLOB v2)
+│       ├── sx_bet.py               # SX Bet public API adapter (P2P, no credentials required)
+│       └── azuro.py                # Azuro decentralised protocol adapter (Polygon subgraph)
 └── tests/
     ├── test_event_matching.py
     ├── test_game_filtering.py
@@ -80,9 +85,11 @@ SMARKETS_PASSWORD=
 SMARKETS_API_TOKEN=
 SMARKETS_BASE_URL=https://api.smarkets.com
 
-# Polymarket (public, no credentials required)
+# Polymarket (public, no credentials required for read; private key required for betting)
 POLYMARKET_GAMMA_BASE_URL=https://gamma-api.polymarket.com
 POLYMARKET_CLOB_BASE_URL=https://clob.polymarket.com
+POLYMARKET_PRIVATE_KEY=        # EVM private key for signing CLOB orders
+POLYGON_RPC_URL=               # Polygon JSON-RPC endpoint (for on-chain reads)
 
 # SX Bet (public, no credentials required)
 SX_BET_BASE_URL=https://api.sx.bet
@@ -91,8 +98,15 @@ SX_BET_BASE_TOKEN=0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B
 # Leave blank to use the default: https://explorerl2.sx.technology/api
 SX_EXPLORER_URL=
 
+# Azuro (public, no credentials required)
+AZURO_SUBGRAPH_URL=https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon
+
 # VPN proxy (optional — see VPN routing section below)
 VPN_PROXY_URL=
+
+# Alerts — set ALERT_WEBHOOK_URL to enable push notifications
+ALERT_WEBHOOK_URL=             # ntfy.sh, Telegram, Discord, Slack, or generic webhook
+ALERT_ENABLED=true
 
 # Commission rates
 # Set SMARKETS_ZERO_COMMISSION=false once the 60-day intro period ends
@@ -100,6 +114,20 @@ SMARKETS_ZERO_COMMISSION=true
 MATCHBOOK_COMMISSION=0.02
 SMARKETS_COMMISSION=0.02
 SX_BET_COMMISSION=0.00
+
+# Kelly bet sizing (used with --auto-bet when KELLY_ENABLED=true)
+KELLY_ENABLED=true
+KELLY_LOW_PROFIT=0.2           # % profit that maps to KELLY_LOW_FRACTION of bankroll
+KELLY_HIGH_PROFIT=1.5          # % profit that maps to KELLY_HIGH_FRACTION of bankroll
+KELLY_LOW_FRACTION=0.10
+KELLY_HIGH_FRACTION=0.25
+MAX_STAKE_USDC=200             # hard cap per arb regardless of Kelly output
+MIN_STAKE_USDC=5               # skip arbs that would size below this
+MIN_BANKROLL_USDC=20           # minimum computed bankroll before Kelly kicks in
+
+# Rebalancer — alerts when a platform USDC balance falls below MIN_BALANCE_USDC
+REBALANCER_ENABLED=true
+MIN_BALANCE_USDC=10
 ```
 
 Providers without credentials will be skipped with a warning rather than crashing.
@@ -138,14 +166,16 @@ Leave `VPN_PROXY_URL` blank to disable proxying entirely.
 python ids.py
 ```
 
-This fetches all markets from the configured providers in parallel, matches them to canonical games, and writes `outputs/active_game_ids.json`. By default Smarkets is excluded.
+This fetches all markets from the configured providers in parallel, matches them to canonical games, and writes `outputs/active_game_ids.json`. By default Smarkets and Azuro are excluded.
 
 ```bash
 python ids.py --leagues nba epl            # specific leagues only
-python ids.py --providers matchbook polymarket sx_bet smarkets
+python ids.py --providers matchbook polymarket sx_bet smarkets azuro
 python ids.py --out outputs/my_ids.json
 python ids.py --debug
 ```
+
+Supported leagues: `nba`, `mlb`, `mlb_spread`, `ucl`, `epl`, `uel`, `nhl`, `ipl`, `seria`, `laliga`.
 
 ### Stage 2 — scan live odds
 
@@ -158,7 +188,7 @@ Reads the IDs JSON, iterates games one at a time. For each game, all providers a
 ```bash
 python scan.py --ids outputs/active_game_ids.json
 python scan.py --leagues nba epl
-python scan.py --providers matchbook polymarket sx_bet
+python scan.py --providers matchbook polymarket sx_bet azuro
 python scan.py --min-profit 0.5            # only show arbs ≥ 0.5% profit
 python scan.py --show-odds                 # print back/lay odds table per game
 python scan.py --azuro-cap                 # show max profit constrained by Azuro pool size
@@ -168,14 +198,18 @@ python scan.py --debug
 
 ### Auto-betting
 
-Pass `--auto-bet` to automatically place every arb found. Requires `--budget` (stake per arb in USDC). Supported providers: Matchbook, Polymarket, SX Bet.
+Pass `--auto-bet` to automatically place every arb found. Requires `--budget` (maximum stake per arb in USDC). Supported providers: Matchbook, Polymarket, SX Bet.
 
 ```bash
 python scan.py --auto-bet --budget 50
 python scan.py --auto-bet --budget 50 --bet-dry-run   # build and sign orders but do not submit
 ```
 
+When `KELLY_ENABLED=true` (the default), the actual stake is determined by a profit-scaled Kelly fraction of the current bankroll rather than `--budget` directly. `--budget` acts as a hard cap. Kelly sizing is skipped if any platform balance is unavailable or the computed bankroll falls below `MIN_BANKROLL_USDC`.
+
 When both a sure bet and a back-lay arb are found on the same game, `--auto-bet` places only the **single highest-profit arb** across both lists. Lower-profit arbs for the same game are skipped and a count is printed.
+
+After each successful bet, the rebalancer checks USDC balances on Polymarket (Polygon) and SX Bet (SX Network). If either drops below `MIN_BALANCE_USDC`, an alert is sent via the configured webhook.
 
 ### Portfolio monitor
 
@@ -244,6 +278,20 @@ SMARKETS_ZERO_COMMISSION=false
 | Smarkets | 0% (zero-commission period) or 2% standard |
 | SX Bet | 0% |
 | Polymarket | Dynamic: `0.0075 × 4 × p × (1 − p)` on stake |
+| Azuro | 0% |
+
+## Kelly bet sizing
+
+When `KELLY_ENABLED=true`, `--auto-bet` sizes each stake as a clamped linear function of the arb's net profit percentage, applied to the current bankroll:
+
+```
+bankroll = min(pm_balance_usd, sx_balance_usd, mb_balance_usd) × 3
+fraction = linear interpolation between (KELLY_LOW_PROFIT, KELLY_LOW_FRACTION)
+                                      and (KELLY_HIGH_PROFIT, KELLY_HIGH_FRACTION)
+stake    = bankroll × fraction  (clamped to [MIN_STAKE_USDC, MAX_STAKE_USDC])
+```
+
+The ×3 factor reflects having three platforms; using the minimum balance ensures sizing is limited by whichever platform is most depleted. If any balance is unavailable, Kelly is skipped and `--budget` is used as the fixed stake.
 
 ## Output
 
@@ -275,6 +323,7 @@ Each game entry in the IDs file (and in the legacy `*_aggregated_games.json`) lo
   "matchbook_event_id": "456",
   "smarkets_market_id": "789",
   "sx_bet_market_hash": "0xabc",
+  "azuro_condition_id": "0xdef",
   "polymarket_team1_back_odds": 2.14,
   "polymarket_team1_lay_odds": null,
   "polymarket_team2_back_odds": 1.74,
@@ -290,7 +339,11 @@ Each game entry in the IDs file (and in the legacy `*_aggregated_games.json`) lo
   "sx_bet_team1_back_odds": 2.08,
   "sx_bet_team1_lay_odds": null,
   "sx_bet_team2_back_odds": 1.82,
-  "sx_bet_team2_lay_odds": null
+  "sx_bet_team2_lay_odds": null,
+  "azuro_team1_back_odds": 2.05,
+  "azuro_team1_lay_odds": null,
+  "azuro_team2_back_odds": 1.85,
+  "azuro_team2_lay_odds": null
 }
 ```
 
@@ -307,7 +360,8 @@ ids.py
     ├── ThreadPoolExecutor                      # parallel provider fetches
     │     ├── MatchbookProvider.fetch_odds
     │     ├── PolymarketProvider.fetch_odds
-    │     └── SxBetProvider.fetch_odds
+    │     ├── SxBetProvider.fetch_odds
+    │     └── AzuroProvider.fetch_odds
     ├── is_game_win_loss_record filter          # market_matching.py
     ├── match_records_to_canonical_events       # event_matching.py
     ├── build_aggregated_games_payload          # aggregation.py
@@ -321,18 +375,20 @@ scan.py
           ├── ThreadPoolExecutor               # all providers in parallel for this game
           │     ├── MatchbookProvider.fetch_odds_by_ids
           │     ├── PolymarketProvider.fetch_odds_by_ids
-          │     └── SxBetProvider.fetch_odds_by_ids
+          │     ├── SxBetProvider.fetch_odds_by_ids
+          │     └── AzuroProvider.fetch_odds_by_ids
           ├── match_records_to_canonical_events
           ├── build_aggregated_games_payload
           ├── calculator.find_sure_bets
-          └── calculator.find_back_lay_arbs    # print arbs immediately
+          ├── calculator.find_back_lay_arbs    # print arbs immediately
+          └── (if --auto-bet) kelly sizing → place bets → rebalancer check
 ```
 
 ### Step-by-step data flow
 
 **1. Configuration** (`config.py`)
 
-`load_settings()` reads a `.env` file from the project root and populates frozen `Settings` dataclasses including `CommissionSettings`. Missing credentials cause a provider to raise `ProviderNotReadyError` at fetch time, caught and reported as a warning.
+`load_settings()` reads a `.env` file from the project root and populates frozen `Settings` dataclasses including `CommissionSettings`, `KellySettings`, and `RebalancerSettings`. Missing credentials cause a provider to raise `ProviderNotReadyError` at fetch time, caught and reported as a warning.
 
 **2. Provider fetching** (`providers/`)
 
@@ -343,6 +399,8 @@ Each provider implements `OddsProvider` (`base.py`) with two methods:
 
 All providers for a given stage are queried concurrently via `ThreadPoolExecutor`. Each returns a `ProviderPayload` containing a flat list of `OddsRecord` objects.
 
+Azuro is a decentralised protocol queried via a GraphQL subgraph on Polygon. It provides back odds only (no lay side); `--azuro-cap` constrains displayed profit by the pool's maximum stake per outcome.
+
 **3. Data model** (`models.py`)
 
 Every record shares the same frozen `OddsRecord` dataclass: provider, sport, league, event/market identity, selection name/side, decimal odds, implied probability, and a `metadata` dict for provider-specific raw fields.
@@ -351,8 +409,9 @@ Every record shares the same frozen `OddsRecord` dataclass: provider, sport, lea
 
 - **Matchbook**: prices already decimal; lay depth in `metadata`.
 - **Smarkets**: integer prices (`0`–`10000`) → divide by 10000 → invert to decimal.
-- **Polymarket**: token IDs resolved from Gamma API; best ask/bid from CLOB order book; prices converted `1 / p`.
+- **Polymarket**: token IDs resolved from Gamma API; best ask/bid from CLOB v2 order book; prices converted `1 / p`.
 - **SX Bet**: odds as scaled integers (`maker_probability × 10²⁰`); taker decimal = `1 / (1 − maker_probability)`.
+- **Azuro**: `currentOdds` from the Polygon subgraph is already a decimal string; used directly.
 
 **5. Team name normalisation** (`normalization.py`)
 
@@ -389,7 +448,7 @@ Example — Matchbook back odds 3.00, c = 0.02:
 
 The lay formula is the inverse: commission makes laying more expensive, so effective lay odds are higher than quoted.
 
-**SX Bet — zero commission**
+**SX Bet and Azuro — zero commission**
 
 ```
 eff_back = odds
@@ -456,3 +515,5 @@ python find_sx_bet_league_ids.py --search "premier"
 - **Investigate liquidity numbers** — verify that `*_back_avail` / `*_lay_avail` figures (Matchbook order depth, Smarkets contract liquidity, SX Bet taker-available, Polymarket CLOB size) are computed and converted to GBP consistently.
 
 - **Investigate SX Bet further** — `type == 1` for soccer markets has not been validated against live EPL/UCL data. The back/lay probability derivation from P2P maker orders needs end-to-end verification once live soccer markets are available.
+
+- **Azuro NHL/MLB slugs** — league slugs for NHL and MLB on the Polygon subgraph are unverified; those leagues may return 0 records gracefully until confirmed live.
