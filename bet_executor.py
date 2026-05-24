@@ -73,6 +73,9 @@ _MB_MONEYLINE = {
     "winner (incl. overtime)", "winner (including overtime)",
 }
 
+# Matchbook handicap / spread market names (MLB run-line, MLS goal-line).
+_MB_HANDICAP = {"run line", "runline", "run-line", "handicap"}
+
 
 # ---------------------------------------------------------------------------
 # Name matching (same logic as arb_finder._names_match)
@@ -221,6 +224,106 @@ def _resolve_mb_runner(
         for runner in market.get("runners", []):
             if not _names_match(str(runner.get("name") or ""), outcome_name):
                 continue
+            prices = runner.get("prices", [])
+            best_back = None
+            for p in prices:
+                if str(p.get("side") or "").lower() == "back":
+                    odds = float(p.get("decimal-odds") or p.get("odds") or 0)
+                    if odds and (best_back is None or odds > best_back):
+                        best_back = odds
+            return int(market["id"]), int(runner["id"]), best_back
+
+    return 0, 0, None
+
+
+import re as _re
+_MB_HANDICAP_SUFFIX_RE = _re.compile(r"\s*\(?[+-]?\d+(?:\.\d+)?\)?\s*$")
+
+
+def _strip_mb_handicap_suffix(name: str) -> str:
+    """Remove a trailing handicap value from a Matchbook runner name.
+
+    Matchbook sometimes appends the handicap in parentheses, e.g.
+    'Inter Miami CF (-1.5)' → 'Inter Miami CF'.
+    """
+    return _MB_HANDICAP_SUFFIX_RE.sub("", name).strip()
+
+
+def _resolve_mb_spread_runner(
+    game: dict, outcome_name: str, settings
+) -> tuple[int, int, float | None]:
+    """
+    Matchbook runner resolution for spread (handicap) markets.
+
+    Searches markets whose name is in _MB_HANDICAP (e.g. 'Handicap',
+    'Run Line') and selects the market whose handicap magnitude matches
+    abs(game['spread']).  Runner names are compared after stripping any
+    trailing handicap suffix.
+
+    Returns (market_id, runner_id, best_back_odds) or (0, 0, None).
+    """
+    event_id = game.get("matchbook_event_id")
+    if not event_id:
+        return 0, 0, None
+
+    # The canonical spread is stored as a signed value (negative = home fav).
+    raw_spread = game.get("spread")
+    abs_target: float | None = None
+    if raw_spread is not None:
+        try:
+            abs_target = abs(float(raw_spread))
+        except (TypeError, ValueError):
+            pass
+
+    http = HttpClient()
+    mb   = settings.matchbook
+
+    token_resp = http.post_json(
+        f"{mb.base_url}/bpapi/rest/security/session",
+        payload={"username": mb.username, "password": mb.password},
+        headers={"Accept": "application/json"},
+    )
+    token = token_resp.get("session-token")
+    if not token:
+        raise RuntimeError(f"Matchbook login failed: {token_resp}")
+
+    event = http.get_json(
+        f"{mb.base_url}/edge/rest/events/{event_id}",
+        headers={"session-token": token, "Accept": "application/json"},
+    )
+
+    for market in event.get("markets", []):
+        if market.get("status") != "open":
+            continue
+        if str(market.get("name") or "").lower().strip() not in _MB_HANDICAP:
+            continue
+
+        # If we know the target spread magnitude, skip markets that don't match.
+        if abs_target is not None:
+            # Each runner in the market carries a 'handicap' field.  We accept the
+            # market if ANY runner's handicap magnitude is within 0.01 of the target.
+            runner_hcaps = [
+                abs(float(r.get("handicap")))
+                for r in market.get("runners", [])
+                if r.get("handicap") is not None
+            ]
+            if runner_hcaps and not any(abs(h - abs_target) < 0.01 for h in runner_hcaps):
+                continue
+
+        for runner in market.get("runners", []):
+            # Strip any handicap suffix from the runner name before matching.
+            bare_name = _strip_mb_handicap_suffix(str(runner.get("name") or ""))
+            if not _names_match(bare_name, outcome_name):
+                continue
+
+            # Additional guard: confirm this runner's handicap matches the target.
+            if abs_target is not None and runner.get("handicap") is not None:
+                try:
+                    if abs(abs(float(runner["handicap"])) - abs_target) >= 0.01:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
             prices = runner.get("prices", [])
             best_back = None
             for p in prices:
@@ -1027,8 +1130,10 @@ def place_sure_bet(
 
         elif provider == "matchbook":
             mb_stake = round(stake_usdc * gbp_rate, 2) if gbp_rate else stake_usdc
+            _is_spread_league = game.get("league") in ("mlb_spread", "mls_spread")
+            _mb_resolver = _resolve_mb_spread_runner if _is_spread_league else _resolve_mb_runner
             try:
-                market_id, runner_id, _ = _resolve_mb_runner(game, outcome_name, settings)
+                market_id, runner_id, _ = _mb_resolver(game, outcome_name, settings)
             except Exception as exc:
                 pre_errors.append({
                     "platform": "Matchbook", "ok": False,
@@ -1036,9 +1141,10 @@ def place_sure_bet(
                 })
                 continue
             if not market_id:
+                _market_type = "handicap" if _is_spread_league else "moneyline"
                 pre_errors.append({
                     "platform": "Matchbook", "ok": False,
-                    "error": f"No moneyline runner found for '{outcome_name}'",
+                    "error": f"No {_market_type} runner found for '{outcome_name}'",
                 })
                 continue
             tasks.append((label, mb_place_bet, {
@@ -1212,8 +1318,10 @@ def place_back_lay_arb(
 
     elif back_prov == "matchbook":
         mb_stake = round(back_stake * gbp_rate, 2) if gbp_rate else back_stake
+        _is_spread_back = game.get("league") in ("mlb_spread", "mls_spread")
+        _mb_back_resolver = _resolve_mb_spread_runner if _is_spread_back else _resolve_mb_runner
         try:
-            market_id, runner_id, _ = _resolve_mb_runner(game, outcome_name, settings)
+            market_id, runner_id, _ = _mb_back_resolver(game, outcome_name, settings)
         except Exception as exc:
             pre_errors.append({"platform": "Matchbook back", "ok": False, "error": str(exc)})
             market_id = 0
@@ -1232,8 +1340,10 @@ def place_back_lay_arb(
     # ── Lay leg ───────────────────────────────────────────────────────────
     if lay_prov == "matchbook":
         mb_lay_stake = round(lay_stake * gbp_rate, 2) if gbp_rate else lay_stake
+        _is_spread_lay = game.get("league") in ("mlb_spread", "mls_spread")
+        _mb_lay_resolver = _resolve_mb_spread_runner if _is_spread_lay else _resolve_mb_runner
         try:
-            market_id, runner_id, _ = _resolve_mb_runner(game, outcome_name, settings)
+            market_id, runner_id, _ = _mb_lay_resolver(game, outcome_name, settings)
         except Exception as exc:
             pre_errors.append({"platform": "Matchbook lay", "ok": False, "error": str(exc)})
             market_id = 0

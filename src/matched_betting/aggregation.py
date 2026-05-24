@@ -332,6 +332,12 @@ def build_aggregated_games_payload(
                         if key[0] == provider_name:
                             _, record = best_sp[key]
                             sp_entry[id_field] = getattr(record, id_attr)
+                            # SX Bet: capture which team is outcomeOne so
+                            # _sx_outcome_for() bets on the correct side.
+                            if provider_name == "sx_bet":
+                                outcome_one = (record.metadata or {}).get("outcome_one_team")
+                                if outcome_one:
+                                    sp_entry["sx_bet_outcome_one_team"] = outcome_one
                             break
 
                 payload.append(sp_entry)
