@@ -728,12 +728,14 @@ TEAM_ALIASES = {
     # Keys must be in already-normalized form (lowercase, non-alphanumeric → space,
     # no double spaces) because normalize_team_name() normalizes before alias lookup.
     # Canonical form is the full club name (as used by SX Bet teamOneName / teamTwoName).
-    # No Polymarket short codes needed — Polymarket has no active MLS markets.
+    # Polymarket uses full team names in spread/totals outcomes and gi fields.
     "mls": {
         # Atlanta United
         "atlanta united fc": "atlanta united",
         # Chicago Fire
         "chicago fire fc": "chicago fire",
+        # Colorado Rapids — Polymarket appends "SC"
+        "colorado rapids sc": "colorado rapids",
         # Philadelphia Union — SX Bet appends " FC", Matchbook does not
         "philadelphia union fc": "philadelphia union",
         # CF Montréal — accent stripped → "montr al"
@@ -741,8 +743,9 @@ TEAM_ALIASES = {
         "club de foot montr al": "cf montreal",
         # Columbus Crew
         "columbus crew sc": "columbus crew",
-        # D.C. United — dots stripped → "d c united"
+        # D.C. United — dots stripped → "d c united"; Polymarket appends "SC"
         "d c united": "dc united",
+        "d c united sc": "dc united",
         "washington dc united": "dc united",
         # Houston Dynamo
         "houston dynamo fc": "houston dynamo",
@@ -774,11 +777,13 @@ TEAM_ALIASES = {
     "mls_spread": {
         "atlanta united fc": "atlanta united",
         "chicago fire fc": "chicago fire",
+        "colorado rapids sc": "colorado rapids",
         "philadelphia union fc": "philadelphia union",
         "cf montr al": "cf montreal",
         "club de foot montr al": "cf montreal",
         "columbus crew sc": "columbus crew",
         "d c united": "dc united",
+        "d c united sc": "dc united",
         "washington dc united": "dc united",
         "houston dynamo fc": "houston dynamo",
         "inter miami cf": "inter miami",
@@ -797,11 +802,13 @@ TEAM_ALIASES = {
     "mls_totals": {
         "atlanta united fc": "atlanta united",
         "chicago fire fc": "chicago fire",
+        "colorado rapids sc": "colorado rapids",
         "philadelphia union fc": "philadelphia union",
         "cf montr al": "cf montreal",
         "club de foot montr al": "cf montreal",
         "columbus crew sc": "columbus crew",
         "d c united": "dc united",
+        "d c united sc": "dc united",
         "washington dc united": "dc united",
         "houston dynamo fc": "houston dynamo",
         "inter miami cf": "inter miami",

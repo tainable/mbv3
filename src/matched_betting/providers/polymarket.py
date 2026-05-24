@@ -25,8 +25,6 @@ LEAGUE_TO_SPORT = {
     "uel": "soccer",
     "seria": "soccer",
     "laliga": "soccer",
-    # MLS: Polymarket has no active MLS markets; entries here prevent KeyError
-    # when mls/mls_spread/mls_totals appear in the league list.
     "mls": "soccer",
     "mls_spread": "soccer",
     "mls_totals": "soccer",
@@ -34,8 +32,7 @@ LEAGUE_TO_SPORT = {
 }
 
 # Leagues that use Yes/No binary markets per outcome (soccer-style)
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga"})
-# NOTE: mls is intentionally excluded — Polymarket has no MLS markets.
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls"})
 
 # Game markets live in /events (not /markets); map league → Polymarket tag_slug
 _LEAGUE_EVENT_TAGS: dict[str, str] = {
@@ -50,7 +47,7 @@ _LEAGUE_EVENT_TAGS: dict[str, str] = {
     "mlb_totals": "mlb",
     "nhl": "nhl",
     "ipl": "indian-premier-league",
-    # MLS: no active Polymarket markets; tag entries prevent missing-key errors
+    # MLS: tag slug is "mls"; base events (1x2) and -more-markets events (spread/totals)
     "mls": "mls",
     "mls_spread": "mls",
     "mls_totals": "mls",
@@ -203,6 +200,24 @@ class PolymarketProvider(OddsProvider):
                         if split_slug[-1] in laliga_teams or split_slug[-1] == "draw":
                             candidate_markets.append((market, "laliga"))
 
+            # MLS — all three sub-leagues share tag "mls"; slug prefix is always "mls"
+            _mls_teams = (
+                team_index.get("mls") or team_index.get("mls_spread") or team_index.get("mls_totals") or set()
+            )
+            if _mls_teams and split_slug[0] == "mls" and len(split_slug) >= 3:
+                c1, c2 = split_slug[1], split_slug[2]
+                if c1 in _mls_teams and c2 in _mls_teams:
+                    # 1x2: mls-{t1}-{t2}-{yyyy}-{mm}-{dd}-{team_or_draw}  (7 parts)
+                    if "mls" in leagues and len(split_slug) == 7:
+                        if split_slug[6] in _mls_teams or split_slug[6] == "draw":
+                            candidate_markets.append((market, "mls"))
+                    # Spread: mls-{t1}-{t2}-{yyyy}-{mm}-{dd}-spread-{home|away}-{Xpt5}  (9 parts)
+                    if "mls_spread" in leagues and "spread" in split_slug:
+                        candidate_markets.append((market, "mls_spread"))
+                    # Totals: mls-{t1}-{t2}-{yyyy}-{mm}-{dd}-total-{Xpt5}  (8 parts)
+                    if "mls_totals" in leagues and "total" in split_slug:
+                        candidate_markets.append((market, "mls_totals"))
+
             _cricket_non_moneyline = {"innings", "runs", "wickets", "fours", "sixes", "total", "over", "under"}
             if "ipl" in leagues and split_slug[0] == "cricipl":
                 if not any(seg in _cricket_non_moneyline for seg in split_slug):
@@ -315,7 +330,7 @@ class PolymarketProvider(OddsProvider):
                         except Exception as exc:
                             warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")
                             self.debug(f"{self.name}: CLOB: skipped market {market_id}: {exc}")
-            elif league == "mlb_totals":
+            elif league in ("mlb_totals", "mls_totals"):
                 market_id = game.get("polymarket_market_id")
                 over_token = game.get("polymarket_over_clob_token_id")
                 under_token = game.get("polymarket_under_clob_token_id")
@@ -625,6 +640,14 @@ class PolymarketProvider(OddsProvider):
                     'bar','rea','bet','get'
                 ]
 
+            elif league in ("mls", "mls_spread", "mls_totals"):
+                # Polymarket slug codes for all 30 MLS clubs (2025-26 season)
+                index[league] = [
+                    'atl', 'aus', 'chi', 'clb', 'clt', 'col', 'dal', 'dcu', 'fcc', 'hou',
+                    'laf', 'lag', 'mia', 'mim', 'min', 'nas', 'ner', 'nyc', 'nyr', 'orl',
+                    'phi', 'por', 'rsl', 'sdg', 'sea', 'sje', 'skc', 'stl', 'tor', 'vwh',
+                ]
+
             elif league == "ipl":
                 # Polymarket uses short lower-case team codes in IPL slugs.
                 # Format: cricipl-{team1}-{team2}[-{date}]
@@ -769,16 +792,16 @@ class PolymarketProvider(OddsProvider):
         _spread_value: float | None = None
         _spread_favourite: str | None = None
         _total_line_value: float | None = None
-        if league == "mlb_spread":
+        if league in ("mlb_spread", "mls_spread"):
             _spread_value, _spread_found = _extract_spread(market)
             _spread_favourite = _extract_spread_favourite(market)
             if not _spread_found:
                 slug = market.get("slug", "unknown")
                 market_id = market.get("id", "unknown")
                 method_warnings.append(
-                    f"mlb_spread market {market_id} ({slug}): spread not found in market data, defaulted to -1.5"
+                    f"{league} market {market_id} ({slug}): spread not found in market data, defaulted to -1.5"
                 )
-        elif league == "mlb_totals":
+        elif league in ("mlb_totals", "mls_totals"):
             _total_line_value = _extract_total_line_pm(market)
 
         lay_probs: list[float | None] = []
@@ -882,6 +905,16 @@ class PolymarketProvider(OddsProvider):
                     event_name_set = True
             if not event_name_set:
                 title = event.get("title") or ""
+                # Strip trailing event-type suffixes added by Polymarket to more-markets events
+                # e.g. "Inter Miami CF vs. Philadelphia Union - More Markets" → "..."
+                _title_suffixes = (
+                    " - More Markets", " - Halftime Result", " - Exact Score",
+                    " - Player Props", " - Total Corners",
+                )
+                for _sfx in _title_suffixes:
+                    if title.endswith(_sfx):
+                        title = title[: -len(_sfx)].strip()
+                        break
                 _separators = (" vs ", " vs. ", " v ", " at ", " @ ")
                 if any(sep in title.lower() for sep in _separators):
                     event_name = title
@@ -906,13 +939,17 @@ class PolymarketProvider(OddsProvider):
             market_name = "Run Line"
         elif league == "mlb_totals":
             market_name = "Total Runs"
+        elif league == "mls_spread":
+            market_name = "Goal Line"
+        elif league == "mls_totals":
+            market_name = "Total Goals"
         else:
             market_name = market.get("groupItemTitle") or market.get("question") or "Unknown market"
 
         # For single-outcome Yes/No remapped markets, infer_market_type would return "multi_way"
         # (only 1 outcome left). UCL markets are three-way (home/draw/away); all other
         # single-outcome remapped markets fall back to two_way for the moneyline filter.
-        if league in ("mlb_spread", "mlb_totals"):
+        if league in ("mlb_spread", "mlb_totals", "mls_spread", "mls_totals"):
             # These are always two-outcome markets; _infer_market_type would return
             # "handicap" or "total" from slug keywords, which the moneyline filter would drop.
             market_type = "two_way"
@@ -944,9 +981,9 @@ class PolymarketProvider(OddsProvider):
                 "market_type_raw": market.get("marketType"),
                 "sports_market_type_raw": market.get("sportsMarketType"),
                 "liquidity_usd": market.get("liquidityNum"),
-                "spread": _spread_value if league == "mlb_spread" else None,
-                "spread_favourite": _spread_favourite if league == "mlb_spread" else None,
-                "total_line": _total_line_value if league == "mlb_totals" else None,
+                "spread": _spread_value if league in ("mlb_spread", "mls_spread") else None,
+                "spread_favourite": _spread_favourite if league in ("mlb_spread", "mls_spread") else None,
+                "total_line": _total_line_value if league in ("mlb_totals", "mls_totals") else None,
             },
         )
 
