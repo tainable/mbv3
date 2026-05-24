@@ -821,16 +821,19 @@ class SxBetProvider(OddsProvider):
             # the same way it does for Polymarket records.
             spread_favourite = team_one if (spread is not None and spread <= 0) else team_two
 
-            # For MLS spread, reject integer handicaps (1.0, 2.0 …).  A whole-number
-            # Asian handicap can result in a push (money refunded), making it a
-            # three-outcome market — not genuinely two-way.  Polymarket only offers
-            # half-ball lines (0.5, 1.5, 2.5 …) so integer lines will never match.
+            # For MLS spread, only accept half-ball lines (0.5, 1.5, 2.5 …).
+            # Integers (1.0, 2.0 …) can push; quarter-balls (0.25, 0.75 …)
+            # split the stake across two adjacent lines.  Both are non-standard
+            # and Polymarket only offers half-ball lines anyway.
+            # A value is half-ball iff abs(val % 1 - 0.5) < 0.1, i.e. the
+            # fractional part is close to 0.5 — same logic as _is_halfball_handicap
+            # in matchbook.py.
             if league == "mls_spread" and spread is not None:
                 val = abs(spread)
-                if abs(val - round(val)) < 0.1:  # integer or very close to integer
+                if abs(val - round(val)) <= 0.4:  # not a X.5 value
                     self.debug(
                         f"{self.name}: skipping mls_spread market {market.get('marketHash', 'unknown')} "
-                        f"— integer spread={spread} can push"
+                        f"— non-half-ball spread={spread}"
                     )
                     return [], []
 
