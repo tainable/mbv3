@@ -362,13 +362,34 @@ class PolymarketProvider(OddsProvider):
                         warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")
 
             else:
-                # NBA / MLB — two-way markets; per-slot token IDs stored alongside market ID
+                # NBA / MLB / MLB-spread / MLS-spread — two-way markets;
+                # per-slot token IDs stored alongside market ID.
                 market_type = "two_way"
                 market_id = game.get("polymarket_market_id")
                 team1_name = normalize_team_name(team1, league)
                 team2_name = normalize_team_name(team2, league)
                 team1_token = game.get("polymarket_team1_clob_token_id")
                 team2_token = game.get("polymarket_team2_clob_token_id")
+
+                # For spread leagues, _fetch_clob_records_by_token returns records
+                # without spread/spread_favourite metadata (the CLOB API only returns
+                # prices, not market structure).  Without these fields,
+                # build_aggregated_games_payload cannot group records by spread line,
+                # so we inject them from the stored game context here — the same
+                # pattern as total_line injection for totals markets.
+                _spread_meta: dict = {}
+                if league in ("mlb_spread", "mls_spread"):
+                    _ctx_spread = game.get("spread")
+                    _ctx_fav = game.get("spread_favourite")
+                    if _ctx_spread is not None:
+                        _spread_meta["spread"] = abs(float(_ctx_spread))
+                    if _ctx_fav is not None:
+                        _spread_meta["spread_favourite"] = _ctx_fav
+
+                def _inject_spread(recs: list) -> list:
+                    if not _spread_meta:
+                        return recs
+                    return [_dc_replace(r, metadata={**(r.metadata or {}), **_spread_meta}) for r in recs]
 
                 if team1_token and team2_token:
                     # Both token IDs stored — use direct CLOB path, one call per outcome.
@@ -382,7 +403,7 @@ class PolymarketProvider(OddsProvider):
                                 clob_token_id, slot_market_id or "", league, outcome_name,
                                 market_type, event_name, event_start, retrieved_at,
                             )
-                            records.extend(slot_records)
+                            records.extend(_inject_spread(slot_records))
                             self.debug(f"{self.name}: CLOB token={clob_token_id} -> {len(slot_records)} records")
                         except Exception as exc:
                             warnings.append(f"Skipped Polymarket CLOB token {clob_token_id}: {exc}")
@@ -396,7 +417,7 @@ class PolymarketProvider(OddsProvider):
                         game_records = self._fetch_clob_moneyline_records(
                             market_id, league, event_name, event_start, retrieved_at,
                         )
-                        records.extend(game_records)
+                        records.extend(_inject_spread(game_records))
                         self.debug(f"{self.name}: CLOB market_id={market_id} -> {len(game_records)} records")
                     except Exception as exc:
                         warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")

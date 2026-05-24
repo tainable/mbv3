@@ -148,16 +148,29 @@ class MatchbookProvider(OddsProvider):
                 # is produced downstream.
                 if league in ("mlb_spread", "mls_spread"):
                     context_favourite = game.get("spread_favourite")
+                    context_spread = game.get("spread")  # normalised (signed) value
+                    before = len(event_records)
                     if context_favourite is not None:
-                        before = len(event_records)
                         event_records = [
                             r for r in event_records
                             if (r.metadata or {}).get("spread_favourite") == context_favourite
                         ]
-                        self.debug(
-                            f"{self.name}: targeted fetch event_id={event_id} "
-                            f"spread filter '{context_favourite}': {before} -> {len(event_records)} records"
-                        )
+                    # Also narrow to the specific handicap magnitude.
+                    # Matchbook returns ALL lines for an event (e.g. -0.5, -1.5, -2.5 …)
+                    # but we only want the line that matches this stored game entry.
+                    # Metadata "spread" is always positive (abs value); context_spread is
+                    # signed (negative for home fav).  Compare on abs().
+                    if context_spread is not None:
+                        abs_target = abs(float(context_spread))
+                        event_records = [
+                            r for r in event_records
+                            if abs(float((r.metadata or {}).get("spread") or 0) - abs_target) < 0.01
+                        ]
+                    self.debug(
+                        f"{self.name}: targeted fetch event_id={event_id} "
+                        f"spread filter '{context_favourite}' abs={abs(float(context_spread)) if context_spread is not None else '?'}: "
+                        f"{before} -> {len(event_records)} records"
+                    )
                 if league in ("mlb_totals", "mls_totals"):
                     context_total_line = game.get("total_line")
                     if context_total_line is not None:

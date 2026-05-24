@@ -270,6 +270,22 @@ def _scan_game(
             if matched:
                 games_payload = matched
 
+    # For spread leagues, further narrow to the specific handicap line stored in
+    # the game context.  Matchbook returns all lines for an event by event_id, so
+    # after aggregation games_payload can contain several spread-line entries for
+    # the same team pair.  Comparing on abs() because context spread is signed
+    # (negative = home fav) while aggregated entries may vary in sign convention.
+    if len(games_payload) > 1 and game.get("league") in ("mlb_spread", "mls_spread"):
+        ctx_spread = game.get("spread")
+        if ctx_spread is not None:
+            abs_ctx = abs(float(ctx_spread))
+            spread_matched = [
+                g for g in games_payload
+                if g.get("spread") is not None and abs(abs(float(g["spread"])) - abs_ctx) < 0.01
+            ]
+            if spread_matched:
+                games_payload = spread_matched
+
     sure_bets = _arb.find_sure_bets(games_payload, min_profit_pct=min_profit_pct)
     back_lay_arbs = _arb.find_back_lay_arbs(games_payload, min_profit_pct=min_profit_pct)
 
