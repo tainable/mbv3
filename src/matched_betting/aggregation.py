@@ -39,6 +39,12 @@ INDEX_EXTRA_FIELDS = (
     "sx_bet_team2_market_hash",
 )
 
+INDEX_TOTALS_FIELDS = (
+    "total_line",
+    "polymarket_over_clob_token_id",
+    "polymarket_under_clob_token_id",
+)
+
 
 def _extract_available(record: OddsRecord) -> float | None:
     m = record.metadata
@@ -89,6 +95,106 @@ def build_aggregated_games_payload(
     payload: list[dict[str, Any]] = []
     for canonical_event_id, indices in grouped_indices.items():
         event_group = events_by_id[canonical_event_id]
+
+        # MLB/MLS totals: one entry per (game, total_line) pair with over/under slot names
+        if event_group.league in ("mlb_totals", "mls_totals"):
+            lines_to_indices: dict[float, list[int]] = {}
+            for index in indices:
+                meta = records[index].metadata or {}
+                tl = meta.get("total_line")
+                if tl is not None:
+                    try:
+                        lines_to_indices.setdefault(float(tl), []).append(index)
+                    except (TypeError, ValueError):
+                        pass
+
+            team1 = _pretty_team(event_group.home_team)
+            team2 = _pretty_team(event_group.away_team)
+
+            for total_line, line_indices in sorted(lines_to_indices.items()):
+                entry: dict[str, Any] = {
+                    "team1": team1,
+                    "team2": team2,
+                    "date_time": event_group.event_start,
+                    "league": event_group.league,
+                    "sport": "soccer" if event_group.league == "mls_totals" else "baseball",
+                    "market_type": "two_way",
+                    "total_line": total_line,
+                    "polymarket_market_id": None,
+                    "matchbook_event_id": None,
+                    "sx_bet_market_hash": None,
+                    "polymarket_over_back_odds": None,
+                    "polymarket_under_back_odds": None,
+                    "matchbook_over_back_odds": None,
+                    "matchbook_over_lay_odds": None,
+                    "matchbook_under_back_odds": None,
+                    "matchbook_under_lay_odds": None,
+                    "sx_bet_over_back_odds": None,
+                    "sx_bet_under_back_odds": None,
+                    "polymarket_over_clob_token_id": None,
+                    "polymarket_under_clob_token_id": None,
+                }
+
+                best_by_provider_slot: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
+                for index in line_indices:
+                    record = records[index]
+                    sel = record.selection_name
+                    if sel not in ("over", "under"):
+                        continue
+                    key = (record.provider, sel, record.selection_side.lower())
+                    current = best_by_provider_slot.get(key)
+                    try:
+                        if current is None:
+                            best_by_provider_slot[key] = (index, record)
+                        elif record.selection_side.lower() == "lay":
+                            if record.decimal_odds < current[1].decimal_odds:
+                                best_by_provider_slot[key] = (index, record)
+                        else:
+                            if record.decimal_odds > current[1].decimal_odds:
+                                best_by_provider_slot[key] = (index, record)
+                    except TypeError:
+                        best_by_provider_slot[key] = (index, record)
+
+                for provider_name in ("polymarket", "matchbook", "sx_bet"):
+                    for ou_slot in ("over", "under"):
+                        for side in ("back", "lay"):
+                            chosen = best_by_provider_slot.get((provider_name, ou_slot, side))
+                            if chosen is None:
+                                continue
+                            _, record = chosen
+                            odds_key = f"{provider_name}_{ou_slot}_{side}_odds"
+                            avail_key = f"{provider_name}_{ou_slot}_{side}_avail"
+                            if odds_key in entry:
+                                entry[odds_key] = record.decimal_odds
+                            entry[avail_key] = _extract_available(record)
+
+                # Polymarket over/under CLOB token IDs and market ID
+                for ou_slot in ("over", "under"):
+                    for side in ("back",):
+                        key = ("polymarket", ou_slot, side)
+                        if key in best_by_provider_slot:
+                            _, record = best_by_provider_slot[key]
+                            clob_token = (record.metadata or {}).get("clob_token_id")
+                            if clob_token:
+                                entry[f"polymarket_{ou_slot}_clob_token_id"] = clob_token
+                            if entry["polymarket_market_id"] is None:
+                                entry["polymarket_market_id"] = record.source_market_id
+                            break
+
+                # Matchbook and SX Bet market IDs
+                for provider_name, id_field, id_attr in (
+                    ("matchbook", "matchbook_event_id", "source_event_id"),
+                    ("sx_bet", "sx_bet_market_hash", "source_market_id"),
+                ):
+                    for key in best_by_provider_slot:
+                        if key[0] == provider_name:
+                            _, record = best_by_provider_slot[key]
+                            entry[id_field] = getattr(record, id_attr)
+                            break
+
+                payload.append(entry)
+            continue  # skip normal two_way/three_way entry building
+
         team1 = _pretty_team(event_group.home_team)
         team2 = _pretty_team(event_group.away_team)
         market_types = {records[i].market_type for i in indices}
@@ -245,7 +351,7 @@ def build_aggregated_games_payload(
                     break
 
         # Soccer: per-outcome SX Bet market hashes for targeted re-fetching
-        if entry.get("league") in ("ucl", "epl", "uel", "seria", "laliga"):
+        if entry.get("league") in ("ucl", "epl", "uel", "seria", "laliga", "mls"):
             for team_slot in ("team1", "draw", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get(("sx_bet", team_slot, side))

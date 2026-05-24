@@ -735,7 +735,7 @@ def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, str,
 
     Returns a list of (slot, provider, outcome_name, raw_odds, stake_usdc).
     """
-    is_totals = arb.get("league") == "mlb_totals"
+    is_totals = arb.get("league") in ("mlb_totals", "mls_totals")
     slot1 = "over" if is_totals else "team1"
     slot2 = "under" if is_totals else "team2"
     legs = [(slot1, arb["team1_back_provider"], arb["team1"], arb["team1_back_odds"])]
@@ -1305,7 +1305,7 @@ def place_back_lay_arb(
             # Non-soccer 2-outcome market: back the opposite outcome.
             # For soccer leagues this is a fallback when per-slot hashes are missing —
             # backing the opposite team does NOT cover a draw. Re-run ids.py to fix.
-            if game.get("league") in ("ucl", "epl", "uel", "seria", "laliga"):
+            if game.get("league") in ("ucl", "epl", "uel", "seria", "laliga", "mls"):
                 print(
                     f"  WARNING: SX Bet lay for '{outcome_name}' ({game.get('league')}) is using "
                     f"back-opposite fallback — draw outcomes are NOT covered. Re-run ids.py.",

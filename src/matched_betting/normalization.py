@@ -593,6 +593,71 @@ TEAM_ALIASES = {
     # the input came from a Polymarket slug code ("bos"), a full outcome name
     # ("Boston Red Sox"), or a nickname ("red sox").
     # Full names already normalise to themselves (lowercase), so no alias needed.
+    "mlb_totals": {
+        # Same aliases as mlb_spread — 3-letter slug codes and nicknames for MLB totals
+        "ari": "arizona diamondbacks",
+        "atl": "atlanta braves",
+        "bal": "baltimore orioles",
+        "bos": "boston red sox",
+        "chc": "chicago cubs",
+        "cws": "chicago white sox",
+        "cin": "cincinnati reds",
+        "cle": "cleveland guardians",
+        "col": "colorado rockies",
+        "det": "detroit tigers",
+        "hou": "houston astros",
+        "kc":  "kansas city royals",
+        "laa": "los angeles angels",
+        "lad": "los angeles dodgers",
+        "mia": "miami marlins",
+        "mil": "milwaukee brewers",
+        "min": "minnesota twins",
+        "nym": "new york mets",
+        "nyy": "new york yankees",
+        "oak": "oakland athletics",
+        "phi": "philadelphia phillies",
+        "pit": "pittsburgh pirates",
+        "sd":  "san diego padres",
+        "sf":  "san francisco giants",
+        "sea": "seattle mariners",
+        "stl": "st louis cardinals",
+        "tb":  "tampa bay rays",
+        "tex": "texas rangers",
+        "tor": "toronto blue jays",
+        "wsh": "washington nationals",
+        "d backs":    "arizona diamondbacks",
+        "diamondbacks": "arizona diamondbacks",
+        "braves":     "atlanta braves",
+        "orioles":    "baltimore orioles",
+        "red sox":    "boston red sox",
+        "cubs":       "chicago cubs",
+        "white sox":  "chicago white sox",
+        "reds":       "cincinnati reds",
+        "guardians":  "cleveland guardians",
+        "rockies":    "colorado rockies",
+        "tigers":     "detroit tigers",
+        "astros":     "houston astros",
+        "royals":     "kansas city royals",
+        "angels":     "los angeles angels",
+        "dodgers":    "los angeles dodgers",
+        "marlins":    "miami marlins",
+        "brewers":    "milwaukee brewers",
+        "twins":      "minnesota twins",
+        "mets":       "new york mets",
+        "yankees":    "new york yankees",
+        "athletics":  "oakland athletics",
+        "a s":        "oakland athletics",
+        "phillies":   "philadelphia phillies",
+        "pirates":    "pittsburgh pirates",
+        "padres":     "san diego padres",
+        "giants":     "san francisco giants",
+        "mariners":   "seattle mariners",
+        "cardinals":  "st louis cardinals",
+        "rays":       "tampa bay rays",
+        "rangers":    "texas rangers",
+        "blue jays":  "toronto blue jays",
+        "nationals":  "washington nationals",
+    },
     "mlb_spread": {
         # 3-letter slug codes → full names
         "ari": "arizona diamondbacks",
@@ -658,6 +723,99 @@ TEAM_ALIASES = {
         "rangers":    "texas rangers",
         "blue jays":  "toronto blue jays",
         "nationals":  "washington nationals",
+    },
+    # MLS team aliases — normalise Matchbook and SX Bet full club names.
+    # Keys must be in already-normalized form (lowercase, non-alphanumeric → space,
+    # no double spaces) because normalize_team_name() normalizes before alias lookup.
+    # Canonical form is the full club name (as used by SX Bet teamOneName / teamTwoName).
+    # No Polymarket short codes needed — Polymarket has no active MLS markets.
+    "mls": {
+        # Atlanta United
+        "atlanta united fc": "atlanta united",
+        # Chicago Fire
+        "chicago fire fc": "chicago fire",
+        # Philadelphia Union — SX Bet appends " FC", Matchbook does not
+        "philadelphia union fc": "philadelphia union",
+        # CF Montréal — accent stripped → "montr al"
+        "cf montr al": "cf montreal",
+        "club de foot montr al": "cf montreal",
+        # Columbus Crew
+        "columbus crew sc": "columbus crew",
+        # D.C. United — dots stripped → "d c united"
+        "d c united": "dc united",
+        "washington dc united": "dc united",
+        # Houston Dynamo
+        "houston dynamo fc": "houston dynamo",
+        # Inter Miami
+        "inter miami cf": "inter miami",
+        # LA Galaxy
+        "los angeles galaxy": "la galaxy",
+        # LAFC
+        "los angeles fc": "lafc",
+        # Minnesota United
+        "minnesota united fc": "minnesota united",
+        # Nashville SC
+        "nashville soccer club": "nashville sc",
+        # New York Red Bulls
+        "ny red bulls": "new york red bulls",
+        # Orlando City
+        "orlando city sc": "orlando city",
+        # Seattle Sounders
+        "seattle sounders fc": "seattle sounders",
+        # Sporting Kansas City
+        "skc": "sporting kansas city",
+        # St. Louis City SC — dot stripped → "st  louis" → "st louis"
+        "st louis city sc": "st louis city sc",
+        "st louis city": "st louis city sc",
+        # Vancouver Whitecaps
+        "vancouver whitecaps fc": "vancouver whitecaps",
+    },
+    # mls_spread and mls_totals share the same team aliases as mls.
+    "mls_spread": {
+        "atlanta united fc": "atlanta united",
+        "chicago fire fc": "chicago fire",
+        "philadelphia union fc": "philadelphia union",
+        "cf montr al": "cf montreal",
+        "club de foot montr al": "cf montreal",
+        "columbus crew sc": "columbus crew",
+        "d c united": "dc united",
+        "washington dc united": "dc united",
+        "houston dynamo fc": "houston dynamo",
+        "inter miami cf": "inter miami",
+        "los angeles galaxy": "la galaxy",
+        "los angeles fc": "lafc",
+        "minnesota united fc": "minnesota united",
+        "nashville soccer club": "nashville sc",
+        "ny red bulls": "new york red bulls",
+        "orlando city sc": "orlando city",
+        "seattle sounders fc": "seattle sounders",
+        "skc": "sporting kansas city",
+        "st louis city sc": "st louis city sc",
+        "st louis city": "st louis city sc",
+        "vancouver whitecaps fc": "vancouver whitecaps",
+    },
+    "mls_totals": {
+        "atlanta united fc": "atlanta united",
+        "chicago fire fc": "chicago fire",
+        "philadelphia union fc": "philadelphia union",
+        "cf montr al": "cf montreal",
+        "club de foot montr al": "cf montreal",
+        "columbus crew sc": "columbus crew",
+        "d c united": "dc united",
+        "washington dc united": "dc united",
+        "houston dynamo fc": "houston dynamo",
+        "inter miami cf": "inter miami",
+        "los angeles galaxy": "la galaxy",
+        "los angeles fc": "lafc",
+        "minnesota united fc": "minnesota united",
+        "nashville soccer club": "nashville sc",
+        "ny red bulls": "new york red bulls",
+        "orlando city sc": "orlando city",
+        "seattle sounders fc": "seattle sounders",
+        "skc": "sporting kansas city",
+        "st louis city sc": "st louis city sc",
+        "st louis city": "st louis city sc",
+        "vancouver whitecaps fc": "vancouver whitecaps",
     },
 }
 

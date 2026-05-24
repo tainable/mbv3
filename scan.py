@@ -70,7 +70,7 @@ except ImportError:
 import arb_finder as _arb
 import bet_executor as _exec
 
-DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga"]
+DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet"]  # Smarkets and Azuro excluded by default
 DEFAULT_IDS = Path("outputs/active_game_ids.json")
 
@@ -316,13 +316,26 @@ def _print_odds_table(
     gbp_rate: float | None = None,
 ) -> None:
     """Print a compact odds table for one game after scanning."""
-    team1 = game.get("team1") or "Team1"
-    team2 = game.get("team2") or "Team2"
+    is_totals = game.get("league") in ("mlb_totals", "mls_totals")
+    if is_totals:
+        team1 = "Over"
+        team2 = "Under"
+    else:
+        team1 = game.get("team1") or "Team1"
+        team2 = game.get("team2") or "Team2"
     league = (game.get("league") or "").upper()
     date_s = _fmt_date(game.get("date_time"))
     spread = games_payload[0].get("spread") if games_payload else game.get("spread")
     spread_s = f" {spread:+.1f}" if spread is not None else ""
-    print(f"  [{i}/{total}]  {team1} vs {team2}  [{league}{spread_s}]  {date_s}")
+    if is_totals:
+        raw_t1 = game.get("team1") or ""
+        raw_t2 = game.get("team2") or ""
+        total_line = game.get("total_line") or (games_payload[0].get("total_line") if games_payload else None)
+        total_s = f"  O/U {total_line}" if total_line is not None else ""
+        title = f"{raw_t1} vs {raw_t2}{total_s}"
+    else:
+        title = f"{team1} vs {team2}"
+    print(f"  [{i}/{total}]  {title}  [{league}{spread_s}]  {date_s}")
 
     if not games_payload:
         print("    (no odds returned by any provider)")
@@ -331,8 +344,15 @@ def _print_odds_table(
 
     g = games_payload[0]
     three_way = g.get("market_type") == "three_way"
-    slots = ("team1", "draw", "team2") if three_way else ("team1", "team2")
-    slot_names = {"team1": team1, "draw": "Draw", "team2": team2}
+    if is_totals:
+        slots = ("over", "under")
+        slot_names = {"over": "Over", "under": "Under"}
+    elif three_way:
+        slots = ("team1", "draw", "team2")
+        slot_names = {"team1": team1, "draw": "Draw", "team2": team2}
+    else:
+        slots = ("team1", "team2")
+        slot_names = {"team1": team1, "team2": team2}
 
     # Column headers — shorten team names to keep lines tidy
     def _short(name: str, max_len: int = 14) -> str:
@@ -537,7 +557,7 @@ def main() -> None:
         default=DEFAULT_LEAGUES,
         choices=DEFAULT_LEAGUES,
         metavar="LEAGUE",
-        help="Leagues to scan: nba mlb mlb_spread ucl epl uel nhl ipl seria laliga (default: all).",
+        help="Leagues to scan: nba mlb mlb_spread mlb_totals ucl epl uel nhl ipl seria laliga mls mls_spread mls_totals (default: all).",
     )
     parser.add_argument(
         "--providers",
@@ -565,9 +585,9 @@ def main() -> None:
     parser.add_argument(
         "--imminent-minutes",
         type=int,
-        default=10,
+        default=20,
         metavar="MINUTES",
-        help="Games kicking off within this many minutes are treated as imminent and skipped (default: 10).",
+        help="Games kicking off within this many minutes are treated as imminent and skipped (default: 20).",
     )
     parser.add_argument(
         "--show-odds",
@@ -589,6 +609,16 @@ def main() -> None:
             "After each game, print a detailed Polymarket diagnostics block: "
             "stored CLOB token IDs, every fetched record (selection, side, prob, odds, token), "
             "fetch path used, and implied-probability sum check."
+        ),
+    )
+    parser.add_argument(
+        "--scan-delay",
+        type=float,
+        default=0.0,
+        metavar="SECS",
+        help=(
+            "Extra pause in seconds between scanning each game (default: 0.0). "
+            "Use to reduce the Matchbook request rate when scanning many games."
         ),
     )
     parser.add_argument(
@@ -700,6 +730,24 @@ def main() -> None:
     if args.auto_bet:
         mode = "DRY RUN" if args.bet_dry_run else "LIVE"
         print(f"  Auto-bet:   ENABLED [{mode}]  budget=${args.budget:.2f} USDC per arb")
+        balances = _exec._fetch_all_balances(settings, providers=args.providers)
+        rate = gbp_rate or 0.79
+        pm_bal  = balances.get("polymarket")
+        sx_bal  = balances.get("sx_bet")
+        mb_gbp  = balances.get("matchbook")
+        mb_usd  = mb_gbp / rate if mb_gbp is not None else None
+        pm_str  = f"${pm_bal:.2f}" if pm_bal is not None else "?"
+        sx_str  = f"${sx_bal:.2f}" if sx_bal is not None else "?"
+        mb_str  = f"£{mb_gbp:.2f} (≈${mb_usd:.2f})" if mb_gbp is not None else "?"
+        print(f"  Balances:   PM {pm_str}  |  SX {sx_str}  |  MB {mb_str}")
+        from matched_betting import kelly as _kelly
+        bankroll = _kelly.compute_bankroll(pm_bal, sx_bal, mb_gbp, gbp_rate)
+        threshold = settings.kelly.min_bankroll_usdc
+        if bankroll is not None:
+            warn = f"  ⚠  below ${threshold:.0f} minimum" if bankroll < threshold else ""
+            print(f"  Bankroll:   ${bankroll:.2f}  (min×3){warn}")
+        else:
+            print("  Bankroll:   (unavailable — one or more balance fetches failed)")
     print(_hr(tw))
 
     if not games:
@@ -762,7 +810,7 @@ def main() -> None:
                 _arb._print_sure_bets(sure_bets, game=_game_ctx, gbp_rate=gbp_rate, budget=args.budget)
             if back_lay_arbs:
                 print(f"  Back-lay arbs ({len(back_lay_arbs)}):")
-                _arb._print_back_lay_arbs(back_lay_arbs, game=_game_ctx, gbp_rate=gbp_rate)
+                _arb._print_back_lay_arbs(back_lay_arbs, game=_game_ctx, gbp_rate=gbp_rate, budget=args.budget)
             print()
 
             # ── Auto-bet ──────────────────────────────────────────────────
@@ -796,7 +844,8 @@ def main() -> None:
                     if bad:
                         print(f"    ⚠  Back-lay skipped — provider(s) {bad} not supported.")
                     else:
-                        candidates.append((arb["profit_pct"], "back_lay", arb))
+                        sort_pct = arb.get("adj_profit_pct") if arb.get("lay_provider") == "matchbook" and arb.get("adj_profit_pct") is not None else arb["profit_pct"]
+                        candidates.append((sort_pct, "back_lay", arb))
 
                 if not candidates:
                     print("    (no executable arbs for this game)")
@@ -832,9 +881,11 @@ def main() -> None:
                             _exec.print_bet_results(results)
                             if _exec.all_legs_ok(results):
                                 print("  [WATCH] ALL LEGS PLACED")
-                                _exec.log_arb_success(best_type, best_arb, game, dry_run=args.bet_dry_run)
+                                _exec.log_arb_success(best_type, best_arb, game, results=results, dry_run=args.bet_dry_run)
                                 from matched_betting import rebalancer as _rebalancer
                                 _rebalancer.run_post_bet_rebalance(settings, dry_run=args.bet_dry_run)
+                                if not args.bet_dry_run and _exec.check_bankroll_halt(settings, gbp_rate):
+                                    sys.exit(3)
 
                     else:
                         lay_note = ""
@@ -864,9 +915,11 @@ def main() -> None:
                             _exec.print_bet_results(results)
                             if _exec.all_legs_ok(results):
                                 print("  [WATCH] ALL LEGS PLACED")
-                                _exec.log_arb_success(best_type, best_arb, game, dry_run=args.bet_dry_run)
+                                _exec.log_arb_success(best_type, best_arb, game, results=results, dry_run=args.bet_dry_run)
                                 from matched_betting import rebalancer as _rebalancer
                                 _rebalancer.run_post_bet_rebalance(settings, dry_run=args.bet_dry_run)
+                                if not args.bet_dry_run and _exec.check_bankroll_halt(settings, gbp_rate):
+                                    sys.exit(3)
 
                 print()
 
@@ -883,6 +936,9 @@ def main() -> None:
                 sys.stdout.flush()
                 progress_on_screen = False
             _print_polymarket_debug(game, raw_records)
+
+        if args.scan_delay > 0 and i < len(games):
+            time.sleep(args.scan_delay)
 
     # End progress line before summary
     if progress_on_screen:

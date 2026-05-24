@@ -421,7 +421,7 @@ def _run(cmd: list[str]) -> None:
 
 # ─── Persistent config ────────────────────────────────────────────────────────
 
-_ALL_LEAGUES   = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga"]
+_ALL_LEAGUES   = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 _ALL_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro", "smarkets"]
 
 _cfg: dict = {

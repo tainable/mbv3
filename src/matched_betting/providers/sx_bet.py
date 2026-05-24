@@ -15,12 +15,16 @@ LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
     "mlb_spread": "baseball",
+    "mlb_totals": "baseball",
     "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
     "seria": "soccer",
     "laliga": "soccer",
+    "mls": "soccer",
+    "mls_spread": "soccer",
+    "mls_totals": "soccer",
     "ipl": "cricket",
 }
 
@@ -29,17 +33,21 @@ _LEAGUE_IDS: dict[str, int | None] = {
     "nba": 1,
     "mlb": 171,
     "mlb_spread": 171,
+    "mlb_totals": 171,
     "nhl": 3,
     "ucl": 30,
     "epl": 29,
     "uel": 31,
     "seria": 1113,
     "laliga": 1114,
+    "mls": 1115,
+    "mls_spread": 1115,
+    "mls_totals": 1115,
     "ipl": 1192,
 }
 
 # Leagues that use binary Yes/No markets per outcome rather than a moneyline
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls"})
 
 # Cricket leagues: two-way match winner markets (no draw, no overtime)
 _CRICKET_LEAGUES: frozenset[str] = frozenset({"ipl"})
@@ -50,16 +58,27 @@ _ODDS_SCALE = 10**20
 # Market type 226 = "Moneyline Including Overtime" (two-way winner market)
 _MONEYLINE_TYPE = 226
 
-# Market type 342 = Run Line / Spread (baseball -1.5 / +1.5)
-# If 0 markets are found on first run, check debug output for available types
-# and update this constant accordingly.
-_RUN_LINE_TYPE = 342
+# Spread (run-line / handicap) market type per league.
+# Baseball run-line = type 342; MLS goal-line handicap = type 3.
+_SPREAD_TYPE_BY_LEAGUE: dict[str, int] = {
+    "mlb_spread": 342,
+    "mls_spread": 3,
+}
 
+# Over/Under (totals) market type per league.
+# Baseball totals = type 28; MLS goal totals = type 2.
+_TOTALS_TYPE_BY_LEAGUE: dict[str, int] = {
+    "mlb_totals": 28,
+    "mls_totals": 2,
+}
 
 _SOCCER_RESULT_TYPE = 1
 
-# Baseball spread leagues (run-line)
-_SPREAD_LEAGUES: frozenset[str] = frozenset({"mlb_spread"})
+# Spread leagues (run-line for baseball, goal-line handicap for soccer)
+_SPREAD_LEAGUES: frozenset[str] = frozenset({"mlb_spread", "mls_spread"})
+
+# Totals leagues (over/under)
+_TOTALS_LEAGUES: frozenset[str] = frozenset({"mlb_totals", "mls_totals"})
 
 # Max hashes per API call — SX Bet returns 414 with long query strings
 _BATCH_SIZE = 20
@@ -217,6 +236,8 @@ class SxBetProvider(OddsProvider):
                 if stored_spread is not None and league in _SPREAD_LEAGUES:
                     raw_spread = -stored_spread if sx_team_one == team2_raw else stored_spread
                     synthetic_market["spread"] = raw_spread
+                if league in _TOTALS_LEAGUES:
+                    synthetic_market["line"] = game.get("total_line")
                 try:
                     market_records, market_warnings = self._market_to_records(
                         synthetic_market, best, league, retrieved_at,
@@ -393,9 +414,30 @@ class SxBetProvider(OddsProvider):
                 sample = next((m.get("marketName") or m.get("label") or m.get("type") for m in all_markets if m.get("type") == t), "")
                 self.debug(f"{self.name}:   type={t}  count={count}  example={sample!r}")
 
-        if league in _SPREAD_LEAGUES:
+        if league in _TOTALS_LEAGUES:
+            totals_type = _TOTALS_TYPE_BY_LEAGUE.get(league)
+            type_counts_t: dict[Any, int] = {}
+            for m in all_markets:
+                t = m.get("type")
+                type_counts_t[t] = type_counts_t.get(t, 0) + 1
+            self.debug(
+                f"{self.name}: {league.upper()} market types for leagueId={league_id}: "
+                + str({t: c for t, c in sorted(type_counts_t.items(), key=lambda x: -x[1])})
+            )
+            filtered = [
+                m for m in all_markets
+                if m.get("leagueId") == league_id
+                and m.get("type") == totals_type
+            ]
+            if not filtered:
+                self.debug(
+                    f"{self.name}: {league}: 0 markets matched type {totals_type}; "
+                    f"check _TOTALS_TYPE_BY_LEAGUE[{league!r}]"
+                )
+        elif league in _SPREAD_LEAGUES:
+            spread_type = _SPREAD_TYPE_BY_LEAGUE.get(league)
             # Log all market types available for this league so we can identify the
-            # correct run-line type if _RUN_LINE_TYPE turns out to be wrong.
+            # correct spread type if _SPREAD_TYPE_BY_LEAGUE turns out to be wrong.
             type_counts: dict[Any, int] = {}
             for m in all_markets:
                 t = m.get("type")
@@ -412,7 +454,7 @@ class SxBetProvider(OddsProvider):
                 )
                 self.debug(f"{self.name}:   type={t}  count={count}  example={sample!r}")
 
-            # Run-line markets (baseball -1.5/+1.5). SX Bet uses type _RUN_LINE_TYPE (342).
+            # Spread markets filtered by per-league type ID.
             # Do NOT fall back to all two-team markets if this type is absent — that would
             # silently use moneyline (or other) markets and produce impossible spread odds.
             filtered = [
@@ -420,14 +462,14 @@ class SxBetProvider(OddsProvider):
                 if m.get("leagueId") == league_id
                 and m.get("teamOneName")
                 and m.get("teamTwoName")
-                and m.get("type") == _RUN_LINE_TYPE
+                and m.get("type") == spread_type
             ]
             if not filtered:
                 all_league_markets = [m for m in all_markets if m.get("leagueId") == league_id]
                 self.debug(
-                    f"{self.name}: mlb_spread: 0 markets matched type {_RUN_LINE_TYPE}; "
+                    f"{self.name}: {league}: 0 markets matched type {spread_type}; "
                     f"{len(all_league_markets)} total markets for leagueId={league_id}. "
-                    f"Update _RUN_LINE_TYPE based on the type counts above."
+                    f"Update _SPREAD_TYPE_BY_LEAGUE[{league!r}] based on the type counts above."
                 )
         elif league in _CRICKET_LEAGUES:
             # Cricket match-winner markets are two-way (no draw, no overtime).
@@ -683,15 +725,80 @@ class SxBetProvider(OddsProvider):
         avail: dict[str, float] | None = None,
     ) -> tuple[list[OddsRecord], list[str]]:
         market_hash = market["marketHash"]
-        team_one: str = normalize_team_name(market["teamOneName"], league)
-        team_two: str = normalize_team_name(market["teamTwoName"], league)
         game_time = market.get("gameTime")
         event_start = _unix_to_iso(game_time) if game_time else None
-        event_name = f"{team_one} vs. {team_two}"
-        sport = LEAGUE_TO_SPORT[league]
         source_event_id = (
             str(market["sportXEventId"]) if market.get("sportXEventId") else None
         )
+
+        if league in _TOTALS_LEAGUES:
+            # Totals (over/under) market: teamOneName/teamTwoName are the actual teams;
+            # outcomeOneName = "Over X.X", outcomeTwoName = "Under X.X".
+            team_one = normalize_team_name(market.get("teamOneName", ""), league)
+            team_two = normalize_team_name(market.get("teamTwoName", ""), league)
+            event_name = f"{team_one} vs. {team_two}"
+            sport = LEAGUE_TO_SPORT[league]
+            try:
+                total_line = float(market.get("line") or 0) or None
+            except (TypeError, ValueError):
+                total_line = None
+
+            outcome_one_data = best.get("outcomeOne", {})
+            outcome_two_data = best.get("outcomeTwo", {})
+            avail_one = avail.get("outcome_one_avail_usd") if avail else None
+            avail_two = avail.get("outcome_two_avail_usd") if avail else None
+
+            records: list[OddsRecord] = []
+            # outcomeOne = Over; taker backing Over uses outcomeTwo maker orders
+            # outcomeTwo = Under; taker backing Under uses outcomeOne maker orders
+            for ou_name, maker_data, avail_usd in [
+                ("over",  outcome_two_data, avail_one),
+                ("under", outcome_one_data, avail_two),
+            ]:
+                raw_pct = maker_data.get("percentageOdds")
+                if raw_pct is None:
+                    continue
+                try:
+                    maker_prob = int(raw_pct) / _ODDS_SCALE
+                except (TypeError, ValueError):
+                    continue
+                taker_prob = 1.0 - maker_prob
+                if not (0.0 < taker_prob < 1.0):
+                    continue
+                records.append(
+                    OddsRecord(
+                        provider=self.name,
+                        sport=sport,
+                        league=league,
+                        event_name=event_name,
+                        event_start=event_start,
+                        market_name="Total Runs",
+                        market_type="two_way",
+                        selection_name=ou_name,
+                        selection_side="back",
+                        decimal_odds=round(1.0 / taker_prob, 6),
+                        implied_probability=round(taker_prob, 6),
+                        currency="USD",
+                        source_market_id=market_hash,
+                        source_event_id=source_event_id,
+                        retrieved_at=retrieved_at,
+                        metadata={
+                            "market_hash": market_hash,
+                            "game_time": game_time,
+                            "league_id": market.get("leagueId"),
+                            "market_type": _TOTALS_TYPE_BY_LEAGUE.get(league),
+                            "total_line": total_line,
+                            "available_usd": round(avail_usd, 2) if avail_usd is not None else None,
+                            "outcome_one_team": "over",
+                        },
+                    )
+                )
+            return records, []
+
+        team_one: str = normalize_team_name(market["teamOneName"], league)
+        team_two: str = normalize_team_name(market["teamTwoName"], league)
+        event_name = f"{team_one} vs. {team_two}"
+        sport = LEAGUE_TO_SPORT[league]
         market_display_name = "Run Line" if league in _SPREAD_LEAGUES else "Moneyline Incl. OT"
 
         method_warnings: list[str] = []
@@ -704,10 +811,10 @@ class SxBetProvider(OddsProvider):
                 spread = float(raw)
 
             except (TypeError, ValueError):
-                spread = -1.5  # standard MLB run-line
+                spread = None
                 method_warnings.append(
-                    f"sx_bet mlb_spread market {market.get('marketHash', 'unknown')}: "
-                    "spread not found in market data, defaulted to -1.5"
+                    f"sx_bet {league} market {market.get('marketHash', 'unknown')}: "
+                    "spread not found in market data"
                 )
             # teamOne is the side at -1.5 when spread < 0; teamTwo when spread > 0.
             # Storing this lets event_matching.py apply the home-perspective flip
@@ -774,7 +881,7 @@ class SxBetProvider(OddsProvider):
                         "market_hash": market_hash,
                         "game_time": game_time,
                         "league_id": market.get("leagueId"),
-                        "market_type": _RUN_LINE_TYPE if league in _SPREAD_LEAGUES else _MONEYLINE_TYPE,
+                        "market_type": _SPREAD_TYPE_BY_LEAGUE.get(league, _MONEYLINE_TYPE) if league in _SPREAD_LEAGUES else _MONEYLINE_TYPE,
                         "spread": spread,
                         "spread_favourite": spread_favourite,
                         "available_usd": round(avail_usd, 2) if avail_usd is not None else None,
@@ -793,7 +900,7 @@ class SxBetProvider(OddsProvider):
                 method_warnings.append(
                     f"sx_bet {league} market {market_hash}: impossible implied-prob sum "
                     f"{prob_sum:.2%} (expected ≥80%); market type may be wrong. "
-                    f"Check _RUN_LINE_TYPE ({_RUN_LINE_TYPE}) vs debug output. Skipping."
+                    f"Check _SPREAD_TYPE_BY_LEAGUE[{league!r}] ({_SPREAD_TYPE_BY_LEAGUE.get(league)}) vs debug output. Skipping."
                 )
                 self.debug(
                     f"{self.name}: SKIPPED {market_hash} — implied-prob sum {prob_sum:.2%}, "

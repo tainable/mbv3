@@ -108,6 +108,16 @@ BACK_ODDS_FIELDS: dict[str, list[str]] = {
         "sx_bet_team2_back_odds",
         "azuro_team2_back_odds",
     ],
+    "over": [
+        "polymarket_over_back_odds",
+        "matchbook_over_back_odds",
+        "sx_bet_over_back_odds",
+    ],
+    "under": [
+        "polymarket_under_back_odds",
+        "matchbook_under_back_odds",
+        "sx_bet_under_back_odds",
+    ],
 }
 
 LAY_ODDS_FIELDS: dict[str, list[str]] = {
@@ -128,6 +138,12 @@ LAY_ODDS_FIELDS: dict[str, list[str]] = {
         "matchbook_team2_lay_odds",
         "smarkets_team2_lay_odds",
         "sx_bet_team2_lay_odds",
+    ],
+    "over": [
+        "matchbook_over_lay_odds",
+    ],
+    "under": [
+        "matchbook_under_lay_odds",
     ],
 }
 
@@ -199,7 +215,11 @@ def _best_lay(game: dict, slot: str) -> tuple[float, str] | tuple[None, None]:
 
 
 def _outcome_label(game: dict, slot: str) -> str:
-    return "Draw" if slot == "draw" else (game.get(slot) or slot)
+    if slot == "draw":
+        return "Draw"
+    if slot in ("over", "under"):
+        return slot.title()
+    return game.get(slot) or slot
 
 
 def _game_started(date_time: str | None) -> bool:
@@ -254,8 +274,12 @@ def find_sure_bets(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]
     results = []
     for game in games:
         three_way = _is_three_way(game)
-        team1_odds, team1_provider = _best_back(game, "team1")
-        team2_odds, team2_provider = _best_back(game, "team2")
+        is_totals = game.get("league") in ("mlb_totals", "mls_totals")
+        slot1 = "over" if is_totals else "team1"
+        slot2 = "under" if is_totals else "team2"
+
+        team1_odds, team1_provider = _best_back(game, slot1)
+        team2_odds, team2_provider = _best_back(game, slot2)
 
         if team1_odds is None or team2_odds is None:
             continue
@@ -297,15 +321,16 @@ def find_sure_bets(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]
             "market_type": "three_way" if three_way else "two_way",
             "league": game.get("league"),
             "date_time": game.get("date_time"),
-            "team1": game.get("team1"),
-            "team2": game.get("team2"),
+            "team1": "Over" if is_totals else game.get("team1"),
+            "team2": "Under" if is_totals else game.get("team2"),
             "spread": game.get("spread"),
+            "total_line": game.get("total_line"),
             "team1_back_odds": team1_odds,
             "team1_back_provider": team1_provider,
-            "team1_back_avail": game.get(f"{team1_provider}_team1_back_avail"),
+            "team1_back_avail": game.get(f"{team1_provider}_{slot1}_back_avail"),
             "team2_back_odds": team2_odds,
             "team2_back_provider": team2_provider,
-            "team2_back_avail": game.get(f"{team2_provider}_team2_back_avail"),
+            "team2_back_avail": game.get(f"{team2_provider}_{slot2}_back_avail"),
             "margin": round(gross_margin, 6),
             "profit_pct": round(net_profit_pct, 4),
             "profit_24h_pct": profit_24h_pct,
@@ -329,7 +354,12 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
     """Return back-lay arbs sorted by net profit."""
     results = []
     for game in games:
-        slots = ("team1", "draw", "team2") if _is_three_way(game) else ("team1", "team2")
+        if game.get("league") in ("mlb_totals", "mls_totals"):
+            slots = ("over", "under")
+        elif _is_three_way(game):
+            slots = ("team1", "draw", "team2")
+        else:
+            slots = ("team1", "team2")
 
         for slot in slots:
             back_odds, back_provider = _best_back(game, slot)
@@ -347,7 +377,9 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
             if eff_back <= eff_lay:
                 continue
 
-            net_profit_pct = (eff_back / eff_lay - 1) * 100
+            # Real yield = profit / total_capital (back_stake + lay_stake × (eff_lay−1)).
+            # This formula is exact for both binary No-token providers and exchange lay.
+            net_profit_pct = (eff_back - eff_lay) / (eff_lay + eff_back * (eff_lay - 1)) * 100
             profit_24h_pct = _profit_24h(net_profit_pct, game.get("date_time"))
             effective_pct = min(net_profit_pct, profit_24h_pct) if profit_24h_pct is not None else net_profit_pct
             if effective_pct < min_profit_pct:
@@ -360,6 +392,7 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
                 "team1": game.get("team1"),
                 "team2": game.get("team2"),
                 "spread": game.get("spread"),
+                "total_line": game.get("total_line"),
                 "outcome_slot": slot,
                 "arb_outcome": _outcome_label(game, slot),
                 "back_odds": back_odds,
@@ -373,10 +406,12 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
                 "gross_profit_pct": round((back_odds / lay_odds - 1) * 100, 4),
             })
 
-    results.sort(
-        key=lambda x: x["profit_24h_pct"] if x["profit_24h_pct"] is not None else x["profit_pct"],
-        reverse=True,
-    )
+    def _sort_key(x: dict) -> float:
+        p = x["profit_pct"]
+        p24 = x.get("profit_24h_pct")
+        return p24 if p24 is not None else p
+
+    results.sort(key=_sort_key, reverse=True)
     return results
 
 
@@ -391,8 +426,11 @@ def best_sure_bet_opportunity(game: dict) -> dict | None:
     profit_pct may be negative.  Returns None if odds are missing.
     """
     three_way = _is_three_way(game)
-    team1_odds, team1_provider = _best_back(game, "team1")
-    team2_odds, team2_provider = _best_back(game, "team2")
+    is_totals = game.get("league") in ("mlb_totals", "mls_totals")
+    slot1 = "over" if is_totals else "team1"
+    slot2 = "under" if is_totals else "team2"
+    team1_odds, team1_provider = _best_back(game, slot1)
+    team2_odds, team2_provider = _best_back(game, slot2)
     if team1_odds is None or team2_odds is None:
         return None
 
@@ -432,7 +470,12 @@ def best_back_lay_opportunity(game: dict) -> dict | None:
     so profit_pct may be negative.  Picks the outcome with the highest profit.
     Returns None if back or lay odds are missing for every outcome.
     """
-    slots = ("team1", "draw", "team2") if _is_three_way(game) else ("team1", "team2")
+    if game.get("league") in ("mlb_totals", "mls_totals"):
+        slots = ("over", "under")
+    elif _is_three_way(game):
+        slots = ("team1", "draw", "team2")
+    else:
+        slots = ("team1", "team2")
     best: dict | None = None
     for slot in slots:
         b_odds, b_prov = _best_back(game, slot)
@@ -441,7 +484,7 @@ def best_back_lay_opportunity(game: dict) -> dict | None:
             continue
         eff_b = _eff_back_odds(b_odds, b_prov)
         eff_l = _eff_lay_odds(l_odds, l_prov)
-        pct = round((eff_b / eff_l - 1) * 100, 4)
+        pct = round((eff_b - eff_l) / (eff_l + eff_b * (eff_l - 1)) * 100, 4)
         if best is None or pct > best["profit_pct"]:
             best = {
                 "arb_outcome": _outcome_label(game, slot),

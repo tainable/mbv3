@@ -14,6 +14,7 @@ from matched_betting.aggregation import (
     INDEX_ID_FIELDS,
     INDEX_POLYMARKET_SLOT_FIELDS,
     INDEX_EXTRA_FIELDS,
+    INDEX_TOTALS_FIELDS,
 )
 from matched_betting.config import load_settings
 from matched_betting.debug import noop_debug, stderr_debug
@@ -25,8 +26,8 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl"]
-ALL_LEAGUES = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl"]
+DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+ALL_LEAGUES = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"]
 
 
@@ -37,6 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     league_shortcuts.add_argument("--nba", action="store_true", help="Shortcut for --leagues nba")
     league_shortcuts.add_argument("--mlb", action="store_true", help="Shortcut for --leagues mlb")
     league_shortcuts.add_argument("--mlb-spread", action="store_true", dest="mlb_spread", help="Shortcut for --leagues mlb_spread")
+    league_shortcuts.add_argument("--mlb-totals", action="store_true", dest="mlb_totals", help="Shortcut for --leagues mlb_totals")
     league_shortcuts.add_argument("--ucl", action="store_true", help="Shortcut for --leagues ucl")
     league_shortcuts.add_argument("--epl", action="store_true", help="Shortcut for --leagues epl")
     league_shortcuts.add_argument("--ipl", action="store_true", help="Shortcut for --leagues ipl")
@@ -659,16 +661,17 @@ def _load_market_index(path: Path) -> dict[str, Any]:
     return {"market_index": {}}
 
 
-def _game_index_key(game: dict[str, Any]) -> tuple[str, str, str]:
+def _game_index_key(game: dict[str, Any]) -> tuple:
     """Stable identity key for matching game entries across runs."""
     return (
         (game.get("team1") or "").lower(),
         (game.get("team2") or "").lower(),
         game.get("date_time") or "",
+        game.get("total_line"),
     )
 
 
-_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl"]
+_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 
 
 def _merge_market_index_additive(
@@ -706,7 +709,7 @@ def _merge_market_index_additive(
         for g in new_games:
             k = _game_index_key(g)
             if k in games_by_key:
-                for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS):
+                for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS, *INDEX_TOTALS_FIELDS):
                     if g.get(field) and not games_by_key[k].get(field):
                         games_by_key[k][field] = g[field]
             else:
@@ -821,7 +824,7 @@ def _build_market_index(aggregated_games: list[dict[str, Any]]) -> dict[str, Any
             "date_time": game.get("date_time"),
             "spread": game.get("spread"),
         }
-        for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS):
+        for field in (*INDEX_ID_FIELDS, *INDEX_POLYMARKET_SLOT_FIELDS, *INDEX_EXTRA_FIELDS, *INDEX_TOTALS_FIELDS):
             entry[field] = game.get(field) or None
         # Only include if the game has at least one provider ID
         if any(entry[field] for field in INDEX_ID_FIELDS):
@@ -846,6 +849,8 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
         return ["mlb"]
     if args.mlb_spread:
         return ["mlb_spread"]
+    if args.mlb_totals:
+        return ["mlb_totals"]
     if args.ucl:
         return ["ucl"]
     if args.epl:

@@ -96,7 +96,9 @@ def _azuro_back_lay_cap_line(arb: dict, game: dict | None, gbp_rate: float | Non
     if max_stake_usdc <= 0:
         return None
 
-    profit_usdc = max_stake_usdc * arb["profit_pct"] / 100.0
+    eff_b = calculator._eff_back_odds(arb["back_odds"], arb["back_provider"])
+    eff_l = calculator._eff_lay_odds(arb["lay_odds"], arb["lay_provider"])
+    profit_usdc = max_stake_usdc * (eff_b / eff_l - 1)
     if gbp_rate:
         return (
             f"    Azuro cap:  back stake £{max_stake_usdc * gbp_rate:,.0f}"
@@ -121,6 +123,7 @@ def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, floa
 
     Returns a list of (outcome_name, provider, raw_odds, stake_usdc).
     """
+    # For mlb_totals arb["team1"]="Over", arb["team2"]="Under" — handled uniformly below
     legs = [
         (arb["team1"],  arb["team1_back_provider"], arb["team1_back_odds"]),
     ]
@@ -174,8 +177,10 @@ def _print_sure_bets(
 
         spread = arb.get("spread")
         spread_s = f" {spread:+.1f}" if spread is not None else ""
+        total_line = arb.get("total_line")
+        total_s = f" O/U {total_line}" if total_line is not None else ""
         lines = [
-            f"  [{arb['league'].upper()}{spread_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
+            f"  [{arb['league'].upper()}{spread_s}{total_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
             f"    Back {arb['team1']:<30} {arb['team1_back_odds']:.4f}  ({arb['team1_back_provider']}){_avail(arb.get('team1_back_avail'), arb['team1_back_provider'])}{_stake_str(arb['team1'], arb['team1_back_provider'])}",
         ]
         if arb["market_type"] == "three_way":
@@ -199,7 +204,7 @@ def _print_sure_bets(
         print("\n".join(lines))
 
 
-def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: float | None = None) -> None:
+def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: float | None = None, budget: float | None = None) -> None:
     if not arbs:
         print("  None found.\n")
         return
@@ -221,8 +226,10 @@ def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: f
         az_line = _azuro_back_lay_cap_line(arb, game, gbp_rate)
         spread = arb.get("spread")
         spread_s = f" {spread:+.1f}" if spread is not None else ""
+        total_line = arb.get("total_line")
+        total_s = f" O/U {total_line}" if total_line is not None else ""
         lines = [
-            f"  [{arb['league'].upper()}{spread_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
+            f"  [{arb['league'].upper()}{spread_s}{total_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
             f"    Back {arb['arb_outcome']:<30} {arb['back_odds']:.4f}  ({arb['back_provider']}){_avail(arb.get('back_avail'), arb['back_provider'])}",
             f"    Lay  {arb['arb_outcome']:<30} {arb['lay_odds']:.4f}  ({arb['lay_provider']}){_avail(arb.get('lay_avail'), arb['lay_provider'])}",
             f"    Net profit: {arb['profit_pct']:.4f}%{gross_str}"
@@ -260,8 +267,13 @@ def _delta_str(old: float, new: float) -> str:
 
 
 def _polymarket_slot_for_outcome(game: dict, outcome_name: str) -> str:
-    if outcome_name.lower() in ("draw", "tie"):
+    outcome_lower = outcome_name.lower()
+    if outcome_lower in ("draw", "tie"):
         return "draw"
+    if outcome_lower == "over":
+        return "over"
+    if outcome_lower == "under":
+        return "under"
     if _names_match(outcome_name, game.get("team1") or ""):
         return "team1"
     if _names_match(outcome_name, game.get("team2") or ""):
@@ -359,6 +371,11 @@ def _fetch_matchbook_leg(game: dict, outcome_name: str, side: str, http, setting
         "match odds", "match winner", "money line", "moneyline",
         "winner (incl. overtime)", "winner (including overtime)",
     }
+    _MB_TOTALS = {
+        "total", "total runs", "total runs (incl. extra innings)",
+        "total (incl. extra innings)", "over/under",
+    }
+    is_totals = game.get("league") in ("mlb_totals", "mls_totals")
     try:
         if settings.matchbook.username and settings.matchbook.password:
             http.post_json(
@@ -370,14 +387,31 @@ def _fetch_matchbook_leg(game: dict, outcome_name: str, side: str, http, setting
             f"{settings.matchbook.base_url}/edge/rest/events/{event_id}",
             headers={"Accept": "application/json"},
         )
+        total_line = game.get("total_line")
         for market in event_data.get("markets", []):
             if market.get("status") != "open":
                 continue
-            if str(market.get("name") or "").lower().strip() not in _MB_MONEYLINE:
-                continue
-            for runner in market.get("runners", []):
-                if not _names_match(str(runner.get("name") or ""), outcome_name):
+            market_name_lower = str(market.get("name") or "").lower().strip()
+            if is_totals:
+                if market_name_lower not in _MB_TOTALS:
                     continue
+            else:
+                if market_name_lower not in _MB_MONEYLINE:
+                    continue
+            for runner in market.get("runners", []):
+                runner_name = str(runner.get("name") or "")
+                if is_totals:
+                    if outcome_name.lower() not in runner_name.lower():
+                        continue
+                    if total_line is not None:
+                        try:
+                            if abs(float(runner.get("handicap")) - float(total_line)) > 0.01:
+                                continue
+                        except (TypeError, ValueError):
+                            pass
+                else:
+                    if not _names_match(runner_name, outcome_name):
+                        continue
                 for price in runner.get("prices", []):
                     if str(price.get("side") or "").lower() == side:
                         odds = price.get("decimal-odds") or price.get("odds")
@@ -401,11 +435,17 @@ def _fetch_sx_bet_leg(game: dict, outcome_name: str, side: str, http, settings) 
         entry = next((e for e in best_list if e["marketHash"] == market_hash), None)
         if not entry:
             return None
-        maker_data = (
-            entry.get("outcomeTwo")
-            if _names_match(game.get("team1", ""), outcome_name)
-            else entry.get("outcomeOne")
-        )
+        # For mlb_totals / mls_totals: outcomeOne=Over, outcomeTwo=Under.
+        # Taker backing Over uses outcomeTwo maker orders; Under uses outcomeOne.
+        if game.get("league") in ("mlb_totals", "mls_totals"):
+            outcome_lower = outcome_name.lower()
+            maker_data = entry.get("outcomeTwo") if outcome_lower == "over" else entry.get("outcomeOne")
+        else:
+            maker_data = (
+                entry.get("outcomeTwo")
+                if _names_match(game.get("team1", ""), outcome_name)
+                else entry.get("outcomeOne")
+            )
         if not maker_data:
             return None
         raw_pct = maker_data.get("percentageOdds")
@@ -576,7 +616,7 @@ def _refresh_back_lay_arb(arb: dict, game: dict | None, http, settings, refreshe
         eff_b = calculator._eff_back_odds(fresh_back, arb["back_provider"])
         eff_l = calculator._eff_lay_odds(fresh_lay, arb["lay_provider"])
         if eff_b > eff_l:
-            fresh_net_profit = (eff_b / eff_l - 1) * 100
+            fresh_net_profit = (eff_b - eff_l) / (eff_l + eff_b * (eff_l - 1)) * 100
             fresh_gross_profit = (fresh_back / fresh_lay - 1) * 100
             gross_str = f"  (gross: {fresh_gross_profit:.4f}%)" if abs(fresh_gross_profit - fresh_net_profit) > 0.0001 else ""
             delta = fresh_net_profit - arb["profit_pct"]
@@ -681,7 +721,7 @@ def main() -> None:
     _print_sure_bets(sure_bets, budget=args.budget)
 
     print(f"=== Back-lay arbs: {len(back_lay_arbs)} found ===\n")
-    _print_back_lay_arbs(back_lay_arbs)
+    _print_back_lay_arbs(back_lay_arbs, budget=args.budget)
 
     if not args.no_refresh:
         run_refresh(sure_bets, back_lay_arbs, games)

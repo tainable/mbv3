@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import time
+import threading
 from typing import Any
 
 from matched_betting.config import MatchbookSettings
@@ -24,7 +26,52 @@ class MatchbookProvider(OddsProvider):
         self.settings = settings
         self.http_client = http_client
         self._session_token: str | None = None
-        self._login_lock = __import__("threading").Lock()
+        self._login_lock = threading.Lock()
+        # Rate-limit state — guarded by _throttle_lock
+        self._requests_per_minute: int = settings.max_requests_per_min
+        self._last_request_time: float = 0.0
+        self._request_timestamps: list[float] = []  # sliding-window bucket
+        self._throttle_lock = threading.Lock()
+
+    def _throttle(self) -> None:
+        """Rate-limit outgoing Matchbook requests.
+
+        Two guards enforced under a single lock:
+        1. Minimum inter-request gap: 60 / requests_per_min seconds — prevents
+           micro-bursts when a fresh process starts with _last_request_time = 0.
+        2. Sliding-window cap: at most requests_per_min calls in any 60-second
+           window — prevents sustained over-rate even across process boundaries.
+
+        Configure via MATCHBOOK_MAX_REQUESTS_PER_MIN in .env (default 200;
+        Matchbook hard limit is 700/min).
+        """
+        min_gap = 60.0 / self._requests_per_minute
+        with self._throttle_lock:
+            now = time.monotonic()
+
+            # Guard 1: minimum inter-request gap
+            gap_wait = min_gap - (now - self._last_request_time)
+            if gap_wait > 0:
+                time.sleep(gap_wait)
+                now = time.monotonic()
+
+            # Guard 2: sliding window — evict timestamps older than 60 s
+            cutoff = now - 60.0
+            while self._request_timestamps and self._request_timestamps[0] <= cutoff:
+                self._request_timestamps.pop(0)
+            if len(self._request_timestamps) >= self._requests_per_minute:
+                # Window full — wait until the oldest entry ages out of the window
+                oldest = self._request_timestamps[0]
+                sleep_for = 60.0 - (now - oldest) + 0.05  # small buffer
+                if sleep_for > 0:
+                    time.sleep(sleep_for)
+                    now = time.monotonic()
+                    cutoff = now - 60.0
+                    while self._request_timestamps and self._request_timestamps[0] <= cutoff:
+                        self._request_timestamps.pop(0)
+
+            self._request_timestamps.append(now)
+            self._last_request_time = now
 
     def fetch_odds(self, leagues: list[str]) -> ProviderPayload:
         if not (self.settings.username and self.settings.password):
@@ -35,7 +82,7 @@ class MatchbookProvider(OddsProvider):
         retrieved_at = utc_now_iso()
         self._login()
 
-        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria", "laliga")):
+        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals")):
             self._log_available_sports()
 
         records: list[OddsRecord] = []
@@ -89,6 +136,7 @@ class MatchbookProvider(OddsProvider):
                 continue
             self.debug(f"{self.name}: targeted fetch event_id={event_id} league={league}")
             try:
+                self._throttle()
                 event_data = self.http_client.get_json(
                     f"{self.settings.base_url}/edge/rest/events/{event_id}",
                     headers={"Accept": "application/json"},
@@ -98,7 +146,7 @@ class MatchbookProvider(OddsProvider):
                 # markets (e.g. both the +1.5 and -1.5 side). Filter to the specific
                 # line stored in the game context so only one canonical spread group
                 # is produced downstream.
-                if league == "mlb_spread":
+                if league in ("mlb_spread", "mls_spread"):
                     context_favourite = game.get("spread_favourite")
                     if context_favourite is not None:
                         before = len(event_records)
@@ -109,6 +157,18 @@ class MatchbookProvider(OddsProvider):
                         self.debug(
                             f"{self.name}: targeted fetch event_id={event_id} "
                             f"spread filter '{context_favourite}': {before} -> {len(event_records)} records"
+                        )
+                if league in ("mlb_totals", "mls_totals"):
+                    context_total_line = game.get("total_line")
+                    if context_total_line is not None:
+                        before = len(event_records)
+                        event_records = [
+                            r for r in event_records
+                            if (r.metadata or {}).get("total_line") == context_total_line
+                        ]
+                        self.debug(
+                            f"{self.name}: targeted fetch event_id={event_id} "
+                            f"total_line filter {context_total_line}: {before} -> {len(event_records)} records"
                         )
                 records.extend(event_records)
                 self.debug(
@@ -124,6 +184,7 @@ class MatchbookProvider(OddsProvider):
         with self._login_lock:
             if self._session_token:
                 return self._session_token
+            self._throttle()
             response = self.http_client.post_json(
                 f"{self.settings.base_url}/bpapi/rest/security/session",
                 payload={
@@ -141,6 +202,7 @@ class MatchbookProvider(OddsProvider):
 
     def _log_available_sports(self) -> None:
         try:
+            self._throttle()
             payload = self.http_client.get_json(
                 f"{self.settings.base_url}/edge/rest/sports",
                 headers={"Accept": "application/json"},
@@ -155,9 +217,10 @@ class MatchbookProvider(OddsProvider):
     def _iter_events(self, *, sport_id: int) -> list[dict[str, Any]]:
         events: list[dict[str, Any]] = []
         offset = 0
-        per_page = 50
+        per_page = 200
         while True:
             self.debug(f"{self.name}: requesting events page offset={offset} per-page={per_page}")
+            self._throttle()
             payload = self.http_client.get_json(
                 f"{self.settings.base_url}/edge/rest/events",
                 params={
@@ -181,7 +244,7 @@ class MatchbookProvider(OddsProvider):
         meta_tags = event.get("meta-tags", [])
         if league == "nba":
             return any(tag.get("url-name") == "nba" for tag in meta_tags)
-        if league in ("mlb", "mlb_spread"):
+        if league in ("mlb", "mlb_spread", "mlb_totals"):
             # Sport ID 3 already scopes the API response to baseball events, so
             # trust it rather than relying on meta-tag values which vary by market.
             return True
@@ -202,6 +265,10 @@ class MatchbookProvider(OddsProvider):
             return any(tag.get("url-name") in ("serie-a", "seria", "italian-serie-a", "italy-serie-a") for tag in meta_tags)
         if league == "laliga":
             return any(tag.get("url-name") == "spain-la-liga" for tag in meta_tags)
+        if league in ("mls", "mls_spread", "mls_totals"):
+            # Sport ID 15 covers all soccer; filter down to MLS specifically.
+            # Confirmed url-name via find_matchbook_league_tags.py: 'us-major-league-soccer'
+            return any(tag.get("url-name") == "us-major-league-soccer" for tag in meta_tags)
         if league == "ipl":
             # Sport ID 110 covers all cricket; filter down to IPL specifically.
             # Try meta-tags first (multiple known url-name variants across seasons).
@@ -227,6 +294,67 @@ class MatchbookProvider(OddsProvider):
     ) -> list[OddsRecord]:
         records: list[OddsRecord] = []
         open_markets = [market for market in event.get("markets", []) if market.get("status") == "open"]
+
+        if league == "mlb_totals":
+            totals_markets = [m for m in open_markets if _is_totals_market(m)]
+            self.debug(
+                f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
+                f"{len(totals_markets)} totals after filtering"
+            )
+            if not totals_markets and open_markets:
+                names = sorted({str(m.get("name") or "").lower().strip() for m in open_markets})
+                self.debug(
+                    f"{self.name}: event_id={event.get('id')} — no totals match; "
+                    f"available market names: {names}"
+                )
+            for market in totals_markets:
+                market_name = str(market.get("name") or "Unknown market")
+                for runner in market.get("runners", []):
+                    runner_name = str(runner.get("name") or "").lower()
+                    if "over" in runner_name:
+                        ou_name = "over"
+                    elif "under" in runner_name:
+                        ou_name = "under"
+                    else:
+                        continue
+                    try:
+                        total_line = float(runner.get("handicap"))
+                    except (TypeError, ValueError):
+                        m = re.search(r"(\d+(?:\.\d+)?)", runner_name)
+                        total_line = float(m.group(1)) if m else None
+                    best_by_side = _best_prices_per_side(runner.get("prices", []))
+                    for side, price in best_by_side.items():
+                        decimal_odds = price.get("decimal-odds") or price.get("odds")
+                        if decimal_odds is None:
+                            continue
+                        records.append(
+                            OddsRecord(
+                                provider=self.name,
+                                sport="baseball",
+                                league=league,
+                                event_name=str(event.get("name") or "Unknown event"),
+                                event_start=event.get("start"),
+                                market_name=market_name,
+                                market_type="two_way",
+                                selection_name=ou_name,
+                                selection_side=side,
+                                decimal_odds=float(decimal_odds),
+                                implied_probability=round(1 / float(decimal_odds), 6),
+                                currency=str(price.get("currency") or "GBP"),
+                                source_market_id=str(market.get("id")),
+                                source_event_id=str(event.get("id")),
+                                retrieved_at=retrieved_at,
+                                metadata={
+                                    "market_status": market.get("status"),
+                                    "available_amount": price.get("available-amount"),
+                                    "handicap": runner.get("handicap"),
+                                    "total_line": total_line,
+                                    "exchange_type": price.get("exchange-type"),
+                                    "last_price_update_time": runner.get("last-price-update-time"),
+                                },
+                            )
+                        )
+            return records
 
         if league == "mlb_spread":
             run_line_markets = [m for m in open_markets if _is_run_line_market(m)]
@@ -329,6 +457,164 @@ class MatchbookProvider(OddsProvider):
                         )
             return records
 
+        if league == "mls_totals":
+            totals_markets = [m for m in open_markets if _is_totals_market(m)]
+            self.debug(
+                f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
+                f"{len(totals_markets)} totals after filtering"
+            )
+            if not totals_markets and open_markets:
+                names = sorted({str(m.get("name") or "").lower().strip() for m in open_markets})
+                self.debug(
+                    f"{self.name}: event_id={event.get('id')} — no mls_totals match; "
+                    f"available market names: {names}"
+                )
+            for market in totals_markets:
+                market_name = str(market.get("name") or "Unknown market")
+                for runner in market.get("runners", []):
+                    runner_name = str(runner.get("name") or "").lower()
+                    if "over" in runner_name:
+                        ou_name = "over"
+                    elif "under" in runner_name:
+                        ou_name = "under"
+                    else:
+                        continue
+                    try:
+                        total_line = float(runner.get("handicap"))
+                    except (TypeError, ValueError):
+                        m = re.search(r"(\d+(?:\.\d+)?)", runner_name)
+                        total_line = float(m.group(1)) if m else None
+                    best_by_side = _best_prices_per_side(runner.get("prices", []))
+                    for side, price in best_by_side.items():
+                        decimal_odds = price.get("decimal-odds") or price.get("odds")
+                        if decimal_odds is None:
+                            continue
+                        records.append(
+                            OddsRecord(
+                                provider=self.name,
+                                sport="soccer",
+                                league=league,
+                                event_name=str(event.get("name") or "Unknown event"),
+                                event_start=event.get("start"),
+                                market_name=market_name,
+                                market_type="two_way",
+                                selection_name=ou_name,
+                                selection_side=side,
+                                decimal_odds=float(decimal_odds),
+                                implied_probability=round(1 / float(decimal_odds), 6),
+                                currency=str(price.get("currency") or "GBP"),
+                                source_market_id=str(market.get("id")),
+                                source_event_id=str(event.get("id")),
+                                retrieved_at=retrieved_at,
+                                metadata={
+                                    "market_status": market.get("status"),
+                                    "available_amount": price.get("available-amount"),
+                                    "handicap": runner.get("handicap"),
+                                    "total_line": total_line,
+                                    "exchange_type": price.get("exchange-type"),
+                                    "last_price_update_time": runner.get("last-price-update-time"),
+                                },
+                            )
+                        )
+            return records
+
+        if league == "mls_spread":
+            # MLS goal-line handicap.  Market name is "Handicap" (same as mlb_spread).
+            # Unlike MLB we accept ALL handicap lines (not just ±1.5) because MLS
+            # commonly trades 0.5, 1.0, 1.5, 2.0 simultaneously; aggregation groups
+            # records by spread value so each line becomes a separate game entry.
+            run_line_markets = [m for m in open_markets if _is_run_line_market(m)]
+            self.debug(
+                f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
+                f"{len(run_line_markets)} goal-line after filtering"
+            )
+            if not run_line_markets and open_markets:
+                names = sorted({str(m.get("name") or "").lower().strip() for m in open_markets})
+                self.debug(
+                    f"{self.name}: event_id={event.get('id')} — no mls_spread match; "
+                    f"available market names: {names}"
+                )
+            for market in run_line_markets:
+                market_name = str(market.get("name") or "Unknown market")
+                runners = market.get("runners", [])
+
+                for runner in runners:
+                    hcap = runner.get("handicap")
+                    back_prices = [p for p in runner.get("prices", []) if str(p.get("side") or "back") == "back"]
+                    best_back = max(
+                        (p.get("decimal-odds") or p.get("odds") for p in back_prices if p.get("decimal-odds") or p.get("odds")),
+                        default=None,
+                    )
+                    self.debug(
+                        f"{self.name}: event_id={event.get('id')} mls_spread runner={runner.get('name')!r} "
+                        f"handicap={hcap} best_back={best_back}"
+                    )
+
+                # Accept any runner with a non-zero handicap (all MLS goal-line variants).
+                spread_runners = [
+                    r for r in runners
+                    if _is_any_nonzero_handicap(r.get("handicap"))
+                ]
+                if not spread_runners:
+                    all_hcaps = [r.get("handicap") for r in runners]
+                    self.debug(
+                        f"{self.name}: event_id={event.get('id')} mls_spread — no nonzero-handicap runners; "
+                        f"handicaps present: {all_hcaps}"
+                    )
+                    continue
+
+                spread_value: float | None = None
+                spread_favourite: str | None = None
+                for runner in spread_runners:
+                    hcap = runner.get("handicap")
+                    if hcap is not None and spread_value is None:
+                        try:
+                            spread_value = abs(float(hcap))
+                        except (TypeError, ValueError):
+                            pass
+                    if spread_favourite is None and _runner_is_favourite(runner):
+                        spread_favourite = normalize_team_name(
+                            _strip_handicap_suffix(str(runner.get("name") or "")), league
+                        )
+
+                for runner in spread_runners:
+                    best_by_side = _best_prices_per_side(runner.get("prices", []))
+                    for side, price in best_by_side.items():
+                        decimal_odds = price.get("decimal-odds") or price.get("odds")
+                        if decimal_odds is None:
+                            continue
+                        records.append(
+                            OddsRecord(
+                                provider=self.name,
+                                sport="soccer",
+                                league=league,
+                                event_name=str(event.get("name") or "Unknown event"),
+                                event_start=event.get("start"),
+                                market_name=market_name,
+                                market_type="two_way",
+                                selection_name=normalize_team_name(
+                                    _strip_handicap_suffix(str(runner.get("name") or "Unknown selection")), league
+                                ),
+                                selection_side=side,
+                                decimal_odds=float(decimal_odds),
+                                implied_probability=round(1 / float(decimal_odds), 6),
+                                currency=str(price.get("currency") or "GBP"),
+                                source_market_id=str(market.get("id")),
+                                source_event_id=str(event.get("id")),
+                                retrieved_at=retrieved_at,
+                                metadata={
+                                    "market_status": market.get("status"),
+                                    "available_amount": price.get("available-amount"),
+                                    "handicap": runner.get("handicap"),
+                                    "spread": spread_value,
+                                    "spread_favourite": spread_favourite,
+                                    "exchange_type": price.get("exchange-type"),
+                                    "last_price_update_time": runner.get("last-price-update-time"),
+                                },
+                            )
+                        )
+            return records
+
         moneyline_markets = [m for m in open_markets if _is_moneyline_market(m)]
         self.debug(
             f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
@@ -340,7 +626,7 @@ class MatchbookProvider(OddsProvider):
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria", "laliga") else "two_way"
+            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria", "laliga", "mls") else "two_way"
             for runner in market.get("runners", []):
                 best_by_side = _best_prices_per_side(runner.get("prices", []))
                 for side, price in best_by_side.items():
@@ -394,6 +680,19 @@ _RUN_LINE_MARKET_NAMES = {
     "handicap",
 }
 
+_TOTALS_MARKET_NAMES = {
+    "total",
+    "total runs",
+    "total runs (incl. extra innings)",
+    "total (incl. extra innings)",
+    "over/under",
+    # Soccer / MLS goal totals
+    "total goals",
+    "total goals (incl. overtime)",
+    "match goals",
+    "over/under goals",
+}
+
 
 def _best_prices_per_side(prices: list[dict]) -> dict[str, dict]:
     """Return the single best price per side from a Matchbook runner's price ladder.
@@ -433,6 +732,11 @@ def _is_run_line_market(market: dict) -> bool:
     return name in _RUN_LINE_MARKET_NAMES
 
 
+def _is_totals_market(market: dict) -> bool:
+    name = str(market.get("name") or "").lower().strip()
+    return name in _TOTALS_MARKET_NAMES
+
+
 _HANDICAP_SUFFIX_RE = re.compile(r"\s*\(?[+-]?\d+(?:\.\d+)?\)?\s*$")
 
 # Standard MLB run line is always ±1.5. Filter out any alternative lines.
@@ -449,6 +753,20 @@ def _is_run_line_handicap(handicap: object) -> bool:
         return False
     try:
         return abs(abs(float(handicap)) - _MLB_RUN_LINE_VALUE) < 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_any_nonzero_handicap(handicap: object) -> bool:
+    """Return True if the runner has any non-zero handicap.
+
+    Used for MLS goal-line markets where all spread values (0.5, 1.0, 1.5, 2.0 …)
+    are valid — unlike MLB where only ±1.5 is the canonical run line.
+    """
+    if handicap is None:
+        return False
+    try:
+        return abs(float(handicap)) > 0.01
     except (TypeError, ValueError):
         return False
 
@@ -474,12 +792,16 @@ LEAGUE_SPORT_IDS = {
     "nba": 4,
     "mlb": 3,
     "mlb_spread": 3,  # Same sport ID as mlb (baseball); events are filtered by run-line market name
+    "mlb_totals": 3,  # Same sport ID (baseball); events are filtered by totals market name
     "nhl": 6,
     "ucl": 15,
     "epl": 15,  # Same sport ID as UCL (soccer)
     "uel": 15,  # Same sport ID (soccer)
     "seria": 15,  # Same sport ID (soccer)
     "laliga": 15,  # Same sport ID (soccer)
+    "mls": 15,       # Major League Soccer — same soccer sport ID
+    "mls_spread": 15,  # MLS goal-line handicap; filtered by run-line market name
+    "mls_totals": 15,  # MLS goal totals; filtered by totals market name
     "ipl": 110,  # Cricket — sport ID 110 covers all cricket; filtered by meta-tag below
 }
 
@@ -487,11 +809,15 @@ LEAGUE_TO_SPORT = {
     "nba": "basketball",
     "mlb": "baseball",
     "mlb_spread": "baseball",
+    "mlb_totals": "baseball",
     "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
     "uel": "soccer",
     "seria": "soccer",
     "laliga": "soccer",
+    "mls": "soccer",
+    "mls_spread": "soccer",
+    "mls_totals": "soccer",
     "ipl": "cricket",
 }
