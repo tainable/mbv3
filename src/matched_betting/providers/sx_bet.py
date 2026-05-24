@@ -821,6 +821,19 @@ class SxBetProvider(OddsProvider):
             # the same way it does for Polymarket records.
             spread_favourite = team_one if (spread is not None and spread <= 0) else team_two
 
+            # For MLS spread, reject integer handicaps (1.0, 2.0 …).  A whole-number
+            # Asian handicap can result in a push (money refunded), making it a
+            # three-outcome market — not genuinely two-way.  Polymarket only offers
+            # half-ball lines (0.5, 1.5, 2.5 …) so integer lines will never match.
+            if league == "mls_spread" and spread is not None:
+                val = abs(spread)
+                if abs(val - round(val)) < 0.1:  # integer or very close to integer
+                    self.debug(
+                        f"{self.name}: skipping mls_spread market {market.get('marketHash', 'unknown')} "
+                        f"— integer spread={spread} can push"
+                    )
+                    return [], []
+
         # In SX Bet's P2P model, percentageOdds is the maker's probability * 10^20.
         # The taker backing team_one is matched against makers betting on team_two,
         # so taker implied probability = 1 - (outcomeTwo.percentageOdds / scale),

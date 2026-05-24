@@ -520,9 +520,10 @@ class MatchbookProvider(OddsProvider):
 
         if league == "mls_spread":
             # MLS goal-line handicap.  Market name is "Handicap" (same as mlb_spread).
-            # Unlike MLB we accept ALL handicap lines (not just ±1.5) because MLS
-            # commonly trades 0.5, 1.0, 1.5, 2.0 simultaneously; aggregation groups
-            # records by spread value so each line becomes a separate game entry.
+            # Only accept HALF-BALL lines (0.5, 1.5, 2.5 …).  Integer lines (1.0,
+            # 2.0 …) can result in a push/refund, making them three-outcome markets.
+            # Polymarket only offers half-ball lines, so integer lines would never
+            # match a Polymarket counterpart and should not be treated as two-way.
             run_line_markets = [m for m in open_markets if _is_run_line_market(m)]
             self.debug(
                 f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
@@ -550,15 +551,15 @@ class MatchbookProvider(OddsProvider):
                         f"handicap={hcap} best_back={best_back}"
                     )
 
-                # Accept any runner with a non-zero handicap (all MLS goal-line variants).
+                # Only accept half-ball handicaps (0.5, 1.5, 2.5 …) — genuinely two-way.
                 spread_runners = [
                     r for r in runners
-                    if _is_any_nonzero_handicap(r.get("handicap"))
+                    if _is_halfball_handicap(r.get("handicap"))
                 ]
                 if not spread_runners:
                     all_hcaps = [r.get("handicap") for r in runners]
                     self.debug(
-                        f"{self.name}: event_id={event.get('id')} mls_spread — no nonzero-handicap runners; "
+                        f"{self.name}: event_id={event.get('id')} mls_spread — no half-ball runners; "
                         f"handicaps present: {all_hcaps}"
                     )
                     continue
@@ -767,6 +768,24 @@ def _is_any_nonzero_handicap(handicap: object) -> bool:
         return False
     try:
         return abs(float(handicap)) > 0.01
+    except (TypeError, ValueError):
+        return False
+
+
+def _is_halfball_handicap(handicap: object) -> bool:
+    """Return True only for half-ball (X.5) handicap values.
+
+    Half-ball spreads (0.5, 1.5, 2.5 …) are genuinely two-way: a push is
+    impossible because the margin of victory can never be exactly 0.5 goals.
+    Whole-number handicaps (1.0, 2.0 …) can result in a push/refund, making
+    them effectively three-outcome markets — unsuitable for two-way spread
+    comparison against Polymarket which only offers half-ball lines.
+    """
+    if handicap is None:
+        return False
+    try:
+        val = abs(float(handicap))
+        return val > 0.01 and abs(val - round(val)) > 0.4
     except (TypeError, ValueError):
         return False
 

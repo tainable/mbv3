@@ -195,6 +195,148 @@ def build_aggregated_games_payload(
                 payload.append(entry)
             continue  # skip normal two_way/three_way entry building
 
+        # MLB/MLS spread: one entry per (game, spread_line) pair.
+        # Without this split, a Matchbook -1.0 record and a Polymarket -1.5
+        # record for the same match would be merged into one entry, creating
+        # phantom cross-line arbs with inflated margins.
+        if event_group.league in ("mlb_spread", "mls_spread"):
+            home_team = event_group.home_team
+            away_team = event_group.away_team
+
+            def _norm_spread(raw_spread, raw_fav: str | None, _ht=home_team, _at=away_team, _lg=event_group.league) -> float | None:
+                if raw_spread is None:
+                    return None
+                try:
+                    val = abs(float(raw_spread))
+                except (TypeError, ValueError):
+                    return None
+                if raw_fav is None:
+                    return val
+                fav_n = normalize_team_name(str(raw_fav), _lg)
+                if _ht and fav_n == _ht:
+                    return -val
+                elif _at and fav_n == _at:
+                    return val
+                return val
+
+            # Group record indices by normalized spread value (home-team perspective).
+            spread_lines_to_indices: dict[float, list[int]] = {}
+            for index in indices:
+                meta = records[index].metadata or {}
+                norm = _norm_spread(meta.get("spread"), meta.get("spread_favourite"))
+                if norm is not None:
+                    spread_lines_to_indices.setdefault(norm, []).append(index)
+
+            _sp_team1 = _pretty_team(home_team)
+            _sp_team2 = _pretty_team(away_team)
+
+            for spread_val, line_indices in sorted(spread_lines_to_indices.items()):
+                # Retrieve spread_favourite label from the first record that has one.
+                _spread_favourite: str | None = None
+                for _idx in line_indices:
+                    _sf = (records[_idx].metadata or {}).get("spread_favourite")
+                    if _sf:
+                        _spread_favourite = _sf
+                        break
+
+                sp_entry: dict[str, Any] = {
+                    "team1": _sp_team1,
+                    "team2": _sp_team2,
+                    "date_time": event_group.event_start,
+                    "league": event_group.league,
+                    "sport": event_group.sport,
+                    "market_type": "two_way",
+                    "spread": spread_val,
+                    "spread_favourite": _spread_favourite,
+                    "polymarket_market_id": None,
+                    "smarkets_market_id": None,
+                    "matchbook_event_id": None,
+                    "sx_bet_market_hash": None,
+                    "polymarket_team1_back_odds": None,
+                    "polymarket_team1_lay_odds": None,
+                    "polymarket_team2_back_odds": None,
+                    "polymarket_team2_lay_odds": None,
+                    "matchbook_team1_back_odds": None,
+                    "matchbook_team1_lay_odds": None,
+                    "matchbook_team2_back_odds": None,
+                    "matchbook_team2_lay_odds": None,
+                    "smarkets_team1_back_odds": None,
+                    "smarkets_team1_lay_odds": None,
+                    "smarkets_team2_back_odds": None,
+                    "smarkets_team2_lay_odds": None,
+                    "sx_bet_team1_back_odds": None,
+                    "sx_bet_team1_lay_odds": None,
+                    "sx_bet_team2_back_odds": None,
+                    "sx_bet_team2_lay_odds": None,
+                }
+
+                best_sp: dict[tuple[str, str, str], tuple[int, OddsRecord]] = {}
+                for index in line_indices:
+                    record = records[index]
+                    sel = record.selection_name
+                    if home_team and sel == home_team:
+                        team_slot = "team1"
+                    elif away_team and sel == away_team:
+                        team_slot = "team2"
+                    else:
+                        continue
+                    side = record.selection_side.lower()
+                    key = (record.provider, team_slot, side)
+                    cur = best_sp.get(key)
+                    try:
+                        if cur is None:
+                            best_sp[key] = (index, record)
+                        elif side == "lay":
+                            if record.decimal_odds < cur[1].decimal_odds:
+                                best_sp[key] = (index, record)
+                        else:
+                            if record.decimal_odds > cur[1].decimal_odds:
+                                best_sp[key] = (index, record)
+                    except TypeError:
+                        best_sp[key] = (index, record)
+
+                for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet"):
+                    for team_slot in ("team1", "team2"):
+                        for side in ("back", "lay"):
+                            chosen = best_sp.get((provider_name, team_slot, side))
+                            if chosen is None:
+                                continue
+                            _, record = chosen
+                            odds_key = f"{provider_name}_{team_slot}_{side}_odds"
+                            avail_key = f"{provider_name}_{team_slot}_{side}_avail"
+                            if odds_key in sp_entry:
+                                sp_entry[odds_key] = record.decimal_odds
+                            sp_entry[avail_key] = _extract_available(record)
+
+                # Polymarket per-slot CLOB token IDs and market IDs.
+                for team_slot in ("team1", "team2"):
+                    for side in ("back", "lay"):
+                        key = ("polymarket", team_slot, side)
+                        if key in best_sp:
+                            _, record = best_sp[key]
+                            clob_token = (record.metadata or {}).get("clob_token_id")
+                            if clob_token:
+                                sp_entry[f"polymarket_{team_slot}_clob_token_id"] = clob_token
+                            sp_entry[f"polymarket_{team_slot}_market_id"] = record.source_market_id
+                            if sp_entry["polymarket_market_id"] is None:
+                                sp_entry["polymarket_market_id"] = record.source_market_id
+                            break
+
+                # Single market/event ID per non-Polymarket provider.
+                for provider_name, id_field, id_attr in (
+                    ("smarkets",  "smarkets_market_id",  "source_market_id"),
+                    ("matchbook", "matchbook_event_id",   "source_event_id"),
+                    ("sx_bet",    "sx_bet_market_hash",   "source_market_id"),
+                ):
+                    for key in best_sp:
+                        if key[0] == provider_name:
+                            _, record = best_sp[key]
+                            sp_entry[id_field] = getattr(record, id_attr)
+                            break
+
+                payload.append(sp_entry)
+            continue  # skip general two_way/three_way entry building
+
         team1 = _pretty_team(event_group.home_team)
         team2 = _pretty_team(event_group.away_team)
         market_types = {records[i].market_type for i in indices}
