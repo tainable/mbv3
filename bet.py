@@ -252,6 +252,24 @@ def pm_get_balance(settings) -> float | None:
         return None
 
 
+def _pm_confirmed_odds(client, token_id: str, timeout: float = 2.0) -> float | None:
+    """Query CLOB trades after a FOK fill to get the actual execution price."""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    address = client.signer.address()
+    while _time.monotonic() < deadline:
+        try:
+            trades = client.get_trades(TradeParams(maker_address=address)) or []
+            for t in trades:
+                if t.get("asset_id") == token_id:
+                    price = float(t.get("price", 0))
+                    return round(1.0 / price, 4) if price > 0 else None
+        except Exception:
+            pass
+        _time.sleep(0.5)
+    return None
+
+
 def _pm_best_decimal_odds(token_id: str, side: str) -> float | None:
     """Fetch the best available price for a token and return decimal odds (1/price)."""
     try:
@@ -266,6 +284,28 @@ def _pm_best_decimal_odds(token_id: str, side: str) -> float | None:
         return round(1.0 / best_price, 4) if best_price > 0 else None
     except Exception:
         return None
+
+
+def pm_check_liquidity(token_id: str, amount_usdc: float, side: str = "BUY") -> tuple[bool, float]:
+    """Return (ok, available_usdc) for this token's order book.
+
+    ok is True when resting order depth is sufficient to fill a market order
+    of amount_usdc.  Sums price * size across all ask (BUY) or bid (SELL)
+    entries to get the total USDC available in the book.
+
+    Returns (True, inf) on any API failure so a transient error does not
+    block an otherwise valid arb — the FOK will catch genuine shortfalls.
+    """
+    try:
+        r = _requests.get(f"{_PM_CLOB_HOST}/book", params={"token_id": token_id}, timeout=10)
+        if not r.ok:
+            return True, float("inf")
+        book = r.json()
+        entries = book.get("asks" if side == "BUY" else "bids", [])
+        available = sum(float(e["price"]) * float(e["size"]) for e in entries)
+        return available >= amount_usdc, round(available, 2)
+    except Exception:
+        return True, float("inf")
 
 
 def pm_place_bet(settings, token_id: str, amount: float, side: str = "BUY",
@@ -288,11 +328,13 @@ def pm_place_bet(settings, token_id: str, amount: float, side: str = "BUY",
             MarketOrderArgs(token_id=token_id, amount=amount, side=side)
         )
         resp = client.post_order(order, OrderType.FOK)
+        execution_odds = _pm_confirmed_odds(client, token_id)
         _log_bet({"platform": "Polymarket", "token_id": token_id,
                   "amount": amount, "side": side, "decimal_odds": decimal_odds,
-                  "response": resp})
+                  "execution_odds": execution_odds, "response": resp})
         return {"platform": "Polymarket", "ok": True, "response": resp,
-                "amount": amount, "side": side, "decimal_odds": decimal_odds}
+                "amount": amount, "side": side, "decimal_odds": decimal_odds,
+                "execution_odds": execution_odds}
     except Exception as e:
         return {"platform": "Polymarket", "ok": False, "error": str(e)}
 
@@ -433,7 +475,7 @@ def mb_get_balance(settings) -> float | None:
             f"{mb.base_url}/edge/rest/account",
             headers={"session-token": token, "Accept": "application/json"},
         )
-        return float(acc.get("balance") or 0)
+        return float(acc.get("free-funds") or acc.get("balance") or 0)
     except Exception:
         return None
 
@@ -587,14 +629,22 @@ _SX_FILL_TYPES = {
 }
 
 
-def _sx_get(url: str, params: dict | None = None) -> dict:
-    r = _requests.get(url, params=params, timeout=15)
+def _sx_proxies(settings) -> dict | None:
+    """Return explicit proxies dict for SX Bet HTTP calls, or None if not configured."""
+    proxy_url = getattr(settings, "vpn_proxy_url", None)
+    if proxy_url:
+        return {"https": proxy_url, "http": proxy_url}
+    return None
+
+
+def _sx_get(url: str, params: dict | None = None, proxies: dict | None = None) -> dict:
+    r = _requests.get(url, params=params, timeout=15, proxies=proxies)
     r.raise_for_status()
     return r.json()
 
 
-def _sx_post(url: str, payload: dict) -> dict:
-    r = _requests.post(url, json=payload, timeout=15)
+def _sx_post(url: str, payload: dict, proxies: dict | None = None) -> dict:
+    r = _requests.post(url, json=payload, timeout=15, proxies=proxies)
     if not r.ok:
         try:
             body = r.json()
@@ -610,11 +660,12 @@ _SX_RPC                 = "https://rpc-rollup.sx.technology"
 _SX_MAX_UINT256         = 2 ** 256 - 1
 
 
-def _sx_rpc(method: str, params: list) -> object:
+def _sx_rpc(method: str, params: list, proxies: dict | None = None) -> object:
     r = _requests.post(
         _SX_RPC,
         json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
         timeout=15,
+        proxies=proxies,
     )
     r.raise_for_status()
     result = r.json()
@@ -623,10 +674,10 @@ def _sx_rpc(method: str, params: list) -> object:
     return result["result"]
 
 
-def _sx_metadata(base_url: str) -> tuple[str, str, int, str]:
+def _sx_metadata(base_url: str, proxies: dict | None = None) -> tuple[str, str, int, str]:
     """Returns (executor_address, fill_hasher_address, chain_id, domain_version)."""
     try:
-        raw  = _sx_get(f"{base_url}/metadata")
+        raw  = _sx_get(f"{base_url}/metadata", proxies=proxies)
         data = raw.get("data", {})
         executor       = data.get("executorAddress") or data.get("executor")
         fill_hasher    = data.get("EIP712FillHasher") or data.get("fillHasher")
@@ -639,10 +690,12 @@ def _sx_metadata(base_url: str) -> tuple[str, str, int, str]:
     return _SX_DEFAULT_EXECUTOR, _SX_DEFAULT_FILL_HASHER, _SX_CHAIN_ID, "6.0"
 
 
-def _sx_derive_ladder(base_url: str, market_hash: str, base_token: str) -> list[int]:
+def _sx_derive_ladder(base_url: str, market_hash: str, base_token: str,
+                      proxies: dict | None = None) -> list[int]:
     try:
         raw    = _sx_get(f"{base_url}/orders",
-                         params={"marketHashes": market_hash, "baseToken": base_token})
+                         params={"marketHashes": market_hash, "baseToken": base_token},
+                         proxies=proxies)
         orders = raw.get("data", []) or []
         return sorted({int(o["percentageOdds"]) for o in orders if o.get("percentageOdds")})
     except Exception:
@@ -809,8 +862,9 @@ def sx_status(settings) -> dict:
         result["address"] = wallet
         base_url      = settings.sx_bet.base_url
         base_token    = settings.sx_bet.base_token
+        _prx          = _sx_proxies(settings)
 
-        raw    = _sx_get(f"{base_url}/orders", params={"maker": wallet})
+        raw    = _sx_get(f"{base_url}/orders", params={"maker": wallet}, proxies=_prx)
         orders = raw.get("data", []) or []
         result["pending_orders"] = len(orders)
         result["orders"] = [
@@ -839,12 +893,42 @@ def sx_get_balance(settings) -> float | None:
         from eth_account import Account
         wallet     = Account.from_key(pk).address
         base_token = settings.sx_bet.base_token
+        _prx       = _sx_proxies(settings)
         # ERC-20 balanceOf(address) — selector 0x70a08231
         data = "0x70a08231" + "000000000000000000000000" + wallet.lower().replace("0x", "")
-        raw  = _sx_rpc("eth_call", [{"to": base_token, "data": data}, "latest"])
+        raw  = _sx_rpc("eth_call", [{"to": base_token, "data": data}, "latest"], proxies=_prx)
         return round(int(raw, 16) / _SX_USDC_DECIMALS, 2)
     except Exception:
         return None
+
+
+def _sx_confirmed_odds(base_url: str, wallet: str, market_hash: str,
+                       timeout: float = 2.0,
+                       proxies: dict | None = None) -> float | None:
+    """Query /trades after a taker fill to get the actual execution odds."""
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        try:
+            r = _requests.get(
+                f"{base_url}/trades",
+                params={"bettor": wallet, "pageSize": 10},
+                timeout=5,
+                proxies=proxies,
+            )
+            if r.ok:
+                trades_data = r.json().get("data", {}) or {}
+                for t in trades_data.get("trades", []) or []:
+                    if (t.get("marketHash") == market_hash
+                            and t.get("tradeStatus") == "SUCCESS"):
+                        pct_raw = t.get("odds")
+                        if pct_raw:
+                            pct = int(pct_raw) / _SX_ODDS_SCALE
+                            return round(1.0 / pct, 4) if 0 < pct < 1 else None
+        except Exception:
+            pass
+        _time.sleep(0.5)
+    return None
 
 
 def sx_place_bet(settings, market_hash: str, amount: float,
@@ -857,10 +941,12 @@ def sx_place_bet(settings, market_hash: str, amount: float,
         from eth_account import Account
         base_url        = settings.sx_bet.base_url
         base_token      = settings.sx_bet.base_token
-        executor, fill_hasher, chain_id, domain_version = _sx_metadata(base_url)
+        _prx            = _sx_proxies(settings)
+        executor, fill_hasher, chain_id, domain_version = _sx_metadata(base_url, proxies=_prx)
 
         odds_raw  = _sx_get(f"{base_url}/orders/odds/best",
-                            params={"marketHashes": market_hash, "baseToken": base_token})
+                            params={"marketHashes": market_hash, "baseToken": base_token},
+                            proxies=_prx)
         best_list = odds_raw.get("data", {}).get("bestOdds", []) or []
         if not best_list:
             return {"platform": "SX Bet", "ok": False, "error": "No live orders for this market"}
@@ -902,16 +988,29 @@ def sx_place_bet(settings, market_hash: str, amount: float,
                 "takerSig":                 sig,
                 "message":                  "N/A",
             }
-            resp = _sx_post(f"{base_url}/orders/fill/v2", payload)
+            resp = _sx_post(f"{base_url}/orders/fill/v2", payload, proxies=_prx)
+            execution_odds = None
+            try:
+                avg_raw = (resp.get("data") or {}).get("averageOdds")
+                if avg_raw:
+                    pct = int(avg_raw) / _SX_ODDS_SCALE
+                    execution_odds = round(1.0 / pct, 4) if 0 < pct < 1 else None
+            except Exception:
+                pass
+            if execution_odds is None:
+                execution_odds = _sx_confirmed_odds(
+                    base_url, wallet, market_hash, proxies=_prx
+                )
             _log_bet({"platform": "SX Bet", "market_hash": market_hash,
                       "amount": amount, "outcome": outcome, "decimal_odds": decimal,
-                      "take": True, "response": resp})
+                      "execution_odds": execution_odds, "take": True, "response": resp})
             return {"platform": "SX Bet", "ok": True, "response": resp,
-                    "amount": amount, "decimal_odds": decimal}
+                    "amount": amount, "decimal_odds": decimal,
+                    "execution_odds": execution_odds}
 
         else:
             # Post a new maker order slightly inside the current best price.
-            ladder   = _sx_derive_ladder(base_url, market_hash, base_token)
+            ladder   = _sx_derive_ladder(base_url, market_hash, base_token, proxies=_prx)
             raw      = int((1 - 1.0 / (decimal * 0.99)) * _SX_ODDS_SCALE)
             pct_odds = min(ladder, key=lambda v: abs(v - raw)) if ladder else raw
             mp       = pct_odds / _SX_ODDS_SCALE
@@ -925,7 +1024,7 @@ def sx_place_bet(settings, market_hash: str, amount: float,
                         "market_hash": market_hash, "amount": amount,
                         "decimal_odds": display, "take": False}
 
-            resp       = _sx_post(f"{base_url}/orders/new", {"orders": [order]})
+            resp       = _sx_post(f"{base_url}/orders/new", {"orders": [order]}, proxies=_prx)
             data       = resp.get("data") or []
             order_hash = data[0].get("orderHash") if isinstance(data, list) and data else None
             _log_bet({"platform": "SX Bet", "market_hash": market_hash,
@@ -943,9 +1042,11 @@ def sx_cancel(settings, order_hash: str) -> None:
     pk = os.getenv("SX_BET_PRIVATE_KEY") or settings.polymarket.private_key
     from eth_account import Account
     maker = Account.from_key(pk).address
+    _prx  = _sx_proxies(settings)
     resp  = _sx_post(
         f"{settings.sx_bet.base_url}/orders/cancel/v2",
         {"orderHashes": [order_hash], "maker": maker},
+        proxies=_prx,
     )
     print(f"  {resp}")
 
@@ -967,8 +1068,9 @@ def sx_approve(settings) -> None:
     account    = Account.from_key(pk)
     base_url   = settings.sx_bet.base_url
     base_token = settings.sx_bet.base_token   # USDC on SX Network
+    _prx       = _sx_proxies(settings)
 
-    meta  = _sx_get(f"{base_url}/metadata").get("data", {})
+    meta  = _sx_get(f"{base_url}/metadata", proxies=_prx).get("data", {})
     proxy = meta.get("TokenTransferProxy")
     if not proxy:
         raise RuntimeError("TokenTransferProxy not in /metadata response")
@@ -980,7 +1082,8 @@ def sx_approve(settings) -> None:
     # Check if the token supports EIP-2612 by calling DOMAIN_SEPARATOR()
     domain_sep: bytes | None = None
     try:
-        raw_ds = _sx_rpc("eth_call", [{"to": base_token, "data": "0x3644e515"}, "latest"])
+        raw_ds = _sx_rpc("eth_call", [{"to": base_token, "data": "0x3644e515"}, "latest"],
+                         proxies=_prx)
         if len(raw_ds) >= 66:   # "0x" + 64 hex chars = 32 bytes
             domain_sep = bytes.fromhex(raw_ds.replace("0x", ""))
             if int.from_bytes(domain_sep, "big") == 0:
@@ -990,19 +1093,21 @@ def sx_approve(settings) -> None:
 
     if domain_sep:
         print(f"  EIP-2612 Permit supported  (DOMAIN_SEPARATOR present)")
-        _sx_permit_approve(pk, account, base_url, base_token, proxy, domain_sep)
+        _sx_permit_approve(pk, account, base_url, base_token, proxy, domain_sep, proxies=_prx)
     else:
         print("  EIP-2612 Permit not available — using on-chain approve()")
-        _sx_onchain_approve(pk, account, base_token, proxy)
+        _sx_onchain_approve(pk, account, base_token, proxy, proxies=_prx)
 
 
 def _sx_permit_approve(pk: str, account, base_url: str, base_token: str,
-                       proxy: str, domain_sep: bytes) -> None:
+                       proxy: str, domain_sep: bytes,
+                       proxies: dict | None = None) -> None:
     """Sign an EIP-2612 Permit using the token's own DOMAIN_SEPARATOR."""
     from eth_hash.auto import keccak
 
     nonces_call = "0x7ecebe00" + "000000000000000000000000" + account.address.lower().replace("0x", "")
-    raw_nonce   = _sx_rpc("eth_call", [{"to": base_token, "data": nonces_call}, "latest"])
+    raw_nonce   = _sx_rpc("eth_call", [{"to": base_token, "data": nonces_call}, "latest"],
+                          proxies=proxies)
     nonce       = int(raw_nonce, 16)
     deadline    = int(time.time()) + 7200
 
@@ -1038,15 +1143,16 @@ def _sx_permit_approve(pk: str, account, base_url: str, base_token: str,
         "deadline":     deadline,
         "signature":    sig_hex,
     }
-    resp = _sx_post(f"{base_url}/orders/approve", payload)
-    print(f"  ✓ Permit approved: {resp}")
+    resp = _sx_post(f"{base_url}/orders/approve", payload, proxies=proxies)
+    print(f"  Permit approved: {resp}")
 
 
-def _sx_onchain_approve(pk: str, account, base_token: str, proxy: str) -> None:
+def _sx_onchain_approve(pk: str, account, base_token: str, proxy: str,
+                        proxies: dict | None = None) -> None:
     """Submit a regular ERC-20 approve() transaction on SX Network."""
     from eth_account import Account
 
-    native = int(_sx_rpc("eth_getBalance", [account.address, "latest"]), 16)
+    native = int(_sx_rpc("eth_getBalance", [account.address, "latest"], proxies=proxies), 16)
     print(f"  Native balance: {native / 1e18:.6f} SX")
     if native == 0:
         raise RuntimeError(
@@ -1055,21 +1161,23 @@ def _sx_onchain_approve(pk: str, account, base_token: str, proxy: str) -> None:
             "to trigger approval automatically."
         )
 
-    nonce     = int(_sx_rpc("eth_getTransactionCount", [account.address, "latest"]), 16)
-    gas_price = int(int(_sx_rpc("eth_gasPrice", [], ), 16) * 1.2)
+    nonce     = int(_sx_rpc("eth_getTransactionCount", [account.address, "latest"],
+                            proxies=proxies), 16)
+    gas_price = int(int(_sx_rpc("eth_gasPrice", [], proxies=proxies), 16) * 1.2)
     proxy_pad = b"\x00" * 12 + bytes.fromhex(proxy.lower().replace("0x", ""))
     data      = "0x" + (bytes.fromhex("095ea7b3") + proxy_pad + _SX_MAX_UINT256.to_bytes(32, "big")).hex()
 
     tx        = {"nonce": nonce, "gasPrice": gas_price, "gas": 80_000,
                  "to": base_token, "value": 0, "data": data, "chainId": _SX_CHAIN_ID}
     signed_tx = Account.sign_transaction(tx, pk)
-    tx_hash   = _sx_rpc("eth_sendRawTransaction", ["0x" + signed_tx.raw_transaction.hex()])
+    tx_hash   = _sx_rpc("eth_sendRawTransaction",
+                        ["0x" + signed_tx.raw_transaction.hex()], proxies=proxies)
     print(f"  tx: {tx_hash}  waiting", end="", flush=True)
     for _ in range(90):
-        receipt = _sx_rpc("eth_getTransactionReceipt", [tx_hash])
+        receipt = _sx_rpc("eth_getTransactionReceipt", [tx_hash], proxies=proxies)
         if receipt:
             if int(receipt.get("status", "0x0"), 16) == 1:
-                print(" ✓")
+                print(" OK")
                 return
             raise RuntimeError(f"Transaction {tx_hash} reverted")
         time.sleep(1)
@@ -1204,6 +1312,22 @@ def main() -> None:
 
     args     = p.parse_args()
     settings = load_settings(_ROOT)
+
+    # ── Proxy setup (standalone use) ─────────────────────────────────────
+    # When bet.py is run directly (not imported via scan.py), scan.py's proxy
+    # patching has not run yet.  py_clob_client_v2 uses an httpx.Client singleton
+    # created at import time — immune to HTTPS_PROXY env vars — so we patch it here.
+    _proxy = settings.vpn_proxy_url
+    if _proxy:
+        os.environ.setdefault("HTTP_PROXY",  _proxy)
+        os.environ.setdefault("HTTPS_PROXY", _proxy)
+        _hx_proxy = _proxy.replace("socks5h://", "socks5://")
+        try:
+            import httpx as _httpx
+            import py_clob_client_v2.http_helpers.helpers as _pm_helpers
+            _pm_helpers._http_client = _httpx.Client(http2=True, proxy=_hx_proxy)
+        except Exception:
+            pass
 
     # ── Status ───────────────────────────────────────────────────────────
     if args.status:

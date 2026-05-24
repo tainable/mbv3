@@ -10,14 +10,332 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent
-_PY   = sys.executable
+_ROOT    = Path(__file__).resolve().parent
+_PY      = sys.executable
+_PYTHONW = Path(sys.executable).parent / "pythonw.exe"
+
+# ─── VPN bridge ───────────────────────────────────────────────────────────────
+
+_VPN_BRIDGE_HOST = "127.0.0.1"
+_VPN_BRIDGE_PORT = 1081
+_BRIDGE_SCRIPT   = _ROOT / "vpn_proxy_bridge.py"
+_VPN_PROXY_HX    = f"socks5://127.0.0.1:{_VPN_BRIDGE_PORT}"  # httpx uses socks5://, not socks5h://
+_VPN_BRIDGE_LOG  = _ROOT / "vpn_bridge.log"
+_PM_CLOB_HOST    = "https://clob.polymarket.com"
+_SX_BET_HOST     = "https://api.sx.bet"
+_IP_ECHO_URL     = "https://ifconfig.me/ip"
+
+
+def _vpn_bridge_running() -> bool:
+    """Return True if the SOCKS5 bridge is listening on 127.0.0.1:1081."""
+    try:
+        s = socket.create_connection((_VPN_BRIDGE_HOST, _VPN_BRIDGE_PORT), timeout=1)
+        s.close()
+        return True
+    except OSError:
+        return False
+
+
+def _mullvad_connected() -> bool:
+    """Return True if Mullvad reports a Connected state (fast local CLI call)."""
+    try:
+        r = subprocess.run(
+            ["mullvad", "status"],
+            capture_output=True, text=True, timeout=3,
+        )
+        return "Connected" in (r.stdout + r.stderr)
+    except Exception:
+        return False  # can't tell — be pessimistic
+
+
+def _vpn_bridge_status() -> str:
+    """
+    Three-state status shown in the menu header:
+      UP           bridge listening + Mullvad connected   → traffic routes through VPN
+      UP [no VPN]  bridge listening + Mullvad disconnected → traffic goes DIRECT (bad)
+      DOWN         bridge not listening
+    """
+    if not _vpn_bridge_running():
+        return "DOWN"
+    return "UP" if _mullvad_connected() else "UP  [Mullvad disconnected — traffic going DIRECT]"
+
+
+def _probe_pm_trading() -> str:
+    """
+    POST /order with no credentials through the bridge.  Polymarket geo-checks
+    the IP before it ever validates auth, so the response tells us about routing:
+      'ok'      HTTP 401 — IP is allowed for trading (auth rejected as expected)
+      'blocked' HTTP 403 — IP is geoblocked for trading (routing direct or bad relay)
+      'error'   could not reach the endpoint
+    """
+    try:
+        import httpx as _httpx
+        with _httpx.Client(proxy=_VPN_PROXY_HX, timeout=8) as _c:
+            _r = _c.post(f"{_PM_CLOB_HOST}/order", content=b"{}")
+        return "blocked" if _r.status_code == 403 else "ok"
+    except Exception:
+        return "error"
+
+
+def _probe_sx_trading() -> str:
+    """
+    POST /orders/fill/v2 with empty body through the bridge.  SX Bet applies
+    IP-level trading restrictions before validating the payload:
+      'ok'      non-403 (400 expected for empty body — IP is allowed)
+      'blocked' HTTP 403 — IP is geoblocked for trading
+      'error'   could not reach the endpoint
+    """
+    try:
+        import httpx as _httpx
+        with _httpx.Client(proxy=_VPN_PROXY_HX, timeout=8) as _c:
+            _r = _c.post(f"{_SX_BET_HOST}/orders/fill/v2", content=b"{}")
+        return "blocked" if _r.status_code == 403 else "ok"
+    except Exception:
+        return "error"
+
+
+def _kill_bridge() -> None:
+    """Kill whatever process is listening on the bridge port."""
+    try:
+        r = subprocess.run(
+            ["netstat", "-ano"],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in r.stdout.splitlines():
+            if f"127.0.0.1:{_VPN_BRIDGE_PORT}" in line and "LISTENING" in line:
+                pid = line.strip().split()[-1]
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", pid],
+                    capture_output=True, timeout=5,
+                )
+                time.sleep(0.5)
+                break
+    except Exception:
+        pass
+
+
+def _start_bridge() -> bool:
+    """Launch vpn_proxy_bridge.py via pythonw.exe.  Returns True if port becomes reachable."""
+    try:
+        subprocess.Popen(
+            [str(_PYTHONW), str(_BRIDGE_SCRIPT)],
+            cwd=_ROOT,
+            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
+        )
+    except Exception as exc:
+        print(f"  ERROR launching bridge: {exc}")
+        return False
+    time.sleep(2)
+    return _vpn_bridge_running()
+
+
+def _ensure_vpn_bridge() -> None:
+    """
+    Guarantee the bridge is running AND routing through Mullvad before the menu appears.
+
+    The three cases it handles:
+      1. Bridge not running            → start it, then probe.
+      2. Bridge running, routing OK    → silent return (already warm).
+      3. Bridge running but DIRECT     → stale pre-VPN process; kill + restart + re-probe.
+
+    A bridge started before Mullvad connects has no tunnel to route through and will
+    silently pass port-1081 checks while actually sending traffic via the Azure public IP.
+    """
+    bridge_was_running = _vpn_bridge_running()
+
+    # ── Step 1: make sure something is listening ──────────────────────────
+    if not bridge_was_running:
+        print()
+        print("  VPN bridge not running -- starting vpn_proxy_bridge.py ...")
+        if not _start_bridge():
+            print("  WARNING: bridge launched but port 1081 is not yet reachable.")
+            print("           Ensure Mullvad VPN is connected, then press [v] to retry.")
+            time.sleep(2)
+            return
+        print("  Bridge started.")
+
+    # ── Step 2: probe the trading endpoint to confirm VPN routing ─────────
+    probe = _probe_pm_trading()
+
+    if probe == "ok":
+        # Routing confirmed.  Only print if we just started the bridge.
+        if not bridge_was_running:
+            print("  VPN routing confirmed (trading endpoint reachable).")
+            time.sleep(1)
+        return
+
+    if probe == "blocked":
+        if bridge_was_running:
+            # Pre-existing bridge is routing direct — started before Mullvad connected.
+            print()
+            print("  Bridge is UP but traffic is routing DIRECT (Mullvad was not connected).")
+            print("  Restarting bridge inside the active VPN tunnel ...")
+        else:
+            print("  Bridge started but traffic is still routing DIRECT.")
+        _kill_bridge()
+        time.sleep(1)
+        if not _start_bridge():
+            print("  ERROR: could not restart bridge.")
+            time.sleep(2)
+            return
+        # Re-probe after restart
+        probe2 = _probe_pm_trading()
+        if probe2 == "ok":
+            print("  VPN routing confirmed — bridge restarted inside tunnel.")
+        else:
+            print("  WARNING: still geoblocked after restart.")
+            print("           Ensure Mullvad is connected, then press [v] -> [1] to diagnose.")
+        time.sleep(2)
+
+    elif probe == "error":
+        if not bridge_was_running:
+            print("  Bridge started but could not reach Polymarket through it.")
+            print("  Ensure Mullvad VPN is connected.")
+            time.sleep(2)
+
+
+def _check_routing() -> None:
+    """
+    Verify that both Polymarket and SX Bet route correctly through the VPN bridge.
+
+    Both platforms apply IP-level trading restrictions independently — the current
+    relay may be clear for one and blocked for the other.  This check tests them
+    together so you can confirm a relay switch fixed both before restarting the daemon.
+
+    For each platform:
+      OK      non-403 response — IP is allowed for trading
+      BLOCKED HTTP 403         — IP is geoblocked; switch relay + restart bridge
+      ERROR   request failed   — bridge or network issue
+    """
+    _header("Route Check  --  Polymarket + SX Bet")
+
+    if not _vpn_bridge_running():
+        print("  Bridge is DOWN.  Start it first with [v].")
+        _pause()
+        return
+
+    print("  Bridge : UP on 127.0.0.1:1081")
+    print()
+
+    try:
+        import httpx as _httpx
+    except ImportError:
+        print("  ERROR: httpx is not installed (pip install httpx[socks]).")
+        _pause()
+        return
+
+    # ── Connectivity sanity check (Polymarket GET / is a lightweight probe) ──
+    print("  Connectivity (GET clob.polymarket.com) ... ", end="", flush=True)
+    try:
+        with _httpx.Client(proxy=_VPN_PROXY_HX, timeout=10) as _c:
+            _c.get(_PM_CLOB_HOST)
+        print("OK")
+    except Exception as _exc:
+        print(f"FAILED  ({_exc})")
+        print()
+        print("  Possible causes:")
+        print("    - Mullvad VPN is not connected")
+        print("    - Bridge process started but is not forwarding yet")
+        _pause()
+        return
+
+    # ── Exit IP (fetched once, shared for both platform checks) ──────────
+    print("  Exit IP (via bridge) ................. ", end="", flush=True)
+    _exit_ip = "(unknown)"
+    try:
+        with _httpx.Client(proxy=_VPN_PROXY_HX, timeout=10) as _c:
+            _exit_ip = _c.get(_IP_ECHO_URL, headers={"User-Agent": "curl/8.0"}).text.strip()
+        print(_exit_ip)
+    except Exception as _exc:
+        print(f"could not fetch  ({_exc})")
+
+    print()
+
+    # ── Polymarket trading check ─────────────────────────────────────────
+    # POST /order with no auth — Polymarket geo-checks before auth, so:
+    #   401  IP allowed (auth rejected as expected)
+    #   403  IP blocked for trading
+    print("  Polymarket  POST /order .............. ", end="", flush=True)
+    _pm_ok = False
+    try:
+        with _httpx.Client(proxy=_VPN_PROXY_HX, timeout=10) as _c:
+            _pr = _c.post(f"{_PM_CLOB_HOST}/order", content=b"{}")
+        if _pr.status_code == 403:
+            try:
+                _err = _pr.json().get("error", _pr.text[:80])
+            except Exception:
+                _err = _pr.text[:80]
+            print(f"BLOCKED  (HTTP 403)")
+            print(f"    {_err}")
+        else:
+            print(f"OK  (HTTP {_pr.status_code})")
+            _pm_ok = True
+    except Exception as _exc:
+        print(f"ERROR  ({_exc})")
+
+    # ── SX Bet trading check ─────────────────────────────────────────────
+    # POST /orders/fill/v2 with empty body — SX Bet checks IP before payload:
+    #   400  IP allowed (bad payload, but not geo-blocked)
+    #   403  IP blocked for trading
+    print("  SX Bet      POST /orders/fill/v2 .... ", end="", flush=True)
+    _sx_ok = False
+    try:
+        with _httpx.Client(proxy=_VPN_PROXY_HX, timeout=10) as _c:
+            _sr = _c.post(f"{_SX_BET_HOST}/orders/fill/v2", content=b"{}")
+        if _sr.status_code == 403:
+            try:
+                _err = _sr.json().get("message", _sr.text[:80])
+            except Exception:
+                _err = _sr.text[:80]
+            print(f"BLOCKED  (HTTP 403)")
+            print(f"    {_err}")
+        else:
+            print(f"OK  (HTTP {_sr.status_code})")
+            _sx_ok = True
+    except Exception as _exc:
+        print(f"ERROR  ({_exc})")
+
+    # ── Summary ──────────────────────────────────────────────────────────
+    print()
+    if _pm_ok and _sx_ok:
+        print(f"  PASS  Exit IP {_exit_ip} is clear for both platforms.")
+        print("  You can restart the daemon now.")
+    else:
+        blocked = []
+        if not _pm_ok:
+            blocked.append("Polymarket")
+        if not _sx_ok:
+            blocked.append("SX Bet")
+        print(f"  FAIL  Exit IP {_exit_ip} is blocked for: {', '.join(blocked)}")
+        print()
+        print("  Switch to a different Mullvad relay, restart the bridge ([2] Restart),")
+        print("  then re-run this check until both show OK.")
+
+    # ── Recent bridge-log entries ────────────────────────────────────────
+    print()
+    if _VPN_BRIDGE_LOG.exists():
+        try:
+            _all = _VPN_BRIDGE_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+            _pm_lines = [l for l in _all if "clob.polymarket.com" in l][-3:]
+            _sx_lines = [l for l in _all if "api.sx.bet" in l][-3:]
+            if _pm_lines or _sx_lines:
+                print("  Recent bridge-log entries:")
+                for _l in _pm_lines:
+                    print(f"    {_l}")
+                for _l in _sx_lines:
+                    print(f"    {_l}")
+        except Exception:
+            pass
+
+    _pause()
+
 
 # ─── Terminal helpers ─────────────────────────────────────────────────────────
 
@@ -103,24 +421,24 @@ def _run(cmd: list[str]) -> None:
 
 # ─── Persistent config ────────────────────────────────────────────────────────
 
-_ALL_LEAGUES   = ["nba", "mlb", "mlb_spread", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga"]
+_ALL_LEAGUES   = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga"]
 _ALL_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro", "smarkets"]
 
 _cfg: dict = {
     "leagues":          list(_ALL_LEAGUES),
     "providers":        ["matchbook", "polymarket", "sx_bet"],
-    "min_profit":       0.0,
+    "min_profit":       0.2,
     "budget":           10.0,
     "debug":            False,
     "show_odds":        False,
     "auto_bet":         False,
     "dry_run":          False,
-    "scan_interval":    300,
+    "scan_interval":    600,
     "max_runtime":      0,   # 0 = unlimited
     "skip_imminent":    True,
     "imminent_minutes": 10,
     # Daemon (watch_bet.py) settings
-    "daemon_interval":      300,   # seconds between scan.py runs
+    "daemon_interval":      600,   # seconds between scan.py runs
     "daemon_ids_refresh":   360,   # minutes between ids.py re-runs
     "daemon_scan_timeout":  600,   # kill scan.py after N seconds
     "daemon_ids_timeout":   600,   # kill ids.py after N seconds
@@ -406,6 +724,7 @@ def run_portfolio() -> None:
         print("  [6]  Cancel Matchbook offer")
         print("  [7]  Cancel Polymarket order(s)")
         print("  [8]  Sell Polymarket position")
+        print("  [a]  Redeem Polymarket wins    — collect pUSD from resolved markets")
         print("  [9]  Cancel SX Bet order")
         print()
         print("  [0]  Back")
@@ -466,6 +785,18 @@ def run_portfolio() -> None:
                         cmd.append("--dry-run")
                     _run(cmd)
                     _pause()
+        elif c == "a":
+            _header("Redeem Polymarket wins")
+            print("  Checks all your Polymarket positions for resolved markets and redeems")
+            print("  any winning tokens — converting them back to pUSD in your wallet.")
+            print("  Each market requires one on-chain transaction (~0.001 MATIC gas).")
+            print()
+            dry = _ask_yn("Dry run first (preview without submitting)?", default=True)
+            cmd = [_PY, "portfolio.py", "--redeem-pm"]
+            if dry:
+                cmd.append("--dry-run")
+            _run(cmd)
+            _pause()
         elif c == "9":
             _header("Cancel SX Bet order")
             print("  Run  python portfolio.py --sx-bet  to see order hashes.")
@@ -481,8 +812,10 @@ def run_portfolio() -> None:
 def run_polymarket_setup() -> None:
     while True:
         _header("Polymarket Setup")
-        print("  [1]  Approve USDC       — one-time on-chain approval (3 contracts)")
-        print("  [2]  Check wallet       — view balance & allowance status")
+        print("  [1]  Check wallet       — view pUSD / USDC / USDC.e balances & allowances")
+        print("  [2]  Wrap USDC (native) — convert native USDC → pUSD  (Polygon Circle issuance)")
+        print("  [3]  Wrap USDC.e        — convert USDC.e → pUSD  (legacy bridged)")
+        print("  [4]  Approve pUSD       — one-time on-chain approval for V2 exchange (3 contracts)")
         print()
         print("  [0]  Back")
         print()
@@ -490,7 +823,37 @@ def run_polymarket_setup() -> None:
         if c == "0":
             break
         elif c == "1":
-            _header("Approve USDC")
+            _run([_PY, "polymarket_bet.py", "--check"])
+            _pause()
+        elif c in ("2", "3"):
+            native = c == "2"
+            label  = "native USDC" if native else "USDC.e"
+            _header(f"Wrap {label} → pUSD")
+            print(f"  Converts {label} to pUSD 1:1 via Polymarket's CollateralOnramp.")
+            print("  You need a small amount of MATIC in your wallet for gas.")
+            print()
+            raw = _ask("Amount to wrap (USDC)", "")
+            if not raw.strip():
+                continue
+            try:
+                amount = float(raw.strip())
+            except ValueError:
+                print("  Invalid amount.")
+                _pause()
+                continue
+            if amount <= 0:
+                print("  Amount must be positive.")
+                _pause()
+                continue
+            print()
+            if _ask_yn(f"Wrap {amount:.2f} {label} → pUSD?", default=False):
+                cmd = [_PY, "polymarket_bet.py", "--wrap", str(amount)]
+                if native:
+                    cmd.append("--wrap-native")
+                _run(cmd)
+                _pause()
+        elif c == "4":
+            _header("Approve pUSD")
             print("  This sends 3 on-chain transactions on Polygon.")
             print("  You need a small amount of MATIC for gas (~0.01 MATIC).")
             print("  Only required once per wallet.")
@@ -498,9 +861,6 @@ def run_polymarket_setup() -> None:
             if _ask_yn("Proceed with approval?", default=False):
                 _run([_PY, "polymarket_bet.py", "--approve"])
                 _pause()
-        elif c == "2":
-            _run([_PY, "polymarket_bet.py", "--check"])
-            _pause()
 
 
 # ─── Daemon (watch_bet.py) ────────────────────────────────────────────────────
@@ -534,7 +894,7 @@ def _heartbeat_summary() -> str:
 def _build_daemon_cmd() -> list[str]:
     cmd = [
         _PY, "watch_bet.py",
-        "--budget",               str(_cfg["budget"]),
+        "--budget",               "1000",  # non-binding; Kelly + MAX_STAKE_USDC (.env) is the real cap
         "--min-profit",           str(_cfg["min_profit"]),
         "--interval",             str(_cfg["daemon_interval"]),
         "--ids-refresh-interval", str(_cfg["daemon_ids_refresh"]),
@@ -558,7 +918,7 @@ def _build_daemon_cmd() -> list[str]:
 def _daemon_summary() -> None:
     print(f"  Leagues      : {_ls()}")
     print(f"  Providers    : {_ps()}")
-    print(f"  Budget       : ${_cfg['budget']:.2f} USDC  |  Min profit: {_cfg['min_profit']:.1f}%")
+    print(f"  Min profit   : {_cfg['min_profit']:.1f}%  (stake sized by Kelly)")
     print(f"  Interval     : {_fmt_duration(_cfg['daemon_interval'])} between scans")
     skip_s = "yes (use existing file)" if _cfg["daemon_skip_initial_ids"] else "no (run ids.py first)"
     print(f"  IDs refresh  : every {_cfg['daemon_ids_refresh']}m  |  skip initial: {skip_s}")
@@ -579,7 +939,7 @@ def run_daemon() -> None:
         print(f"  [d]  Toggle dry run        — currently: {mode_s}")
         print("  [2]  Providers")
         print("  [3]  Leagues")
-        print("  [4]  Budget / min-profit")
+        print("  [4]  Min profit")
         print("  [5]  Scan interval")
         print("  [6]  IDs refresh interval  (minutes)")
         print("  [7]  Scan timeout          (seconds before killing a hung scan.py)")
@@ -602,7 +962,6 @@ def run_daemon() -> None:
         elif c == "3":
             _toggle_list("leagues", _ALL_LEAGUES, "Leagues — Daemon")
         elif c == "4":
-            _cfg["budget"]     = _ask_float("Budget per arb (USDC)", _cfg["budget"])
             _cfg["min_profit"] = _ask_float("Min profit %", _cfg["min_profit"])
         elif c == "5":
             _cfg["daemon_interval"] = max(30, _ask_int("Seconds between scans", _cfg["daemon_interval"]))
@@ -638,11 +997,13 @@ def run_daemon() -> None:
 # ─── Main menu ────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    _ensure_vpn_bridge()   # auto-start SOCKS5 bridge on launch if not already up
     while True:
         _header()
-        now = datetime.now().strftime("%d %b %Y  %H:%M")
+        now   = datetime.now().strftime("%d %b %Y  %H:%M")
         ids_s = _ids_age()
-        print(f"  {now}   |   IDs: {ids_s}")
+        vpn_s = _vpn_bridge_status()
+        print(f"  {now}   |   IDs: {ids_s}   |   VPN bridge: {vpn_s}")
         print()
         print("  Pipeline")
         print("  " + "─" * 48)
@@ -662,6 +1023,10 @@ def main() -> None:
         print("  Polymarket")
         print("  " + "─" * 48)
         print("  [6]  Polymarket setup     — wallet approvals & status check")
+        print()
+        print("  VPN")
+        print("  " + "─" * 48)
+        print(f"  [v]  VPN bridge           — status: {vpn_s}   (start / geo-check)")
         print()
         print("  Config")
         print("  " + "─" * 48)
@@ -683,6 +1048,31 @@ def main() -> None:
         elif c == "5": settings_menu()
         elif c == "6": run_polymarket_setup()
         elif c == "7": run_daemon()
+        elif c == "v":
+            while True:
+                _header("VPN Bridge")
+                vpn_now = _vpn_bridge_status()
+                print(f"  Status  : {vpn_now}")
+                print(f"  Bridge  : 127.0.0.1:{_VPN_BRIDGE_PORT}  ->  Mullvad tunnel  ->  internet")
+                print()
+                print("  [1]  Check routing  — Polymarket + SX Bet trading endpoint + exit IP")
+                print("  [2]  (Re)start bridge")
+                print()
+                print("  [0]  Back")
+                print()
+                vc = _ask("Choice")
+                if vc == "0":
+                    break
+                elif vc == "1":
+                    _check_routing()
+                elif vc == "2":
+                    if _vpn_bridge_running():
+                        print()
+                        print("  Bridge is already UP.  Launching a fresh instance alongside it.")
+                        print("  The old process will exit once existing connections close.")
+                        time.sleep(1)
+                    _ensure_vpn_bridge()
+                    _pause()
 
 
 if __name__ == "__main__":

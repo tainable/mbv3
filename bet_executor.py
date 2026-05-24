@@ -52,10 +52,8 @@ from matched_betting import calculator, kelly
 _SUPPORTED = {"polymarket", "matchbook", "sx_bet"}
 
 # Legs are placed in this order and aborted on first failure to avoid uncovered positions.
-# Polymarket goes first because geo-blocks fail immediately — before any other platform
-# commits real funds.  Matchbook before SX Bet so GBP liability is confirmed before
-# USDC is spent on-chain.
-_PLATFORM_ORDER = ["polymarket", "matchbook", "sx_bet"]
+# Matchbook first to confirm GBP liability before USDC is committed on-chain.
+_PLATFORM_ORDER = ["matchbook", "sx_bet", "polymarket"]
 
 # Set to True when a leg fails after a prior leg succeeded.
 # Persists until process restart — requires human review before resuming.
@@ -176,6 +174,10 @@ def _pm_no_token_for(game: dict, slot: str, settings) -> str | None:
 
 def _sx_outcome_for(game: dict, outcome_name: str) -> str:
     """Return 'one' (team1) or 'two' (team2) for an SX Bet order."""
+    # For totals/spread markets the scanner stores which outcome is outcomeOne explicitly.
+    stored_one = game.get("sx_bet_outcome_one_team")
+    if stored_one:
+        return "one" if _names_match(stored_one, outcome_name) else "two"
     if _names_match(game.get("team1", ""), outcome_name):
         return "one"
     return "two"
@@ -235,18 +237,45 @@ def _resolve_mb_runner(
 # Placed-game tracking — prevent duplicate bets on the same match
 # ---------------------------------------------------------------------------
 
-def log_arb_success(arb_type: str, arb: dict, game: dict, dry_run: bool = False) -> None:
+def log_arb_success(
+    arb_type: str,
+    arb: dict,
+    game: dict,
+    results: list[dict] | None = None,
+    dry_run: bool = False,
+) -> None:
     """Append a PLACED/DRY_RUN entry to bet_log.jsonl."""
     from datetime import datetime, timezone
+
+    if arb_type == "sure_bet":
+        scanned_odds = {
+            "team1": arb.get("team1_back_odds"),
+            "team2": arb.get("team2_back_odds"),
+            "draw":  arb.get("draw_back_odds"),
+        }
+    else:
+        scanned_odds = {
+            "back": arb.get("back_odds"),
+            "lay":  arb.get("lay_odds"),
+        }
+
+    execution_odds = {}
+    if results:
+        for r in results:
+            if r.get("ok") and "_timing_s" not in r and r.get("execution_odds") is not None:
+                execution_odds[r.get("_leg", r.get("platform", "?"))] = r["execution_odds"]
+
     entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "status":    "DRY_RUN" if dry_run else "PLACED",
-        "arb_type":  arb_type,
-        "team1":     game.get("team1"),
-        "team2":     game.get("team2"),
-        "league":    game.get("league"),
-        "date_time": game.get("date_time"),
-        "profit_pct": arb.get("profit_pct"),
+        "timestamp":      datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "status":         "DRY_RUN" if dry_run else "PLACED",
+        "arb_type":       arb_type,
+        "team1":          game.get("team1"),
+        "team2":          game.get("team2"),
+        "league":         game.get("league"),
+        "date_time":      game.get("date_time"),
+        "profit_pct":     arb.get("profit_pct"),
+        "scanned_odds":   scanned_odds,
+        "execution_odds": execution_odds or None,
     }
     _BET_LOG.parent.mkdir(parents=True, exist_ok=True)
     with _BET_LOG.open("a", encoding="utf-8") as f:
@@ -414,20 +443,140 @@ def _on_leg_failure(
         )
 
 
+def _on_arb_success(
+    arb_type: str,
+    arb: dict,
+    game: dict,
+    results: list[dict],
+    settings,
+) -> None:
+    """Send a success notification after all legs are placed live."""
+    from matched_betting import notifier
+    profit = arb.get("profit_pct")
+    profit_str = f"{profit:.2f}%" if profit is not None else "?"
+    legs = [r for r in results if r.get("ok") and "_timing_s" not in r]
+    leg_lines = []
+    slippage_parts = []
+    for r in legs:
+        label  = r.get("_leg", r.get("platform", "?"))
+        amount = r.get("amount")
+        odds   = r.get("decimal_odds")
+        exec_o = r.get("execution_odds")
+        parts  = [label]
+        if amount is not None:
+            parts.append(f"${amount:.2f}")
+        if odds is not None:
+            parts.append(f"@ {odds:.3f}")
+        if exec_o is not None:
+            parts.append(f"(exec {exec_o:.3f})")
+        leg_lines.append("  " + "  ".join(parts))
+        if odds is not None and exec_o is not None:
+            diff = exec_o - odds
+            if abs(diff) >= 0.005:
+                sign = "+" if diff >= 0 else ""
+                slippage_parts.append(f"{label}: {sign}{diff:.3f}")
+    body = (
+        f"Game:  {game.get('team1')} vs {game.get('team2')} ({game.get('league', '?')})\n"
+        f"Type:  {arb_type}  ({profit_str} net)\n"
+        f"Legs:\n" + "\n".join(leg_lines)
+    )
+    if slippage_parts:
+        body += "\nSlippage: " + "  ".join(slippage_parts)
+    notifier.send_alert(
+        f"BET PLACED +{profit_str} — {game.get('team1')} vs {game.get('team2')}",
+        body,
+        settings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bankroll floor check
+# ---------------------------------------------------------------------------
+
+def check_bankroll_halt(settings, gbp_rate: float | None) -> bool:
+    """
+    Return True (and send an alert) if the bankroll has dropped below
+    settings.kelly.min_bankroll_usdc.
+
+    Bankroll = min(pm_usd, sx_usd, mb_usd) × 3, matching the Kelly formula.
+    Returns False if balances cannot be fetched (fail-open — don't stop on errors).
+    """
+    threshold = getattr(getattr(settings, "kelly", None), "min_bankroll_usdc", 20.0)
+    balances  = _fetch_all_balances(settings)
+    bankroll  = kelly.compute_bankroll(
+        balances.get("polymarket"),
+        balances.get("sx_bet"),
+        balances.get("matchbook"),
+        gbp_rate,
+    )
+    if bankroll is None:
+        return False
+    if bankroll >= threshold:
+        return False
+
+    from matched_betting import notifier
+    bal_str = (
+        f"  Polymarket: ${balances.get('polymarket') or 0:.2f}\n"
+        f"  SX Bet:     ${balances.get('sx_bet') or 0:.2f}\n"
+        f"  Matchbook:  GBP {balances.get('matchbook') or 0:.2f}"
+    )
+    notifier.send_alert(
+        f"DAEMON STOPPED — bankroll ${bankroll:.2f} below ${threshold:.2f}",
+        f"Bankroll (min×3): ${bankroll:.2f}  threshold: ${threshold:.2f}\n{bal_str}",
+        settings,
+    )
+    print(
+        f"\n  BANKROLL ${bankroll:.2f} below minimum ${threshold:.2f} — stopping daemon.",
+        file=sys.stderr,
+    )
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Kelly bet sizing
 # ---------------------------------------------------------------------------
 
-def _fetch_all_balances(settings) -> dict[str, float | None]:
-    """Fetch PM, SX Bet, and Matchbook balances concurrently."""
+def _arb_providers(arb: dict, arb_type: str) -> set[str]:
+    """Return the set of provider names actually involved in this arb."""
+    if arb_type == "back_lay":
+        return {arb["back_provider"], arb["lay_provider"]}
+    provs = {arb["team1_back_provider"], arb["team2_back_provider"]}
+    if arb.get("draw_back_provider"):
+        provs.add(arb["draw_back_provider"])
+    return provs
+
+
+def get_platform_balances_usd(
+    settings,
+    gbp_rate: float | None = None,
+    providers: list[str] | None = None,
+) -> dict[str, float | None]:
+    """Fetch free-fund balances for the given platforms (all three if None), returned in USD.
+
+    Matchbook is fetched in GBP and converted. Returns None for any platform
+    whose balance could not be fetched or was not requested.
+    """
+    balances = _fetch_all_balances(settings, providers=providers)
+    rate = gbp_rate or 0.79
+    mb_gbp = balances.get("matchbook")
+    return {
+        "polymarket": balances.get("polymarket"),
+        "sx_bet":     balances.get("sx_bet"),
+        "matchbook":  mb_gbp / rate if mb_gbp is not None else None,
+    }
+
+
+def _fetch_all_balances(settings, providers: list[str] | None = None) -> dict[str, float | None]:
+    """Fetch platform balances concurrently. Pass providers to limit which are fetched."""
     from bet import pm_get_balance, mb_get_balance, sx_get_balance
-    _getters = {
+    all_getters = {
         "polymarket": pm_get_balance,
         "sx_bet":     sx_get_balance,
         "matchbook":  mb_get_balance,
     }
-    result: dict[str, float | None] = {k: None for k in _getters}
-    with ThreadPoolExecutor(max_workers=3) as ex:
+    _getters = {k: v for k, v in all_getters.items() if providers is None or k in providers}
+    result: dict[str, float | None] = {k: None for k in all_getters}
+    with ThreadPoolExecutor(max_workers=max(1, len(_getters))) as ex:
         futs = {ex.submit(fn, settings): name for name, fn in _getters.items()}
         for f in as_completed(futs):
             name = futs[f]
@@ -473,6 +622,12 @@ def _provider_max_budgets(
             _pm_f = calculator._polymarket_fee_rate(arb["lay_odds"])
             pm_frac = lay_frac * (arb["lay_odds"] - 1) * (1 + _pm_f)
             usdc_fractions[lay_prov] = usdc_fractions.get(lay_prov, 0.0) + pm_frac
+        elif lay_prov == "matchbook":
+            # Matchbook requires the full liability (backer_stake × (odds − 1)) in free funds.
+            usdc_fractions[lay_prov] = usdc_fractions.get(lay_prov, 0.0) + lay_frac * (arb["lay_odds"] - 1)
+        elif lay_prov == "sx_bet":
+            # SX Bet binary No-token: actual USDC = lay_frac × (lay_odds − 1).
+            usdc_fractions[lay_prov] = usdc_fractions.get(lay_prov, 0.0) + lay_frac * (arb["lay_odds"] - 1)
         else:
             usdc_fractions[lay_prov] = usdc_fractions.get(lay_prov, 0.0) + lay_frac
 
@@ -498,8 +653,8 @@ def _compute_kelly_budget(
     Compute the Kelly-sized stake for this arb.
 
     Steps:
-      1. Fetch all platform balances
-      2. Compute bankroll = min(pm, sx, mb_usd) × 3
+      1. Fetch all platform balances and convert to USD
+      2. Compute bankroll = min(arb platforms) × n_arb_platforms
       3. Apply profit-scaled fraction → kelly_stake
       4. Constrain by per-provider balance limits
       5. Enforce max_stake_usdc and min_stake_usdc caps
@@ -511,23 +666,35 @@ def _compute_kelly_budget(
     if ks is None or not ks.enabled:
         return max_budget_usdc
 
-    balances = _fetch_all_balances(settings)
-    bankroll = kelly.compute_bankroll(
-        balances.get("polymarket"),
-        balances.get("sx_bet"),
-        balances.get("matchbook"),
-        gbp_rate,
-    )
+    arb_provs = _arb_providers(arb, arb_type)
+    balances = _fetch_all_balances(settings, providers=list(arb_provs))
+
+    # Convert arb platform balances to USD.
+    rate = gbp_rate or 0.79
+    mb_gbp = balances.get("matchbook")
+    all_usd: dict[str, float | None] = {
+        "polymarket": balances.get("polymarket"),
+        "sx_bet":     balances.get("sx_bet"),
+        "matchbook":  mb_gbp / rate if mb_gbp is not None else None,
+    }
+    arb_usd = {p: all_usd.get(p) for p in arb_provs}
+
+    bankroll = kelly.compute_bankroll_for_arb(arb_usd)
 
     if bankroll is None:
         print(
-            "  ⚠  Kelly: could not fetch all balances — using --budget as stake.",
+            "  Kelly: could not fetch balances for arb platforms "
+            f"({', '.join(sorted(arb_provs))}) -- using --budget as stake.",
             file=sys.stderr,
         )
         return max_budget_usdc
 
+    profit_pct = arb.get("profit_pct", 0.0)
+    profit_24h_pct = arb.get("profit_24h_pct")
+    kelly_edge = min(profit_pct, profit_24h_pct) if profit_24h_pct is not None else profit_pct
+
     frac = kelly.kelly_fraction(
-        arb.get("profit_pct", 0.0),
+        kelly_edge,
         ks.low_profit, ks.high_profit, ks.low_fraction, ks.high_fraction,
     )
     stake = frac * bankroll
@@ -541,14 +708,17 @@ def _compute_kelly_budget(
 
     if final < ks.min_stake_usdc:
         print(
-            f"  ⚠  Kelly stake ${final:.2f} below minimum ${ks.min_stake_usdc:.2f} — skipping arb.",
+            f"  Kelly stake ${final:.2f} below minimum ${ks.min_stake_usdc:.2f} -- skipping arb.",
             file=sys.stderr,
         )
         return 0.0
 
-    profit_pct = arb.get("profit_pct", 0.0)
+    edge_str = f"{kelly_edge:.2f}%"
+    if profit_24h_pct is not None and profit_24h_pct < profit_pct:
+        edge_str += f" (24h-adj from {profit_pct:.2f}%)"
+    platforms_str = "+".join(sorted(arb_provs))
     print(
-        f"  Kelly: bankroll=${bankroll:.0f}  edge={profit_pct:.2f}%  "
+        f"  Kelly: bankroll=${bankroll:.0f} ({platforms_str})  edge={edge_str}  "
         f"fraction={frac:.1%}  stake=${final:.2f}"
     )
     return final
@@ -565,10 +735,13 @@ def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, str,
 
     Returns a list of (slot, provider, outcome_name, raw_odds, stake_usdc).
     """
-    legs = [("team1", arb["team1_back_provider"], arb["team1"], arb["team1_back_odds"])]
+    is_totals = arb.get("league") == "mlb_totals"
+    slot1 = "over" if is_totals else "team1"
+    slot2 = "under" if is_totals else "team2"
+    legs = [(slot1, arb["team1_back_provider"], arb["team1"], arb["team1_back_odds"])]
     if arb.get("market_type") == "three_way" and arb.get("draw_back_odds"):
         legs.append(("draw", arb["draw_back_provider"], "Draw", arb["draw_back_odds"]))
-    legs.append(("team2", arb["team2_back_provider"], arb["team2"], arb["team2_back_odds"]))
+    legs.append((slot2, arb["team2_back_provider"], arb["team2"], arb["team2_back_odds"]))
 
     # Use effective (post-commission) odds so stakes give equal net profit
     eff = [(slot, prov, name, odds, calculator._eff_back_odds(odds, prov))
@@ -581,7 +754,18 @@ def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, str,
     ]
 
     guaranteed_returns = [s * e for (_, _, _, _, e), (_, _, _, _, s) in zip(eff, stakes)]
-    spread = max(guaranteed_returns) - min(guaranteed_returns)
+    total_staked = sum(s for *_, s in stakes)
+    min_return = min(guaranteed_returns)
+    spread = max(guaranteed_returns) - min_return
+
+    if min_return < total_staked:
+        print(
+            f"  ABORT: rounding error turns worst outcome into a loss "
+            f"(return {min_return:.3f} < staked {total_staked:.3f}) — skipping arb.",
+            file=sys.stderr,
+        )
+        return []
+
     if spread > 0.01:
         print(
             f"  WARNING: sure-bet legs imbalanced by {spread:.3f} USDC after rounding "
@@ -597,11 +781,17 @@ def _back_lay_stakes(arb: dict, budget_usdc: float) -> tuple[float, float]:
     Return (back_stake_usdc, lay_stake_usdc) sized for equal net profit in both outcomes.
 
     Stakes are derived from the commission-adjusted equal-profit condition:
-      lay_stake = back_stake × eff_back / (lay_odds − c_lay)
+      lay_stake = back_stake × eff_back / lay_odds
 
     Budget allocation:
       Polymarket lay:  back_stake + lay_stake × (lay_odds − 1) × (1 + fee) = budget
-      Other lay:       back_stake + lay_stake = budget
+      SX Bet binary:   back_stake + lay_stake × (lay_odds − 1)             = budget
+      Other lay:       back_stake + lay_stake                               = budget
+
+    SX Bet soccer uses per-slot Yes/No binary markets identical in structure to
+    Polymarket.  The stored lay_odds is the traditional exchange equivalent
+    (1 / maker_prob).  Buying the No token costs lay_stake × (lay_odds − 1) USDC,
+    exactly like Polymarket — just without the fee factor.
     """
     back_odds  = arb["back_odds"]
     lay_odds   = arb["lay_odds"]
@@ -615,6 +805,12 @@ def _back_lay_stakes(arb: dict, budget_usdc: float) -> tuple[float, float]:
         # Budget covers back_stake + NO-token cost including Polymarket fee on order size.
         f = calculator._polymarket_fee_rate(lay_odds)
         back_stake = budget_usdc * lay_odds / (lay_odds + eff_back * (lay_odds - 1) * (1 + f))
+        lay_stake  = back_stake * eff_back / lay_odds
+    elif lay_prov == "sx_bet":
+        # SX Bet per-slot binary No-token: same mechanics as Polymarket, no fee.
+        # Actual USDC spent on No tokens = lay_stake × (lay_odds − 1).
+        # Budget = back_stake + lay_stake × (lay_odds − 1).
+        back_stake = budget_usdc * lay_odds / (lay_odds + eff_back * (lay_odds - 1))
         lay_stake  = back_stake * eff_back / lay_odds
     else:
         # Equal-profit condition: lay_stake = back_stake * eff_back / (lay_odds - c_lay)
@@ -685,7 +881,12 @@ def check_balances_for_arb(
             _pm_f = calculator._polymarket_fee_rate(arb["lay_odds"])
             lay_native = round(lay_stake * (arb["lay_odds"] - 1) * (1 + _pm_f), 2)
         elif lay_prov == "matchbook":
-            lay_native = round(lay_stake * gbp_rate, 2) if gbp_rate else lay_stake
+            # Matchbook requires the full liability (backer_stake × (odds − 1)) in free funds.
+            lay_liability = lay_stake * (arb["lay_odds"] - 1)
+            lay_native = round(lay_liability * gbp_rate, 2) if gbp_rate else lay_liability
+        elif lay_prov == "sx_bet":
+            # SX Bet binary No-token: actual spend = lay_stake × (lay_odds − 1).
+            lay_native = round(lay_stake * (arb["lay_odds"] - 1), 2)
         else:
             lay_native = lay_stake
         required[lay_prov] = required.get(lay_prov, 0.0) + lay_native
@@ -728,6 +929,34 @@ def check_balances_for_arb(
 
 
 # ---------------------------------------------------------------------------
+# Pre-flight Polymarket liquidity check
+# ---------------------------------------------------------------------------
+
+def _pm_liquidity_issues(tasks: list[tuple[str, Callable, dict]]) -> list[str]:
+    """Check order book depth for every Polymarket leg before any leg is placed.
+
+    Returns a list of human-readable issues; empty means all clear.
+    Fails open (no issue reported) when the CLOB API is unreachable.
+    """
+    from bet import pm_check_liquidity
+    issues: list[str] = []
+    for label, _fn, kwargs in tasks:
+        if "polymarket" not in label.lower():
+            continue
+        token_id = kwargs.get("token_id")
+        amount   = kwargs.get("amount")
+        side     = kwargs.get("side", "BUY")
+        if not token_id or not amount:
+            continue
+        ok, available = pm_check_liquidity(str(token_id), float(amount), str(side))
+        if not ok:
+            issues.append(
+                f"{label}: need ${float(amount):.2f} but book depth is ~${available:.2f}"
+            )
+    return issues
+
+
+# ---------------------------------------------------------------------------
 # Main placement functions
 # ---------------------------------------------------------------------------
 
@@ -753,6 +982,18 @@ def place_sure_bet(
         return [{"ok": False, "skipped": True, "error": "Kelly stake below minimum — arb skipped"}]
 
     legs = _sure_bet_stakes(arb, budget_usdc)
+    if not legs:
+        return [{"ok": False, "skipped": True,
+                 "error": "Skipped: rounding error would create a loss on at least one outcome."}]
+
+    min_stake = getattr(getattr(settings, "kelly", None), "min_stake_usdc", 1.50)
+    too_small = [(prov, name, s) for _, prov, name, _, s in legs if s < min_stake]
+    if too_small:
+        details = ", ".join(f"{prov} ({name}) ${s:.2f}" for prov, name, s in too_small)
+        print(f"  ⚠  Leg stake below minimum ${min_stake:.2f} — skipping arb: {details}", file=sys.stderr)
+        return [{"ok": False, "skipped": True,
+                 "error": f"Leg stake below minimum ${min_stake:.2f}: {details}"}]
+
     providers = [prov for _, prov, *_ in legs]
     if len(set(providers)) == 1:
         return [{"ok": False, "skipped": True,
@@ -833,6 +1074,18 @@ def place_sure_bet(
     if not tasks:
         return results
 
+    if pre_errors:
+        _on_leg_failure("sure_bet", arb, game, [], pre_errors[0], settings, dry_run)
+        return results
+
+    pm_issues = _pm_liquidity_issues(tasks)
+    if pm_issues:
+        for issue in pm_issues:
+            print(f"  Liquidity check failed: {issue}", file=sys.stderr)
+        issue_str = "; ".join(pm_issues)
+        return [{"ok": False, "skipped": True,
+                 "error": f"Polymarket liquidity insufficient: {issue_str}"}]
+
     t0 = time.monotonic()
     for label, fn, kwargs in sorted(tasks, key=lambda t: _platform_rank(t[0])):
         r = fn(**kwargs)
@@ -843,6 +1096,8 @@ def place_sure_bet(
             _on_leg_failure("sure_bet", arb, game, placed, r, settings, dry_run)
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
+    if all_legs_ok(results) and not dry_run:
+        _on_arb_success("sure_bet", arb, game, results, settings)
     return results
 
 
@@ -889,6 +1144,25 @@ def place_back_lay_arb(
         return [{"ok": False, "skipped": True, "error": "Kelly stake below minimum — arb skipped"}]
 
     back_stake, lay_stake = _back_lay_stakes(arb, budget_usdc)
+
+    if lay_prov == "matchbook":
+        mb_liability = lay_stake * (arb["lay_odds"] - 1)
+        liability_line = f"  Matchbook liability: ~${mb_liability:.2f} USDC"
+        if gbp_rate:
+            liability_line += f"  (~£{mb_liability * gbp_rate:.2f})"
+        print(liability_line)
+
+    min_stake = getattr(getattr(settings, "kelly", None), "min_stake_usdc", 1.50)
+    too_small = []
+    if back_stake < min_stake:
+        too_small.append(f"{back_prov} (back) ${back_stake:.2f}")
+    if lay_stake < min_stake:
+        too_small.append(f"{lay_prov} (lay) ${lay_stake:.2f}")
+    if too_small:
+        details = ", ".join(too_small)
+        print(f"  ⚠  Leg stake below minimum ${min_stake:.2f} — skipping arb: {details}", file=sys.stderr)
+        return [{"ok": False, "skipped": True,
+                 "error": f"Leg stake below minimum ${min_stake:.2f}: {details}"}]
 
     # Determine outcome slot for Polymarket token lookups
     if _names_match(game.get("team1", ""), outcome_name):
@@ -1016,11 +1290,13 @@ def place_back_lay_arb(
         main_hash = game.get("sx_bet_market_hash")
 
         if slot_hash:
-            # Soccer: per-slot binary market — bet on outcomeTwo (No)
+            # Soccer: per-slot binary market — buy the No token (outcomeTwo).
+            # Cost = lay_stake × (lay_odds − 1), same as Polymarket No-token but no fee.
+            sx_no_usdc = round(lay_stake * (arb["lay_odds"] - 1), 2)
             tasks.append((f"sx_bet lay / No ({outcome_name})", sx_place_bet, {
                 "settings":    settings,
                 "market_hash": slot_hash,
-                "amount":      lay_stake,
+                "amount":      sx_no_usdc,
                 "outcome":     "two",   # outcomeTwo = "No" = outcome doesn't happen
                 "take":        True,
                 "dry_run":     dry_run,
@@ -1058,6 +1334,14 @@ def place_back_lay_arb(
     if not tasks:
         return results if results else [{"ok": False, "error": "No executable legs built"}]
 
+    pm_issues = _pm_liquidity_issues(tasks)
+    if pm_issues:
+        for issue in pm_issues:
+            print(f"  Liquidity check failed: {issue}", file=sys.stderr)
+        issue_str = "; ".join(pm_issues)
+        return [{"ok": False, "skipped": True,
+                 "error": f"Polymarket liquidity insufficient: {issue_str}"}]
+
     t0 = time.monotonic()
     for label, fn, kwargs in sorted(tasks, key=lambda t: _platform_rank(t[0])):
         r = fn(**kwargs)
@@ -1068,6 +1352,8 @@ def place_back_lay_arb(
             _on_leg_failure("back_lay", arb, game, placed, r, settings, dry_run)
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
+    if all_legs_ok(results) and not dry_run:
+        _on_arb_success("back_lay", arb, game, results, settings)
     return results
 
 
