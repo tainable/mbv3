@@ -421,18 +421,19 @@ def _run(cmd: list[str]) -> None:
 
 # ─── Persistent config ────────────────────────────────────────────────────────
 
-_ALL_LEAGUES   = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+_ALL_LEAGUES   = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 _ALL_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro", "smarkets"]
 
 _cfg: dict = {
     "leagues":          list(_ALL_LEAGUES),
     "providers":        ["matchbook", "polymarket", "sx_bet"],
-    "min_profit":       0.2,
+    "min_profit":       0.33,
     "budget":           10.0,
     "debug":            False,
     "show_odds":        False,
     "auto_bet":         False,
     "dry_run":          False,
+    "allow_topup":      False,
     "scan_interval":    600,
     "max_runtime":      0,   # 0 = unlimited
     "skip_imminent":    True,
@@ -507,6 +508,7 @@ def settings_menu() -> None:
         print(f"  [7]  Show odds     :  {'on' if _cfg['show_odds'] else 'off'}")
         print(f"  [8]  Auto-bet      :  {auto_s}")
         print(f"  [9]  Dry run       :  {'on' if _cfg['dry_run'] else 'off'}")
+        print(f"  [10] Allow top-up  :  {'on' if _cfg['allow_topup'] else 'off'}")
         print()
         print("  [0]  Back")
         print()
@@ -524,10 +526,11 @@ def settings_menu() -> None:
             _cfg["skip_imminent"] = not _cfg["skip_imminent"]
         elif c == "5d":
             _cfg["imminent_minutes"] = max(1, _ask_int("Imminent cutoff (minutes)", _cfg["imminent_minutes"]))
-        elif c == "6": _cfg["debug"]     = not _cfg["debug"]
-        elif c == "7": _cfg["show_odds"] = not _cfg["show_odds"]
-        elif c == "8": _cfg["auto_bet"]  = not _cfg["auto_bet"]
-        elif c == "9": _cfg["dry_run"]   = not _cfg["dry_run"]
+        elif c == "6": _cfg["debug"]        = not _cfg["debug"]
+        elif c == "7": _cfg["show_odds"]    = not _cfg["show_odds"]
+        elif c == "8": _cfg["auto_bet"]     = not _cfg["auto_bet"]
+        elif c == "9": _cfg["dry_run"]      = not _cfg["dry_run"]
+        elif c == "10": _cfg["allow_topup"] = not _cfg["allow_topup"]
 
 
 # ─── IDs ──────────────────────────────────────────────────────────────────────
@@ -588,6 +591,8 @@ def _build_scan_cmd() -> list[str]:
         cmd.append("--auto-bet")
         if _cfg["dry_run"]:
             cmd.append("--bet-dry-run")
+        if _cfg["allow_topup"]:
+            cmd.append("--allow-topup")
     return cmd
 
 
@@ -597,7 +602,8 @@ def _scan_summary() -> None:
     print(f"  Providers  : {_ps()}")
     print(f"  Min profit : {_cfg['min_profit']:.1f}%")
     print(f"  Show odds  : {'on' if _cfg['show_odds'] else 'off'}")
-    print(f"  Auto-bet   : {auto_s}   budget=${_cfg['budget']:.2f}")
+    topup_s = "on" if _cfg["allow_topup"] else "off"
+    print(f"  Auto-bet   : {auto_s}   budget=${_cfg['budget']:.2f}   top-up={topup_s}")
     imminent = "skip" if _cfg["skip_imminent"] else "include"
     print(f"  Imminent   : {imminent}")
     print(f"  Debug      : {'on' if _cfg['debug'] else 'off'}")
@@ -816,6 +822,7 @@ def run_polymarket_setup() -> None:
         print("  [2]  Wrap USDC (native) — convert native USDC → pUSD  (Polygon Circle issuance)")
         print("  [3]  Wrap USDC.e        — convert USDC.e → pUSD  (legacy bridged)")
         print("  [4]  Approve pUSD       — one-time on-chain approval for V2 exchange (3 contracts)")
+        print("  [5]  Unwrap pUSD        — convert pUSD → USDC.e  (to bridge out to SX Network)")
         print()
         print("  [0]  Back")
         print()
@@ -860,6 +867,30 @@ def run_polymarket_setup() -> None:
             print()
             if _ask_yn("Proceed with approval?", default=False):
                 _run([_PY, "polymarket_bet.py", "--approve"])
+                _pause()
+        elif c == "5":
+            _header("Unwrap pUSD -> USDC.e")
+            print("  Burns pUSD and returns USDC.e 1:1 to your Polygon wallet.")
+            print("  Use this when you want to move funds out of Polymarket.")
+            print("  After unwrapping, bridge via: https://sx.bet/wallet/bridge")
+            print("  You need a small amount of MATIC in your wallet for gas.")
+            print()
+            raw = _ask("Amount of pUSD to unwrap", "")
+            if not raw.strip():
+                continue
+            try:
+                amount = float(raw.strip())
+            except ValueError:
+                print("  Invalid amount.")
+                _pause()
+                continue
+            if amount <= 0:
+                print("  Amount must be positive.")
+                _pause()
+                continue
+            print()
+            if _ask_yn(f"Unwrap {amount:.2f} pUSD → USDC.e?", default=False):
+                _run([_PY, "polymarket_bet.py", "--unwrap", str(amount)])
                 _pause()
 
 
@@ -908,6 +939,8 @@ def _build_daemon_cmd() -> list[str]:
         cmd += ["--leagues"] + _cfg["leagues"]
     if _cfg["dry_run"]:
         cmd.append("--bet-dry-run")
+    if _cfg["allow_topup"]:
+        cmd.append("--allow-topup")
     if _cfg["daemon_skip_initial_ids"]:
         cmd.append("--skip-initial-ids")
     if _cfg["daemon_log"]:

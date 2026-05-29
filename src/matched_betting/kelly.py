@@ -30,12 +30,50 @@ def kelly_fraction(
         1.0% profit → 19.2% of bankroll
         1.5% profit → 25.0% of bankroll  (capped)
     """
-    if profit_pct <= low_profit:
-        return low_frac
-    if profit_pct >= high_profit:
-        return high_frac
-    t = (profit_pct - low_profit) / (high_profit - low_profit)
-    return low_frac + t * (high_frac - low_frac)
+    return kelly_fraction_piecewise(
+        profit_pct,
+        [(low_profit, low_frac), (high_profit, high_frac)],
+    )
+
+
+def kelly_fraction_piecewise(
+    profit_pct: float,
+    anchors: list[tuple[float, float]],
+) -> float:
+    """
+    Piecewise linear interpolation over a sorted list of (profit_pct, fraction) anchors.
+    Clamps to the first/last fraction outside the covered range.
+    """
+    if profit_pct <= anchors[0][0]:
+        return anchors[0][1]
+    if profit_pct >= anchors[-1][0]:
+        return anchors[-1][1]
+    for i in range(len(anchors) - 1):
+        x0, y0 = anchors[i]
+        x1, y1 = anchors[i + 1]
+        if x0 <= profit_pct <= x1:
+            t = (profit_pct - x0) / (x1 - x0)
+            return y0 + t * (y1 - y0)
+    return anchors[-1][1]
+
+
+def compute_bankroll_for_arb(platform_balances_usd: dict[str, float | None]) -> float | None:
+    """
+    Returns min(arb platform balances) × 3.
+
+    Pass only the platforms actually involved in the arb
+    (e.g. {"polymarket": 120.0, "matchbook": 85.0} for a back-lay arb).
+    The ×3 multiplier is fixed regardless of how many platforms the arb uses,
+    so sizing is always anchored to the weakest of the involved platforms.
+
+    Returns None if the dict is empty or any value is None (caller falls back to
+    the fixed --budget cap).
+    """
+    if not platform_balances_usd:
+        return None
+    if any(v is None for v in platform_balances_usd.values()):
+        return None
+    return min(platform_balances_usd.values()) * 3  # type: ignore[type-var]
 
 
 def compute_bankroll(
@@ -47,14 +85,11 @@ def compute_bankroll(
     """
     Returns min(pm_usd, sx_usd, mb_usd) × 3.
 
-    The ×3 factor reflects having three platforms; using the minimum ensures
-    sizing is limited by whichever platform is most depleted.
-
-    Returns None if any balance is unavailable (caller should fall back to
-    the fixed --budget cap).
+    Kept for use by check_bankroll_halt (global low-balance alert across all platforms).
+    For Kelly sizing per arb, use compute_bankroll_for_arb instead.
     """
     if pm_balance_usd is None or sx_balance_usd is None or mb_balance_gbp is None:
         return None
     rate = gbp_rate if gbp_rate else 0.79
     mb_usd = mb_balance_gbp / rate
-    return min(pm_balance_usd, sx_balance_usd, mb_usd) * 3
+    return compute_bankroll_for_arb({"polymarket": pm_balance_usd, "sx_bet": sx_balance_usd, "matchbook": mb_usd})

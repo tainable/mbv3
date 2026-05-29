@@ -24,6 +24,7 @@ class MatchbookSettings:
     username: str | None
     password: str | None
     base_url: str
+    max_requests_per_min: int = 200  # hard limit is 700; keep well below it
 
 
 @dataclass(frozen=True)
@@ -63,6 +64,11 @@ class KellySettings:
     high_fraction: float
     max_stake_usdc: float
     min_stake_usdc: float
+    min_bankroll_usdc: float
+    # SX/PM-specific kinked curve: steeper ramp once profit clears the bridge fee
+    sx_pm_kink_profit: float   # kink point = bridge fee threshold (default 0.44%)
+    sx_pm_kink_fraction: float # fraction at kink (default 0.15)
+    sx_pm_high_fraction: float # fraction at high_profit for sx/pm arbs (default 0.40)
 
 
 @dataclass(frozen=True)
@@ -109,6 +115,7 @@ def load_settings(project_root: Path) -> Settings:
             username=os.getenv("MATCHBOOK_USERNAME") or None,
             password=os.getenv("MATCHBOOK_PASSWORD") or None,
             base_url=os.getenv("MATCHBOOK_BASE_URL", "https://api.matchbook.com"),
+            max_requests_per_min=int(os.getenv("MATCHBOOK_MAX_REQUESTS_PER_MIN", "200")),
         ),
         smarkets=SmarketsSettings(
             username=os.getenv("SMARKETS_USERNAME") or None,
@@ -151,6 +158,10 @@ def load_settings(project_root: Path) -> Settings:
             high_fraction=float(os.getenv("KELLY_HIGH_FRACTION", "0.25")),
             max_stake_usdc=float(os.getenv("MAX_STAKE_USDC", "200")),
             min_stake_usdc=float(os.getenv("MIN_STAKE_USDC", "5")),
+            min_bankroll_usdc=float(os.getenv("MIN_BANKROLL_USDC", "20")),
+            sx_pm_kink_profit=float(os.getenv("SX_PM_KINK_PROFIT", "0.44")),
+            sx_pm_kink_fraction=float(os.getenv("SX_PM_KINK_FRACTION", "0.15")),
+            sx_pm_high_fraction=float(os.getenv("SX_PM_HIGH_FRACTION", "0.40")),
         ),
         commission=CommissionSettings(
             matchbook=float(os.getenv("MATCHBOOK_COMMISSION", "0.02")),

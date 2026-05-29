@@ -16,6 +16,7 @@ from matched_betting.providers.base import GameContext, OddsProvider
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
+    "wnba": "basketball",
     "mlb": "baseball",
     "mlb_spread": "baseball",
     "mlb_totals": "baseball",
@@ -37,11 +38,12 @@ _SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "lali
 # Game markets live in /events (not /markets); map league → Polymarket tag_slug
 _LEAGUE_EVENT_TAGS: dict[str, str] = {
     "epl": "premier-league",
-    "ucl": "champions-league",
+    "ucl": "ucl",
     "uel": "uel",
     "seria": "sea",
     "laliga": "la-liga",
     "nba": "nba",
+    "wnba": "wnba",
     "mlb": "mlb",
     "mlb_spread": "mlb",
     "mlb_totals": "mlb",
@@ -99,8 +101,10 @@ class PolymarketProvider(OddsProvider):
 
             # NBA moneyline slugs are exactly: nba-{team1}-{team2}-{yyyy}-{mm}-{dd} (6 parts).
             # Any extra segments indicate props/alternates (e.g. team-to-score-first, odd-even).
+            # Exact prefix match — "nba" is a substring of "wnba", so a loose `in` check
+            # would misclassify WNBA slugs as NBA.
             _nba_non_moneyline = {"spread", "total", "over", "under", "cover", "ats"}
-            if "nba" in leagues and "nba" in split_slug[0]:
+            if "nba" in leagues and split_slug[0] == "nba":
                 if len(split_slug) == 6 and not any(seg in _nba_non_moneyline for seg in split_slug):
                     if split_slug[1] in ['atl','phx','lal','ind','chi','phi',
                     'okc','bos','mia','cle','sas','mem','was','uta',
@@ -111,6 +115,15 @@ class PolymarketProvider(OddsProvider):
                     'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']:
                             league = 'nba'
                             candidate_markets.append((market, league))
+
+            # WNBA moneyline slugs: wnba-{team1}-{team2}-{yyyy}-{mm}-{dd} (6 parts).
+            # Same shape as NBA but with the dedicated 'wnba' team slug index.
+            _wnba_non_moneyline = {"spread", "total", "over", "under", "cover", "ats"}
+            if "wnba" in leagues and split_slug[0] == "wnba":
+                if len(split_slug) == 6 and not any(seg in _wnba_non_moneyline for seg in split_slug):
+                    wnba_slugs = team_index.get("wnba", [])
+                    if split_slug[1] in wnba_slugs and split_slug[2] in wnba_slugs:
+                        candidate_markets.append((market, "wnba"))
 
             # MLB moneyline slugs: mlb-{team1}-{team2}-{yyyy}-{mm}-{dd} (6 parts).
             # Doubleheaders may add a game number suffix (7 parts, e.g. -2). 8+ = props/alternates.
@@ -455,7 +468,7 @@ class PolymarketProvider(OddsProvider):
             source_market_id=source_market_id,
             source_event_id=None,
             retrieved_at=retrieved_at,
-            metadata={"token_id": clob_token_id, "liquidity_usd": total_ask_size * 2},
+            metadata={"clob_token_id": clob_token_id, "liquidity_usd": total_ask_size * 2},
         )
         result: list[OddsRecord] = []
         if best_ask and 0 < best_ask < 1:
@@ -537,7 +550,7 @@ class PolymarketProvider(OddsProvider):
             source_market_id=market_id,
             source_event_id=None,
             retrieved_at=retrieved_at,
-            metadata={"token_id": token_id, "liquidity_usd": total_ask_size * 2},
+            metadata={"clob_token_id": token_id, "liquidity_usd": total_ask_size * 2},
         )
         records: list[OddsRecord] = []
         if best_ask and 0 < best_ask < 1:
@@ -595,7 +608,7 @@ class PolymarketProvider(OddsProvider):
                 source_market_id=market_id,
                 source_event_id=None,
                 retrieved_at=retrieved_at,
-                metadata={"token_id": token_id, "liquidity_usd": total_ask_size * 2},
+                metadata={"clob_token_id": token_id, "liquidity_usd": total_ask_size * 2},
             ))
         return records
 
@@ -608,6 +621,14 @@ class PolymarketProvider(OddsProvider):
                 index[league] = ['atl','phx','lal','ind','chi','phi',
                 'okc','bos','mia','cle','sas','mem','was','uta',
                 'hou','min','mil','por','bkn','gsw','dal','den','tor','lac','nop','det','nyk','cha','sac','orl']
+
+            elif league == "wnba":
+                # Polymarket WNBA slug codes (2026 season — 15 franchises incl.
+                # expansion teams Toronto Tempo, Portland Fire, Golden State Valkyries).
+                index[league] = [
+                    'atl', 'chi', 'conn', 'dal', 'gsv', 'ind', 'la', 'las',
+                    'min', 'nyl', 'phx', 'por', 'sea', 'tor', 'wsh',
+                ]
 
             elif league in ("mlb", "mlb_spread", "mlb_totals"):
                 index[league] = ['cws','mil','wsh','chc','min','bal',
@@ -625,7 +646,7 @@ class PolymarketProvider(OddsProvider):
                 'det','fla','tor','ott']
 
             elif league == "ucl":
-                index[league] = ['rma1','bay1','spo1','ars','psg1','liv1','fcb1','atm1']
+                index[league] = ['rma1','bay1','spo1','ars','psg','psg1','liv1','fcb1','atm1']
 
             elif league == "epl":
 
@@ -765,8 +786,9 @@ class PolymarketProvider(OddsProvider):
         market: dict[str, Any],
         team_index: dict[str, set[str]],
     ) -> str | None:
-        team_a = str(market.get("outcomes")[0] or "").strip()
-        team_b = str(market.get("outcomes")[1] or "").strip()
+        _outcomes = market.get("outcomes") or []
+        team_a = str(_outcomes[0] or "").strip() if len(_outcomes) > 0 else ""
+        team_b = str(_outcomes[1] or "").strip() if len(_outcomes) > 1 else ""
         for league, known_ids in team_index.items():
             if team_a in known_ids or team_b in known_ids:
                 return league
@@ -906,7 +928,7 @@ class PolymarketProvider(OddsProvider):
                 event_name = (
                     event.get("title")
                     or market.get("question")
-                    or f"{outcomes[0]} vs {outcomes[-1]}"
+                    or (f"{outcomes[0]} vs {outcomes[-1]}" if len(outcomes) >= 2 else outcomes[0] if outcomes else "unknown")
                 )
         else:
             # For US sports, Polymarket slugs follow "{sport}-{away_slug}-{home_slug}[-extra]"
@@ -914,7 +936,7 @@ class PolymarketProvider(OddsProvider):
             # matching the ordering used by SX Bet (which lists home first as teamOneName).
             # Only use slug ordering when normalization resolves the codes to full names —
             # if the code isn't in the alias table it returns unchanged, signalling a miss.
-            _SLUG_ORDERED_LEAGUES = frozenset({"mlb", "mlb_spread", "mlb_totals", "nba", "nhl"})
+            _SLUG_ORDERED_LEAGUES = frozenset({"mlb", "mlb_spread", "mlb_totals", "nba", "nhl", "wnba"})
             slug = market.get("slug", "")
             slug_parts = slug.split("-")
             event_name_set = False

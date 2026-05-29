@@ -95,6 +95,8 @@ def is_game_win_loss_record(record: OddsRecord) -> bool:
     selection = record.selection_name
     if selection in ("draw", "tie"):
         return True
+    if selection in ("over", "under"):
+        return True
     identity = infer_event_identity(record)
     if not identity.home_team or not identity.away_team:
         return False

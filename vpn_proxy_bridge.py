@@ -1,14 +1,16 @@
 """
-SOCKS5 server: 127.0.0.1:1081
+SOCKS5 bridge: 127.0.0.1:1081  ->  target host (direct from pythonw.exe inside VPN)
 
-Run with pythonw.exe (not python.exe) so this process stays inside the
-Mullvad VPN tunnel. Outbound TCP connections opened here naturally egress
-through the Mullvad exit node — no need to chain through 10.64.0.1:1080.
+Accepts SOCKS5 CONNECT requests from python.exe (which is excluded from the
+Mullvad VPN tunnel) and opens the upstream connection from pythonw.exe, which
+IS inside the VPN tunnel.  Outbound connections therefore always egress through
+the Mullvad exit node.
 
-python.exe is excluded from the tunnel, so it cannot reach the VPN exit
-directly. It connects to this server instead, and the SOCKS5 CONNECT is
-fulfilled by pythonw.exe making the actual outbound connection inside the
-tunnel.
+If Mullvad is disconnected the upstream connect will fail (exit node
+unreachable) and the bridge logs an ERROR rather than silently routing through
+the Azure public IP.
+
+Matchbook is never routed here: it uses HttpClient() with no proxy_url.
 """
 import socket
 import struct
@@ -90,17 +92,19 @@ def handle(client: socket.socket) -> None:
 
         port = struct.unpack("!H", _recvall(client, 2))[0]
 
-        # --- open direct connection (goes through Mullvad VPN exit) ---
+        # --- connect directly (pythonw.exe is inside VPN tunnel) ---
+        # This process runs as pythonw.exe which is NOT in Mullvad's split-
+        # tunnel exclusion list, so its connections always exit via Mullvad.
+        # Failure here means VPN is down — explicit error, no silent bypass.
         try:
-            upstream = socket.create_connection((host, port), timeout=30)
+            upstream = socket.create_connection((host, port), timeout=10)
         except OSError as exc:
             _log(f"ERROR connecting to {host}:{port} — {exc}")
-            client.sendall(b"\x05\x04\x00\x01" + b"\x00" * 6)  # host unreachable
+            client.sendall(b"\x05\x04\x00\x01" + b"\x00" * 6)
             client.close()
             return
 
         _log(f"CONNECT {host}:{port}")
-        # success response — bound addr/port not meaningful here, send zeros
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
 
         # --- relay ---
@@ -122,7 +126,7 @@ def main() -> None:
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((LISTEN_HOST, LISTEN_PORT))
         server.listen(64)
-        _log(f"SOCKS5 server started: {LISTEN_HOST}:{LISTEN_PORT}")
+        _log(f"Bridge started (direct/VPN): {LISTEN_HOST}:{LISTEN_PORT}")
     except OSError as exc:
         _log(f"FATAL: could not bind {LISTEN_HOST}:{LISTEN_PORT} — {exc}")
         return

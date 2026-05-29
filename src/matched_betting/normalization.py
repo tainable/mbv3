@@ -799,6 +799,63 @@ TEAM_ALIASES = {
         "st louis city": "st louis city sc",
         "vancouver whitecaps fc": "vancouver whitecaps",
     },
+    "wnba": {
+        # Polymarket slug codes (3-4 chars) -> canonical team names
+        "atl":  "atlanta dream",
+        "chi":  "chicago sky",
+        "conn": "connecticut sun",
+        "dal":  "dallas wings",
+        "gsv":  "golden state valkyries",
+        "ind":  "indiana fever",
+        "la":   "los angeles sparks",
+        "las":  "las vegas aces",
+        "min":  "minnesota lynx",
+        "nyl":  "new york liberty",
+        "phx":  "phoenix mercury",
+        "por":  "portland fire",
+        "sea":  "seattle storm",
+        "tor":  "toronto tempo",
+        "wsh":  "washington mystics",
+
+        # SX Bet appends " W" to every WNBA team name (e.g. "Phoenix Mercury W").
+        # After normalize_team_name lowercases and collapses, the trailing " w" remains.
+        "atlanta dream w":           "atlanta dream",
+        "chicago sky w":             "chicago sky",
+        "connecticut sun w":         "connecticut sun",
+        "dallas wings w":            "dallas wings",
+        "golden state valkyries w":  "golden state valkyries",
+        "indiana fever w":           "indiana fever",
+        "los angeles sparks w":      "los angeles sparks",
+        "las vegas aces w":          "las vegas aces",
+        "minnesota lynx w":          "minnesota lynx",
+        "new york liberty w":        "new york liberty",
+        "phoenix mercury w":         "phoenix mercury",
+        "portland fire w":           "portland fire",
+        "seattle storm w":           "seattle storm",
+        "toronto tempo w":           "toronto tempo",
+        "washington mystics w":      "washington mystics",
+
+        # Polymarket renders Portland Fire as "PortlandFire" (no space) in outcomes
+        # and event titles.  After normalization both characters collapse so we
+        # only need the no-space form here.
+        "portlandfire": "portland fire",
+
+        # Common nicknames in case any provider surfaces them
+        "dream":     "atlanta dream",
+        "sky":       "chicago sky",
+        "sun":       "connecticut sun",
+        "wings":     "dallas wings",
+        "valkyries": "golden state valkyries",
+        "fever":     "indiana fever",
+        "sparks":    "los angeles sparks",
+        "aces":      "las vegas aces",
+        "lynx":      "minnesota lynx",
+        "liberty":   "new york liberty",
+        "mercury":   "phoenix mercury",
+        "storm":     "seattle storm",
+        "tempo":     "toronto tempo",
+        "mystics":   "washington mystics",
+    },
     "mls_totals": {
         "atlanta united fc": "atlanta united",
         "chicago fire fc": "chicago fire",

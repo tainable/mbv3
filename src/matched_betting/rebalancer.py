@@ -88,12 +88,12 @@ def run_post_bet_rebalance(
     status_line = f"PM=${pm_bal:.2f}  SX=${sx_bal:.2f}  min=${rs.min_balance_usdc:.2f}"
 
     if not needs:
-        print(f"  [rebalancer] Balances OK — {status_line}")
+        print(f"  [rebalancer] Balances OK - {status_line}")
         return
 
     if direction == "both_low":
-        summary = f"both platforms below ${rs.min_balance_usdc:.2f} — manual top-up needed"
-        subject = "⚠ matched-betting: both platforms low — top-up required"
+        summary = f"both platforms below ${rs.min_balance_usdc:.2f} - manual top-up needed"
+        subject = "[!] matched-betting: both platforms low - top-up required"
         body = (
             f"Polymarket balance: ${pm_bal:.2f} USDC\n"
             f"SX Bet balance:     ${sx_bal:.2f} USDC\n"
@@ -102,10 +102,10 @@ def run_post_bet_rebalance(
         )
     else:
         direction_label = (
-            "SX Network → Polygon" if direction == "sx_to_polygon" else "Polygon → SX Network"
+            "SX Network -> Polygon" if direction == "sx_to_polygon" else "Polygon -> SX Network"
         )
         summary = f"bridge ${amount:.2f} USDC {direction_label}"
-        subject = f"⚖ matched-betting: rebalance needed — {summary}"
+        subject = f"[~] matched-betting: rebalance needed - {summary}"
         body = (
             f"Polymarket balance: ${pm_bal:.2f} USDC\n"
             f"SX Bet balance:     ${sx_bal:.2f} USDC\n"
@@ -114,11 +114,11 @@ def run_post_bet_rebalance(
             f"Bridge: https://sx.bet/wallet/bridge"
         )
 
-    print(f"  [rebalancer] ⚠  Rebalance needed — {summary}")
-    print(f"  [rebalancer]    {status_line}")
+    print(f"  [rebalancer] [!] Rebalance needed - {summary}")
+    print(f"  [rebalancer]     {status_line}")
 
     if dry_run:
-        print(f"  [rebalancer] DRY RUN — alert suppressed")
+        print(f"  [rebalancer] DRY RUN - alert suppressed")
         return
 
     try:

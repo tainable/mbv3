@@ -257,6 +257,8 @@ class MatchbookProvider(OddsProvider):
         meta_tags = event.get("meta-tags", [])
         if league == "nba":
             return any(tag.get("url-name") == "nba" for tag in meta_tags)
+        if league == "wnba":
+            return any(tag.get("url-name") == "wnba" for tag in meta_tags)
         if league in ("mlb", "mlb_spread", "mlb_totals"):
             # Sport ID 3 already scopes the API response to baseball events, so
             # trust it rather than relying on meta-tag values which vary by market.
@@ -822,6 +824,7 @@ def _runner_is_favourite(runner: dict) -> bool:
 
 LEAGUE_SPORT_IDS = {
     "nba": 4,
+    "wnba": 4,  # Same basketball sport ID as NBA; filtered by meta-tag url-name 'wnba'
     "mlb": 3,
     "mlb_spread": 3,  # Same sport ID as mlb (baseball); events are filtered by run-line market name
     "mlb_totals": 3,  # Same sport ID (baseball); events are filtered by totals market name
@@ -839,6 +842,7 @@ LEAGUE_SPORT_IDS = {
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
+    "wnba": "basketball",
     "mlb": "baseball",
     "mlb_spread": "baseball",
     "mlb_totals": "baseball",

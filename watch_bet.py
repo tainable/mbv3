@@ -17,11 +17,12 @@ Exit codes from scan.py that the daemon treats specially:
   0 → success (keep running)
   1 → crash (backoff + retry)
   2 → HALT (failed-leg incident — stop and alert, require human restart)
+  3 → BANKROLL (balance below minimum — 24h cooldown, retry up to 3× total, then stop)
 
 Usage
 -----
     py watch_bet.py --budget 50 --providers polymarket sx_bet --min-profit 0.5
-    py watch_bet.py --budget 50 --log daemon.log --interval 180
+    py watch_bet.py --budget 50 --log daemon.log --interval 1200
     Get-Content daemon.log -Wait -Tail 30    # follow log on Windows
 """
 from __future__ import annotations
@@ -48,6 +49,8 @@ _BACKOFF = [30, 60, 120, 300]
 
 # scan.py exit code that signals a halted state requiring human review
 _EXIT_HALT = 2
+# scan.py exit code that signals bankroll is below the minimum threshold
+_EXIT_BANKROLL = 3
 
 
 def _now() -> str:
@@ -163,15 +166,20 @@ def _build_ids_cmd(args: argparse.Namespace) -> list[str]:
     return cmd
 
 
-def _build_scan_cmd(args: argparse.Namespace) -> list[str]:
+def _build_scan_cmd(args: argparse.Namespace, disabled_providers: set[str]) -> list[str]:
     cmd = [sys.executable, "scan.py", "--auto-bet", "--budget", str(args.budget)]
-    if args.providers:
-        cmd += ["--providers"] + args.providers
+    active = [p for p in (args.providers or []) if p not in disabled_providers]
+    if active:
+        cmd += ["--providers"] + active
     if args.leagues:
         cmd += ["--leagues"] + args.leagues
     cmd += ["--min-profit", str(args.min_profit)]
     if args.bet_dry_run:
         cmd.append("--bet-dry-run")
+    if args.allow_topup:
+        cmd.append("--allow-topup")
+    if args.scan_delay > 0:
+        cmd += ["--scan-delay", str(args.scan_delay)]
     return cmd
 
 
@@ -184,8 +192,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="24/7 matched-betting daemon: runs ids.py + scan.py in a loop."
     )
-    parser.add_argument("--interval", type=int, default=300, metavar="SECS",
-                        help="Seconds between scan.py runs (default: 300).")
+    parser.add_argument("--interval", type=int, default=600, metavar="SECS",
+                        help="Seconds between scan.py runs (default: 600).")
     parser.add_argument("--ids-refresh-interval", type=int, default=360, metavar="MINS",
                         help="Minutes between ids.py re-runs (default: 360).")
     parser.add_argument("--scan-timeout", type=int, default=600, metavar="SECS",
@@ -198,16 +206,27 @@ def main() -> None:
                         help="How long to pause after hitting the crash limit (default: 3600).")
     parser.add_argument("--budget", type=float, default=50.0, metavar="USDC",
                         help="Max stake budget passed to scan.py --budget (default: 50).")
-    parser.add_argument("--min-profit", type=float, default=0.5, metavar="PCT",
-                        help="Min net profit %% passed to scan.py (default: 0.5).")
+    parser.add_argument("--min-profit", type=float, default=0.0, metavar="PCT",
+                        help="Min net profit %% passed to scan.py (default: 0.0).")
     parser.add_argument("--providers", nargs="+", metavar="PROVIDER",
                         help="Providers passed to ids.py and scan.py.")
     parser.add_argument("--leagues", nargs="+", metavar="LEAGUE",
                         help="Leagues passed to ids.py and scan.py.")
     parser.add_argument("--bet-dry-run", action="store_true",
                         help="Pass --bet-dry-run to every scan.py run (simulate bets, no real placement).")
+    parser.add_argument("--allow-topup", action="store_true",
+                        help="Pass --allow-topup to every scan.py run (incremental Kelly top-ups on improved arbs).")
+    parser.add_argument("--scan-delay", type=float, default=0.0, metavar="SECS",
+                        help="Extra pause between games passed to scan.py (default: 0.0). "
+                             "Use to reduce Matchbook request rate.")
     parser.add_argument("--skip-initial-ids", action="store_true",
                         help="Skip the ids.py run at startup and use the existing IDs file.")
+    parser.add_argument("--redeem-interval", type=int, default=480, metavar="MINS",
+                        help="Minutes between Polymarket redemption runs and platform re-enable checks (default: 480 = 8h, 0 = disabled).")
+    parser.add_argument("--platform-balance-threshold", type=float, default=12.0, metavar="USD",
+                        help="USD free-funds floor; a platform is disabled when its balance drops below this (default: 12.0).")
+    parser.add_argument("--redeem-timeout", type=int, default=300, metavar="SECS",
+                        help="Kill the redeem run after this many seconds (default: 300).")
     parser.add_argument("--log", metavar="FILE", default=None,
                         help="Write all output to FILE (headless mode). "
                              "Monitor with: Get-Content FILE -Wait -Tail 30")
@@ -230,13 +249,17 @@ def main() -> None:
     started_at = _now()
     scan_count = 0
     crash_count = 0
+    disabled_providers: set[str] = set()
     last_ids_refresh: float | None = time.monotonic() if args.skip_initial_ids else None
+    last_redeem:      float | None = None  # None = run on first iteration
 
     mode = "DRY RUN" if args.bet_dry_run else "LIVE"
     _log(_SEP)
     _log(f"  watch_bet daemon starting  [{mode}]")
     _log(f"  budget={args.budget} USDC  min-profit={args.min_profit}%  "
          f"interval={args.interval}s  ids-refresh={args.ids_refresh_interval}m")
+    redeem_note = f"every {args.redeem_interval}m" if args.redeem_interval else "disabled"
+    _log(f"  pm-redeem/platform-check={redeem_note}  balance-threshold=${args.platform_balance_threshold:.2f}")
     if args.skip_initial_ids:
         _log(f"  --skip-initial-ids: using existing IDs file, next refresh in {args.ids_refresh_interval}m")
     _log(_SEP)
@@ -264,17 +287,85 @@ def main() -> None:
                 _log(f"  ✓  IDs refreshed")
             last_ids_refresh = time.monotonic()
 
+        # ── 1.5. Redeem Polymarket + re-enable platforms if due ──────────────
+        if args.redeem_interval > 0:
+            redeem_age_mins = (now - last_redeem) / 60 if last_redeem is not None else None
+            redeem_due = last_redeem is None or redeem_age_mins >= args.redeem_interval
+            if redeem_due:
+                _log(_SEP)
+                _log(f"  PM REDEEM + PLATFORM CHECK (age={redeem_age_mins:.0f}m)" if redeem_age_mins else "  PM REDEEM + PLATFORM CHECK (startup)")
+                _log(_SEP)
+                redeem_cmd = [sys.executable, "portfolio.py", "--redeem-pm"]
+                try:
+                    redeem_rc, redeem_timeout = _run_subprocess(
+                        redeem_cmd, args.redeem_timeout, "portfolio.py --redeem-pm"
+                    )
+                except KeyboardInterrupt:
+                    _log("  Interrupted.")
+                    break
+                if redeem_timeout or redeem_rc != 0:
+                    _log(f"  WARNING: Redeem finished with issues (exit={redeem_rc}, timeout={redeem_timeout}) -- continuing")
+                else:
+                    _log("  Redemption complete")
+                # Re-enable any platform whose balance is now above the threshold.
+                if disabled_providers and settings:
+                    try:
+                        sys.path.insert(0, str(_ROOT / "src"))
+                        from bet_executor import get_platform_balances_usd
+                        recheck = get_platform_balances_usd(settings, providers=list(args.providers or []))
+                        newly_enabled = {
+                            p for p in disabled_providers
+                            if (recheck.get(p) or 0.0) >= args.platform_balance_threshold
+                        }
+                        if newly_enabled:
+                            disabled_providers -= newly_enabled
+                            _log(f"  Re-enabled providers: {', '.join(sorted(newly_enabled))}")
+                        else:
+                            _log(f"  No providers re-enabled (still below ${args.platform_balance_threshold:.2f}): "
+                                 f"{', '.join(sorted(disabled_providers))}")
+                    except Exception as exc:
+                        _log(f"  (platform re-enable check failed: {exc})")
+                last_redeem = time.monotonic()
+
         # ── 2. Run scan ────────────────────────────────────────────────────
+        active_providers = [p for p in (args.providers or []) if p not in disabled_providers]
+        if not active_providers:
+            _log("  All providers disabled (low balance) -- skipping scan until next platform check.")
+            try:
+                time.sleep(args.interval)
+            except KeyboardInterrupt:
+                _log("  Interrupted.")
+                break
+            continue
+
         _log(_SEP)
-        _log(f"  SCAN #{scan_count + 1}")
+        _log(f"  SCAN #{scan_count + 1}" + (f"  (disabled: {', '.join(sorted(disabled_providers))})" if disabled_providers else ""))
         _log(_SEP)
-        scan_cmd = _build_scan_cmd(args)
+        scan_cmd = _build_scan_cmd(args, disabled_providers)
         try:
             scan_rc, scan_timeout = _run_subprocess(scan_cmd, args.scan_timeout, "scan.py")
             scan_count += 1
         except KeyboardInterrupt:
             _log("  Interrupted.")
             break
+
+        # ── 2.5. Check per-platform balances after scan ───────────────────
+        if settings:
+            try:
+                sys.path.insert(0, str(_ROOT / "src"))
+                from bet_executor import get_platform_balances_usd
+                balances_usd = get_platform_balances_usd(settings, providers=list(args.providers or []))
+                for prov, bal in balances_usd.items():
+                    if bal is not None and bal < args.platform_balance_threshold and prov not in disabled_providers:
+                        disabled_providers.add(prov)
+                        _log(f"  WARNING: {prov} free funds ${bal:.2f} below ${args.platform_balance_threshold:.2f} -- disabled from scan")
+                        _send_alert(
+                            f"{prov} disabled - low balance",
+                            f"Free funds: ${bal:.2f} USD (threshold ${args.platform_balance_threshold:.2f})",
+                            settings,
+                        )
+            except Exception as exc:
+                _log(f"  (balance check failed: {exc})")
 
         # ── 3. Update heartbeat ────────────────────────────────────────────
         _write_heartbeat({
@@ -284,36 +375,47 @@ def main() -> None:
             "last_ids_refresh_at":  datetime.fromtimestamp(
                                         last_ids_refresh, tz=timezone.utc
                                     ).isoformat().replace("+00:00", "Z"),
+            "last_redeem_at":       (
+                datetime.fromtimestamp(last_redeem, tz=timezone.utc)
+                .isoformat().replace("+00:00", "Z")
+                if last_redeem is not None else None
+            ),
             "scan_count":           scan_count,
             "consecutive_crashes":  crash_count,
+            "disabled_providers":   sorted(disabled_providers),
         })
 
         # ── 4. Handle halt (failed-leg incident) ──────────────────────────
         if scan_rc == _EXIT_HALT:
-            _log("  ⛔  scan.py exited with HALT code — a leg placement failed.")
-            _log("  ⛔  Daemon stopping. Review outputs/bet_log.jsonl, then restart manually.")
+            _log("  DAEMON STOPPED -- scan.py exited with HALT code (failed leg placement).")
+            _log("  Review outputs/bet_log.jsonl for the unhedged position, then restart manually.")
             if settings:
                 _send_alert(
-                    "⛔ watch_bet DAEMON STOPPED — FAILED LEG",
+                    "watch_bet DAEMON STOPPED - FAILED LEG",
                     "scan.py exited with halt code 2. "
                     "Check outputs/bet_log.jsonl for the unhedged position.",
                     settings,
                 )
             break
 
+        # ── 4b. exit code 3 (old bankroll halt) — now handled by per-platform disabling ──
+        if scan_rc == _EXIT_BANKROLL:
+            _log("  (exit code 3: old bankroll signal -- per-platform balance check will handle low funds)")
+            # fall through to normal handling
+
         # ── 5. Handle crash / timeout ─────────────────────────────────────
-        if scan_timeout or scan_rc != 0:
+        if scan_timeout or (scan_rc != 0 and scan_rc != _EXIT_BANKROLL):
             crash_count += 1
             backoff = _backoff_secs(crash_count)
             reason = f"timeout after {args.scan_timeout}s" if scan_timeout else f"exit code {scan_rc}"
-            _log(f"  ⚠  scan.py failed ({reason}) — crash #{crash_count}, backing off {backoff}s")
+            _log(f"  WARNING: scan.py failed ({reason}) -- crash #{crash_count}, backing off {backoff}s")
 
             if crash_count > args.max_restarts:
                 pause = args.pause_on_max_restarts
-                _log(f"  ⛔  Circuit breaker: {crash_count} consecutive crashes — pausing {pause}s")
+                _log(f"  CIRCUIT BREAKER: {crash_count} consecutive crashes -- pausing {pause}s")
                 if settings:
                     _send_alert(
-                        f"⛔ watch_bet circuit breaker: {crash_count} crashes",
+                        f"watch_bet circuit breaker: {crash_count} crashes",
                         f"scan.py has crashed {crash_count} times in a row ({reason}). "
                         f"Pausing {pause}s before resuming.",
                         settings,
@@ -335,7 +437,7 @@ def main() -> None:
 
         # ── 6. Success — sleep until next scan ────────────────────────────
         crash_count = 0
-        _log(f"  ✓  Scan #{scan_count} complete. Next scan in {args.interval}s.")
+        _log(f"  Scan #{scan_count} complete. Next scan in {args.interval}s.")
         try:
             time.sleep(args.interval)
         except KeyboardInterrupt:

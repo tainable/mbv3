@@ -123,6 +123,7 @@ def build_aggregated_games_payload(
                     "polymarket_market_id": None,
                     "matchbook_event_id": None,
                     "sx_bet_market_hash": None,
+                    "sx_bet_outcome_one_team": None,
                     "polymarket_over_back_odds": None,
                     "polymarket_under_back_odds": None,
                     "matchbook_over_back_odds": None,
@@ -143,17 +144,16 @@ def build_aggregated_games_payload(
                         continue
                     key = (record.provider, sel, record.selection_side.lower())
                     current = best_by_provider_slot.get(key)
-                    try:
-                        if current is None:
-                            best_by_provider_slot[key] = (index, record)
-                        elif record.selection_side.lower() == "lay":
-                            if record.decimal_odds < current[1].decimal_odds:
-                                best_by_provider_slot[key] = (index, record)
-                        else:
-                            if record.decimal_odds > current[1].decimal_odds:
-                                best_by_provider_slot[key] = (index, record)
-                    except TypeError:
+                    if record.decimal_odds is None:
+                        continue
+                    if current is None:
                         best_by_provider_slot[key] = (index, record)
+                    elif record.selection_side.lower() == "lay":
+                        if current[1].decimal_odds is None or record.decimal_odds < current[1].decimal_odds:
+                            best_by_provider_slot[key] = (index, record)
+                    else:
+                        if current[1].decimal_odds is None or record.decimal_odds > current[1].decimal_odds:
+                            best_by_provider_slot[key] = (index, record)
 
                 for provider_name in ("polymarket", "matchbook", "sx_bet"):
                     for ou_slot in ("over", "under"):
@@ -190,6 +190,15 @@ def build_aggregated_games_payload(
                         if key[0] == provider_name:
                             _, record = best_by_provider_slot[key]
                             entry[id_field] = getattr(record, id_attr)
+                            # SX Bet: store which outcome is outcomeOne so
+                            # _sx_outcome_for() bets Over vs Under on the correct side.
+                            # Without this, _sx_outcome_for falls back to team-name
+                            # matching which never matches "Over"/"Under", causing
+                            # both sure-bet legs to land on the same side.
+                            if provider_name == "sx_bet":
+                                outcome_one = (record.metadata or {}).get("outcome_one_team")
+                                if outcome_one:
+                                    entry["sx_bet_outcome_one_team"] = outcome_one
                             break
 
                 payload.append(entry)
@@ -283,17 +292,16 @@ def build_aggregated_games_payload(
                     side = record.selection_side.lower()
                     key = (record.provider, team_slot, side)
                     cur = best_sp.get(key)
-                    try:
-                        if cur is None:
-                            best_sp[key] = (index, record)
-                        elif side == "lay":
-                            if record.decimal_odds < cur[1].decimal_odds:
-                                best_sp[key] = (index, record)
-                        else:
-                            if record.decimal_odds > cur[1].decimal_odds:
-                                best_sp[key] = (index, record)
-                    except TypeError:
+                    if record.decimal_odds is None:
+                        continue
+                    if cur is None:
                         best_sp[key] = (index, record)
+                    elif side == "lay":
+                        if cur[1].decimal_odds is None or record.decimal_odds < cur[1].decimal_odds:
+                            best_sp[key] = (index, record)
+                    else:
+                        if cur[1].decimal_odds is None or record.decimal_odds > cur[1].decimal_odds:
+                            best_sp[key] = (index, record)
 
                 for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet"):
                     for team_slot in ("team1", "team2"):
@@ -439,17 +447,16 @@ def build_aggregated_games_payload(
             side = record.selection_side.lower()
             key = (record.provider, team_slot, side)
             current = best_by_provider_team.get(key)
-            try:
-                if current is None:
-                    best_by_provider_team[key] = (index, record)
-                elif side == "lay":
-                    if record.decimal_odds < current[1].decimal_odds:
-                        best_by_provider_team[key] = (index, record)
-                else:
-                    if record.decimal_odds > current[1].decimal_odds:
-                        best_by_provider_team[key] = (index, record)
-            except TypeError:
+            if record.decimal_odds is None:
+                continue
+            if current is None:
                 best_by_provider_team[key] = (index, record)
+            elif side == "lay":
+                if current[1].decimal_odds is None or record.decimal_odds < current[1].decimal_odds:
+                    best_by_provider_team[key] = (index, record)
+            else:
+                if current[1].decimal_odds is None or record.decimal_odds > current[1].decimal_odds:
+                    best_by_provider_team[key] = (index, record)
 
         for provider_name in ("polymarket", "matchbook", "smarkets", "sx_bet", "azuro"):
             for team_slot in ("team1", "draw", "team2"):

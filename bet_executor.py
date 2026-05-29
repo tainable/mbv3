@@ -96,6 +96,91 @@ def _names_match(a: str, b: str) -> bool:
     return bool(shorter) and shorter.issubset(longer)
 
 
+def _legs_match_exactly(proposed: list[dict], committed: list[dict]) -> bool:
+    """Return True if proposed and committed legs are the same set (bijection).
+
+    Same leg = same platform (case-insensitive), same side, matching team name.
+    """
+    if len(proposed) != len(committed):
+        return False
+    used = [False] * len(committed)
+    for p_leg in proposed:
+        matched = False
+        for i, c_leg in enumerate(committed):
+            if not used[i] and (
+                p_leg.get("platform", "").lower() == c_leg.get("platform", "").lower()
+                and p_leg.get("side") == c_leg.get("side")
+                and _names_match(p_leg.get("team", ""), c_leg.get("team", ""))
+            ):
+                used[i] = True
+                matched = True
+                break
+        if not matched:
+            return False
+    return True
+
+
+def _arb_legs(arb_type: str, arb: dict) -> list[dict]:
+    """Return structured legs for an arb: each leg is {platform, side, team}.
+
+    Used to record which (platform, side, outcome) combinations were committed
+    so the directional duplicate guard can allow opposite-direction arbs while
+    blocking same-direction ones.
+    """
+    if arb_type == "sure_bet":
+        legs = [
+            {"platform": arb.get("team1_back_provider", ""), "side": "back", "team": arb.get("team1", "")},
+            {"platform": arb.get("team2_back_provider", ""), "side": "back", "team": arb.get("team2", "")},
+        ]
+        if arb.get("draw_back_provider"):
+            legs.append({"platform": arb["draw_back_provider"], "side": "back", "team": "draw"})
+        return legs
+    else:  # back_lay
+        return [
+            {"platform": arb.get("back_provider", ""), "side": "back", "team": arb.get("arb_outcome", "")},
+            {"platform": arb.get("lay_provider",  ""), "side": "lay",  "team": arb.get("arb_outcome", "")},
+        ]
+
+
+def _in_proximity(game: dict, entry: dict) -> bool:
+    """Return True if *game* and a prior log *entry* are in the same market.
+
+    Same market means the spread / total-line values are close enough that
+    the directional check should apply.  Markets that are too far apart are
+    treated as independent (no blocking).
+
+    Rules
+    -----
+    * Totals vs ML/spread     → always independent (return False).
+    * Totals vs Totals        → in proximity if |total_line_a - total_line_b| <= 2.
+                                Missing total_line on either side → conservative True.
+    * ML/spread vs ML/spread  → in proximity if |spread_a - spread_b| <= 2,
+                                treating None as 0 (ML = spread 0).
+                                If entry has no "spread" key (old log entry) → conservative True.
+    """
+    is_totals_game  = (_norm(game.get("team1")  or "") == "over")
+    is_totals_entry = (_norm(entry.get("team1") or "") == "over")
+
+    # Cross-type (totals vs ML/spread): always independent
+    if is_totals_game != is_totals_entry:
+        return False
+
+    if is_totals_game:
+        g_tl = game.get("total_line")
+        e_tl = entry.get("total_line")
+        if g_tl is None or e_tl is None:
+            return True  # missing → conservative
+        return abs(g_tl - e_tl) <= 2
+    else:
+        # Old log entry without a "spread" key → conservative
+        if "spread" not in entry:
+            return True
+        g_sp = float(game.get("spread") or 0.0)
+        e_sp = float(entry.get("spread") or 0.0)
+        return abs(g_sp - e_sp) <= 2
+
+
+
 # ---------------------------------------------------------------------------
 # Platform-specific ID lookups
 # ---------------------------------------------------------------------------
@@ -336,6 +421,95 @@ def _resolve_mb_spread_runner(
     return 0, 0, None
 
 
+# Matchbook totals (over/under) market names — mirrors _TOTALS_MARKET_NAMES in matchbook.py
+_MB_TOTALS = {
+    "total",
+    "total runs",
+    "total runs (incl. extra innings)",
+    "total (incl. extra innings)",
+    "over/under",
+    "total goals",
+    "total goals (incl. overtime)",
+    "match goals",
+    "over/under goals",
+}
+
+
+def _resolve_mb_totals_runner(
+    game: dict, outcome_name: str, settings
+) -> tuple[int, int, float | None]:
+    """
+    Matchbook runner resolution for totals (over/under) markets.
+
+    Searches open markets whose name is in _MB_TOTALS (e.g. 'Total Runs',
+    'Over/Under').  Matches runners by whether their name contains 'over' or
+    'under'.  When game['total_line'] is set, only accepts runners whose
+    handicap field matches that line (within 0.1 to tolerate float rounding).
+
+    Returns (market_id, runner_id, best_back_odds) or (0, 0, None).
+    """
+    event_id = game.get("matchbook_event_id")
+    if not event_id:
+        return 0, 0, None
+
+    raw_line = game.get("total_line")
+    abs_target: float | None = None
+    if raw_line is not None:
+        try:
+            abs_target = abs(float(raw_line))
+        except (TypeError, ValueError):
+            pass
+
+    http = HttpClient()
+    mb   = settings.matchbook
+
+    token_resp = http.post_json(
+        f"{mb.base_url}/bpapi/rest/security/session",
+        payload={"username": mb.username, "password": mb.password},
+        headers={"Accept": "application/json"},
+    )
+    token = token_resp.get("session-token")
+    if not token:
+        raise RuntimeError(f"Matchbook login failed: {token_resp}")
+
+    event = http.get_json(
+        f"{mb.base_url}/edge/rest/events/{event_id}",
+        headers={"session-token": token, "Accept": "application/json"},
+    )
+
+    target_side = outcome_name.lower()  # "over" or "under"
+
+    for market in event.get("markets", []):
+        if market.get("status") != "open":
+            continue
+        if str(market.get("name") or "").lower().strip() not in _MB_TOTALS:
+            continue
+
+        for runner in market.get("runners", []):
+            runner_name = str(runner.get("name") or "").lower()
+            if target_side not in runner_name:
+                continue
+
+            # Verify total line if we know the target.
+            if abs_target is not None and runner.get("handicap") is not None:
+                try:
+                    if abs(abs(float(runner["handicap"])) - abs_target) >= 0.1:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+
+            prices = runner.get("prices", [])
+            best_back = None
+            for p in prices:
+                if str(p.get("side") or "").lower() == "back":
+                    odds = float(p.get("decimal-odds") or p.get("odds") or 0)
+                    if odds and (best_back is None or odds > best_back):
+                        best_back = odds
+            return int(market["id"]), int(runner["id"]), best_back
+
+    return 0, 0, None
+
+
 # ---------------------------------------------------------------------------
 # Placed-game tracking — prevent duplicate bets on the same match
 # ---------------------------------------------------------------------------
@@ -346,8 +520,9 @@ def log_arb_success(
     game: dict,
     results: list[dict] | None = None,
     dry_run: bool = False,
+    topup: bool = False,
 ) -> None:
-    """Append a PLACED/DRY_RUN entry to bet_log.jsonl."""
+    """Append a PLACED/PLACED_TOPUP/DRY_RUN entry to bet_log.jsonl."""
     from datetime import datetime, timezone
 
     if arb_type == "sure_bet":
@@ -370,26 +545,47 @@ def log_arb_success(
 
     entry = {
         "timestamp":      datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        "status":         "DRY_RUN" if dry_run else "PLACED",
+        "status":         "DRY_RUN" if dry_run else ("PLACED_TOPUP" if topup else "PLACED"),
         "arb_type":       arb_type,
         "team1":          game.get("team1"),
         "team2":          game.get("team2"),
         "league":         game.get("league"),
         "date_time":      game.get("date_time"),
+        "spread":         game.get("spread"),
+        "total_line":     game.get("total_line"),
         "profit_pct":     arb.get("profit_pct"),
         "scanned_odds":   scanned_odds,
         "execution_odds": execution_odds or None,
+        "legs":           _arb_legs(arb_type, arb),
     }
     _BET_LOG.parent.mkdir(parents=True, exist_ok=True)
     with _BET_LOG.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
 
 
-def game_already_bet(game: dict, window_hours: float = 36.0) -> bool:
-    """
-    Return True if bet_log.jsonl contains a PLACED entry for this game within
-    window_hours.  Matches on normalised team names so minor spelling differences
-    across providers don't create false negatives.
+def game_already_bet(
+    game: dict,
+    proposed_legs: list[dict] | None = None,
+    window_hours: float = 36.0,
+) -> bool:
+    """Return True if placing *proposed_legs* would conflict with a prior bet.
+
+    A conflict means a proposed leg shares the same (platform, side, team/outcome)
+    as a committed leg recorded in bet_log.jsonl within *window_hours*.
+
+    Market proximity rules
+    ----------------------
+    Before the directional check, each prior entry must be *in the same market*
+    as the incoming game (via ``_in_proximity``).  Entries from a sufficiently
+    different spread / total-line are treated as independent and never block.
+
+    Backward compatibility
+    ----------------------
+    * If *proposed_legs* is None the function falls back to the old behaviour:
+      any PLACED entry for the same game within the window returns True.
+    * Prior log entries that lack a ``"legs"`` field (written before this change)
+      also fall back to the old conservative behaviour and return True whenever
+      they are in proximity.
     """
     if not _BET_LOG.exists():
         return False
@@ -419,14 +615,202 @@ def game_already_bet(game: dict, window_hours: float = 36.0) -> bool:
                         continue
                 except ValueError:
                     continue
-                if (
+                # Must be the same game (normalised team names)
+                if not (
                     _norm(entry.get("team1") or "") == t1
                     and _norm(entry.get("team2") or "") == t2
                 ):
+                    continue
+                # Must be in the same market (spread / total-line proximity)
+                if not _in_proximity(game, entry):
+                    continue
+                # No proposed legs supplied → old conservative behaviour
+                if proposed_legs is None:
                     return True
+                # Old entry without leg detail → conservative block
+                committed_legs = entry.get("legs")
+                if not committed_legs:
+                    return True
+                # Directional check: block if any proposed leg matches a committed leg
+                for p_leg in proposed_legs:
+                    for c_leg in committed_legs:
+                        if (
+                            p_leg.get("platform", "").lower() == c_leg.get("platform", "").lower()
+                            and p_leg.get("side") == c_leg.get("side")
+                            and _names_match(p_leg.get("team", ""), c_leg.get("team", ""))
+                        ):
+                            return True
     except Exception:
         pass
     return False
+
+
+def find_exact_prior_bet(
+    game: dict,
+    proposed_legs: list[dict],
+    window_hours: float = 36.0,
+) -> dict | None:
+    """Return the highest-profit_pct log entry whose leg set exactly matches
+    proposed_legs for this game within window_hours, or None.
+
+    Both PLACED and PLACED_TOPUP entries are considered.  The entry with the
+    highest profit_pct is returned so that subsequent top-ups always delta
+    against the most recent committed edge, not the original one.
+    """
+    if not _BET_LOG.exists():
+        return None
+    from datetime import datetime, timezone, timedelta
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=window_hours)
+    t1 = _norm(game.get("team1") or "")
+    t2 = _norm(game.get("team2") or "")
+    if not t1 or not t2:
+        return None
+    best: dict | None = None
+    try:
+        with _BET_LOG.open(encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if not raw:
+                    continue
+                try:
+                    entry = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                if entry.get("status") not in ("PLACED", "PLACED_TOPUP"):
+                    continue
+                try:
+                    ts = datetime.fromisoformat(
+                        entry.get("timestamp", "").replace("Z", "+00:00")
+                    )
+                    if ts < cutoff:
+                        continue
+                except ValueError:
+                    continue
+                if not (
+                    _norm(entry.get("team1") or "") == t1
+                    and _norm(entry.get("team2") or "") == t2
+                ):
+                    continue
+                if not _in_proximity(game, entry):
+                    continue
+                committed_legs = entry.get("legs")
+                if not committed_legs:
+                    continue
+                if not _legs_match_exactly(proposed_legs, committed_legs):
+                    continue
+                entry_profit = entry.get("profit_pct") or 0.0
+                if best is None or entry_profit > (best.get("profit_pct") or 0.0):
+                    best = entry
+    except Exception:
+        pass
+    return best
+
+
+def _kelly_frac(ks, arb_provs: set, kelly_edge: float) -> float:
+    """Compute Kelly fraction for the given edge, routing to the correct curve."""
+    if arb_provs == {"sx_bet", "polymarket"}:
+        return kelly.kelly_fraction_piecewise(kelly_edge, [
+            (ks.low_profit,        ks.low_fraction),
+            (ks.sx_pm_kink_profit, ks.sx_pm_kink_fraction),
+            (ks.high_profit,       ks.sx_pm_high_fraction),
+        ])
+    return kelly.kelly_fraction(
+        kelly_edge, ks.low_profit, ks.high_profit, ks.low_fraction, ks.high_fraction,
+    )
+
+
+def compute_topup_budget(
+    arb: dict,
+    arb_type: str,
+    prior_profit_pct: float,
+    settings,
+    gbp_rate: float | None,
+    max_budget_usdc: float,
+) -> float:
+    """Compute the top-up stake = Kelly(new_edge) - Kelly(prior_edge).
+
+    Both edges are evaluated against the current bankroll so the delta is
+    coherent.  Returns 0.0 if Kelly is disabled, balances are unavailable,
+    or the delta is below min_stake_usdc.
+    """
+    ks = getattr(settings, "kelly", None)
+    if ks is None or not ks.enabled:
+        return 0.0
+
+    arb_provs = _arb_providers(arb, arb_type)
+    balances = _fetch_all_balances(settings, providers=list(arb_provs))
+
+    rate = gbp_rate or 0.79
+    mb_gbp = balances.get("matchbook")
+    all_usd: dict[str, float | None] = {
+        "polymarket": balances.get("polymarket"),
+        "sx_bet":     balances.get("sx_bet"),
+        "matchbook":  mb_gbp / rate if mb_gbp is not None else None,
+    }
+    arb_usd = {p: all_usd.get(p) for p in arb_provs}
+    bankroll = kelly.compute_bankroll_for_arb(arb_usd)
+
+    if bankroll is None:
+        return 0.0
+
+    profit_pct = arb.get("profit_pct", 0.0)
+    profit_24h_pct = arb.get("profit_24h_pct")
+    new_edge = min(profit_pct, profit_24h_pct) if profit_24h_pct is not None else profit_pct
+    old_edge = prior_profit_pct
+
+    stake_new = _kelly_frac(ks, arb_provs, new_edge) * bankroll
+    stake_old = _kelly_frac(ks, arb_provs, old_edge) * bankroll
+
+    provider_maxes = _provider_max_budgets(arb, arb_type, balances, gbp_rate)
+    if provider_maxes:
+        cap = min(provider_maxes)
+        stake_new = min(stake_new, cap)
+        stake_old = min(stake_old, cap)
+
+    stake_new = min(stake_new, ks.max_stake_usdc, max_budget_usdc)
+    stake_old = min(stake_old, ks.max_stake_usdc, max_budget_usdc)
+
+    delta = max(0.0, stake_new - stake_old)
+
+    if delta < ks.min_stake_usdc:
+        print(
+            f"  Kelly top-up delta ${delta:.2f} below minimum ${ks.min_stake_usdc:.2f} -- skipping top-up.",
+            file=sys.stderr,
+        )
+        return 0.0
+
+    platforms_str = "+".join(sorted(arb_provs))
+    print(
+        f"  Kelly top-up: bankroll=${bankroll:.0f} ({platforms_str})  "
+        f"prior={old_edge:.2f}%  new={new_edge:.2f}%  delta=${delta:.2f}"
+    )
+    return delta
+
+
+# ---------------------------------------------------------------------------
+# Alert helpers
+# ---------------------------------------------------------------------------
+
+def _market_line_str(game: dict) -> str | None:
+    """Return a compact market descriptor for spread/totals games, or None for moneyline.
+
+    Examples:
+      mlb_totals  -> "O/U 7.5"
+      mls_totals  -> "O/U 2.5"
+      mlb_spread  -> "spread -1.5"   (negative = home team favoured)
+      mls_spread  -> "spread +1.5"   (positive = away team favoured)
+    """
+    league = game.get("league") or ""
+    if "totals" in league:
+        tl = game.get("total_line")
+        if tl is not None:
+            return f"O/U {tl}"
+    elif "spread" in league:
+        sp = game.get("spread")
+        if sp is not None:
+            sign = "+" if sp > 0 else ""
+            return f"spread {sign}{sp}"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -524,8 +908,13 @@ def _on_leg_failure(
     placed_labels = [r.get("_leg", "?") for r in placed if r.get("ok")]
     profit = arb.get("profit_pct")
     profit_str = f"{profit:.2f}%" if profit is not None else "?"
+    _mkt = _market_line_str(game)
+    _game_line = (
+        f"{game.get('team1')} vs {game.get('team2')} ({game.get('league', '?')})"
+        + (f"  [{_mkt}]" if _mkt else "")
+    )
     body = (
-        f"Game:       {game.get('team1')} vs {game.get('team2')} ({game.get('league', '?')})\n"
+        f"Game:       {_game_line}\n"
         f"Arb type:   {arb_type}  ({profit_str} net)\n"
         f"Failed leg: {failed.get('_leg', failed.get('platform', '?'))}\n"
         f"Error:      {failed.get('error', '?')}\n"
@@ -578,18 +967,20 @@ def _on_arb_success(
             if abs(diff) >= 0.005:
                 sign = "+" if diff >= 0 else ""
                 slippage_parts.append(f"{label}: {sign}{diff:.3f}")
+    _mkt = _market_line_str(game)
+    _game_desc = f"{game.get('team1')} vs {game.get('team2')}"
     body = (
-        f"Game:  {game.get('team1')} vs {game.get('team2')} ({game.get('league', '?')})\n"
-        f"Type:  {arb_type}  ({profit_str} net)\n"
-        f"Legs:\n" + "\n".join(leg_lines)
+        f"Game:  {_game_desc} ({game.get('league', '?')})"
+        + (f"  [{_mkt}]" if _mkt else "") + "\n"
+        + f"Type:  {arb_type}  ({profit_str} net)\n"
+        + "Legs:\n" + "\n".join(leg_lines)
     )
     if slippage_parts:
         body += "\nSlippage: " + "  ".join(slippage_parts)
-    notifier.send_alert(
-        f"BET PLACED +{profit_str} — {game.get('team1')} vs {game.get('team2')}",
-        body,
-        settings,
-    )
+    _subject = f"BET PLACED +{profit_str} — {_game_desc}"
+    if _mkt:
+        _subject += f" [{_mkt}]"
+    notifier.send_alert(_subject, body, settings)
 
 
 # ---------------------------------------------------------------------------
@@ -711,11 +1102,25 @@ def _provider_max_budgets(
         "matchbook":  mb_gbp / rate if mb_gbp is not None else None,
     }
 
-    # Compute each provider's USDC fraction of a unit budget
+    # Compute each provider's USDC fraction of a unit budget analytically.
+    # Previously this called _sure_bet_stakes(arb, 1.0), which triggered the
+    # rounding-error ABORT check at a $1 budget — a regime we never actually
+    # bet in — producing a false "skipping arb" message and silently disabling
+    # the per-provider balance cap when it fired.  Computing fractions directly
+    # (no rounding) avoids both problems; the real rounding guard in
+    # place_sure_bet at the actual Kelly stake is the one that matters.
     if arb_type == "sure_bet":
+        _sb_raw_legs: list[tuple[str, float]] = [
+            (arb["team1_back_provider"], arb["team1_back_odds"]),
+        ]
+        if arb.get("market_type") == "three_way" and arb.get("draw_back_odds"):
+            _sb_raw_legs.append((arb["draw_back_provider"], arb["draw_back_odds"]))
+        _sb_raw_legs.append((arb["team2_back_provider"], arb["team2_back_odds"]))
+        _sb_eff = [(prov, calculator._eff_back_odds(odds, prov)) for prov, odds in _sb_raw_legs]
+        _sb_margin = sum(1.0 / e for _, e in _sb_eff)
         usdc_fractions: dict[str, float] = {}
-        for _slot, provider, _name, _odds, fraction in _sure_bet_stakes(arb, 1.0):
-            usdc_fractions[provider] = usdc_fractions.get(provider, 0.0) + fraction
+        for _sb_prov, _sb_e in _sb_eff:
+            usdc_fractions[_sb_prov] = usdc_fractions.get(_sb_prov, 0.0) + 1.0 / (_sb_e * _sb_margin)
     else:
         back_frac, lay_frac = _back_lay_stakes(arb, 1.0)
         back_prov = arb["back_provider"]
@@ -796,10 +1201,7 @@ def _compute_kelly_budget(
     profit_24h_pct = arb.get("profit_24h_pct")
     kelly_edge = min(profit_pct, profit_24h_pct) if profit_24h_pct is not None else profit_pct
 
-    frac = kelly.kelly_fraction(
-        kelly_edge,
-        ks.low_profit, ks.high_profit, ks.low_fraction, ks.high_fraction,
-    )
+    frac = _kelly_frac(ks, arb_provs, kelly_edge)
     stake = frac * bankroll
 
     # Constrain by what each provider can actually cover
@@ -1060,6 +1462,71 @@ def _pm_liquidity_issues(tasks: list[tuple[str, Callable, dict]]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Matchbook partial-fill guard
+# ---------------------------------------------------------------------------
+
+# Matchbook offers are always LIMIT orders that can match partially — their API has
+# no FOK / IOC / all-or-nothing mode. A partially-filled offer leaves us with a
+# matched position smaller than the requested stake, which the OTHER arb legs
+# would over-hedge if placed at full size. After each Matchbook leg we compare
+# matched-stake to the requested stake; a shortfall beyond MB_FILL_TOLERANCE_GBP
+# aborts the arb (the matched portion remains as a real, now-unhedged position
+# that the alert pipeline surfaces to the operator).
+#
+# Tolerance: 5p absolute, absorbing 1p–4p rounding in Matchbook's price-ladder
+# arithmetic without ignoring meaningful shortfalls. Tune via the constant.
+MB_FILL_TOLERANCE_GBP = 0.05
+
+
+def _check_matchbook_partial_fill(
+    r:        dict,
+    settings,
+    dry_run:  bool,
+) -> dict | None:
+    """Return a synthetic failure record when a Matchbook leg matched short.
+
+    No-op for non-Matchbook legs, dry runs, and legs that already failed.
+
+    The matched portion of the offer is a real on-exchange position; the
+    caller is expected to route the returned record through _on_leg_failure
+    so the unmatched remainder is cancelled (via the standard placed-leg
+    cancellation path) and the operator is alerted.
+    """
+    if dry_run:
+        return None
+    if not r.get("ok"):
+        return None
+    leg      = str(r.get("_leg") or "").lower()
+    platform = str(r.get("platform") or "").lower()
+    if "matchbook" not in leg and platform != "matchbook":
+        return None
+
+    requested = float(r.get("amount") or 0)
+    matched   = float(r.get("matched") or 0)
+    if requested <= 0:
+        return None
+
+    if matched + MB_FILL_TOLERANCE_GBP >= requested:
+        return None  # fill is within tolerance — treat as complete
+
+    pct = (matched / requested * 100) if requested > 0 else 0.0
+    return {
+        "platform":     "Matchbook",
+        "ok":           False,
+        "partial_fill": True,
+        "_leg":         r.get("_leg", "matchbook"),
+        "matched":      matched,
+        "amount":       requested,
+        "offer_id":     r.get("offer_id"),
+        "error": (
+            f"Matchbook partial fill: matched £{matched:.2f} of £{requested:.2f} "
+            f"({pct:.1f}%) — cancelling unmatched remainder and aborting arb. "
+            f"Matched portion is an open, unhedged position."
+        ),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Main placement functions
 # ---------------------------------------------------------------------------
 
@@ -1130,8 +1597,13 @@ def place_sure_bet(
 
         elif provider == "matchbook":
             mb_stake = round(stake_usdc * gbp_rate, 2) if gbp_rate else stake_usdc
-            _is_spread_league = game.get("league") in ("mlb_spread", "mls_spread")
-            _mb_resolver = _resolve_mb_spread_runner if _is_spread_league else _resolve_mb_runner
+            _league = game.get("league")
+            if _league in ("mlb_spread", "mls_spread"):
+                _mb_resolver = _resolve_mb_spread_runner
+            elif _league in ("mlb_totals", "mls_totals"):
+                _mb_resolver = _resolve_mb_totals_runner
+            else:
+                _mb_resolver = _resolve_mb_runner
             try:
                 market_id, runner_id, _ = _mb_resolver(game, outcome_name, settings)
             except Exception as exc:
@@ -1141,7 +1613,12 @@ def place_sure_bet(
                 })
                 continue
             if not market_id:
-                _market_type = "handicap" if _is_spread_league else "moneyline"
+                if _league in ("mlb_spread", "mls_spread"):
+                    _market_type = "handicap"
+                elif _league in ("mlb_totals", "mls_totals"):
+                    _market_type = "totals"
+                else:
+                    _market_type = "moneyline"
                 pre_errors.append({
                     "platform": "Matchbook", "ok": False,
                     "error": f"No {_market_type} runner found for '{outcome_name}'",
@@ -1200,6 +1677,15 @@ def place_sure_bet(
         if not r.get("ok"):
             placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
             _on_leg_failure("sure_bet", arb, game, placed, r, settings, dry_run)
+            break
+        partial_fail = _check_matchbook_partial_fill(r, settings, dry_run)
+        if partial_fail:
+            # Keep r in `placed` so _on_leg_failure treats the matched portion as an
+            # open position (HALT + uncovered-position alert) and _cancel_placed_legs
+            # DELETEs the offer (which Matchbook applies to the unmatched remainder only).
+            placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
+            _on_leg_failure("sure_bet", arb, game, placed, partial_fail, settings, dry_run)
+            results.append(partial_fail)  # so all_legs_ok() returns False
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
     if all_legs_ok(results) and not dry_run:
@@ -1270,8 +1756,12 @@ def place_back_lay_arb(
         return [{"ok": False, "skipped": True,
                  "error": f"Leg stake below minimum ${min_stake:.2f}: {details}"}]
 
-    # Determine outcome slot for Polymarket token lookups
-    if _names_match(game.get("team1", ""), outcome_name):
+    # Determine outcome slot for Polymarket token lookups.
+    # Totals must be resolved first: "over"/"under" would otherwise fall through
+    # to slot="team2" and look up the wrong CLOB token.
+    if outcome_name.lower() in ("over", "under"):
+        slot = outcome_name.lower()
+    elif _names_match(game.get("team1", ""), outcome_name):
         slot = "team1"
     elif outcome_name.lower() in ("draw", "tie"):
         slot = "draw"
@@ -1318,8 +1808,13 @@ def place_back_lay_arb(
 
     elif back_prov == "matchbook":
         mb_stake = round(back_stake * gbp_rate, 2) if gbp_rate else back_stake
-        _is_spread_back = game.get("league") in ("mlb_spread", "mls_spread")
-        _mb_back_resolver = _resolve_mb_spread_runner if _is_spread_back else _resolve_mb_runner
+        _back_league = game.get("league")
+        if _back_league in ("mlb_spread", "mls_spread"):
+            _mb_back_resolver = _resolve_mb_spread_runner
+        elif _back_league in ("mlb_totals", "mls_totals"):
+            _mb_back_resolver = _resolve_mb_totals_runner
+        else:
+            _mb_back_resolver = _resolve_mb_runner
         try:
             market_id, runner_id, _ = _mb_back_resolver(game, outcome_name, settings)
         except Exception as exc:
@@ -1340,8 +1835,13 @@ def place_back_lay_arb(
     # ── Lay leg ───────────────────────────────────────────────────────────
     if lay_prov == "matchbook":
         mb_lay_stake = round(lay_stake * gbp_rate, 2) if gbp_rate else lay_stake
-        _is_spread_lay = game.get("league") in ("mlb_spread", "mls_spread")
-        _mb_lay_resolver = _resolve_mb_spread_runner if _is_spread_lay else _resolve_mb_runner
+        _lay_league = game.get("league")
+        if _lay_league in ("mlb_spread", "mls_spread"):
+            _mb_lay_resolver = _resolve_mb_spread_runner
+        elif _lay_league in ("mlb_totals", "mls_totals"):
+            _mb_lay_resolver = _resolve_mb_totals_runner
+        else:
+            _mb_lay_resolver = _resolve_mb_runner
         try:
             market_id, runner_id, _ = _mb_lay_resolver(game, outcome_name, settings)
         except Exception as exc:
@@ -1460,6 +1960,12 @@ def place_back_lay_arb(
         if not r.get("ok"):
             placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
             _on_leg_failure("back_lay", arb, game, placed, r, settings, dry_run)
+            break
+        partial_fail = _check_matchbook_partial_fill(r, settings, dry_run)
+        if partial_fail:
+            placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
+            _on_leg_failure("back_lay", arb, game, placed, partial_fail, settings, dry_run)
+            results.append(partial_fail)
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
     if all_legs_ok(results) and not dry_run:

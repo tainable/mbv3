@@ -26,8 +26,8 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
-ALL_LEAGUES = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+ALL_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"]
 
 
@@ -36,6 +36,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--leagues", nargs="+", default=DEFAULT_LEAGUES, choices=ALL_LEAGUES)
     league_shortcuts = parser.add_mutually_exclusive_group()
     league_shortcuts.add_argument("--nba", action="store_true", help="Shortcut for --leagues nba")
+    league_shortcuts.add_argument("--wnba", action="store_true", help="Shortcut for --leagues wnba")
     league_shortcuts.add_argument("--mlb", action="store_true", help="Shortcut for --leagues mlb")
     league_shortcuts.add_argument("--mlb-spread", action="store_true", dest="mlb_spread", help="Shortcut for --leagues mlb_spread")
     league_shortcuts.add_argument("--mlb-totals", action="store_true", dest="mlb_totals", help="Shortcut for --leagues mlb_totals")
@@ -124,7 +125,7 @@ def fetch_aggregated_games(
         except FuturesTimeoutError:
             pass  # timed out — use whatever records arrived so far
     finally:
-        executor.shutdown(wait=False)  # don't block on slow provider threads
+        executor.shutdown(wait=True, cancel_futures=True)  # wait for in-flight threads before touching records
 
     records = [r for r in records if is_game_win_loss_record(r)]
     canonical_assignment, canonical_events = match_records_to_canonical_events(records)
@@ -671,7 +672,7 @@ def _game_index_key(game: dict[str, Any]) -> tuple:
     )
 
 
-_KNOWN_LEAGUE_ORDER = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+_KNOWN_LEAGUE_ORDER = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 
 
 def _merge_market_index_additive(
@@ -845,6 +846,8 @@ def _build_market_index(aggregated_games: list[dict[str, Any]]) -> dict[str, Any
 def _resolve_leagues(args: argparse.Namespace) -> list[str]:
     if args.nba:
         return ["nba"]
+    if args.wnba:
+        return ["wnba"]
     if args.mlb:
         return ["mlb"]
     if args.mlb_spread:

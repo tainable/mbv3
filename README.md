@@ -1,6 +1,6 @@
 # matched_betting
 
-Odds ingestion and arbitrage detection system for matched betting on NBA, MLB, MLB spread, UCL, EPL, UEL, NHL, IPL, Serie A, and La Liga games.
+Odds ingestion and arbitrage detection system for matched betting on NBA, WNBA, MLB (moneyline, spread, totals), UCL, EPL, UEL, NHL, IPL, Serie A, La Liga, and MLS (moneyline, spread, totals) games.
 
 Fetches live odds from Matchbook, Smarkets, Polymarket, SX Bet, and Azuro, normalises them into a unified schema, matches records for the same game across providers, and scans for sure bets and back-lay arbs (after commission).
 
@@ -15,9 +15,18 @@ The system runs as a two-stage pipeline:
 mbv2-Default/
 ├── ids.py                          # Stage 1: discover active games → outputs/active_game_ids.json
 ├── scan.py                         # Stage 2: live scan, per-game parallel fetch + arb detection
+├── bet_executor.py                 # Auto-bet orchestration: leg ordering, sizing, placement, alerts
+├── bet.py                          # Per-platform bet placement functions (Matchbook, Polymarket, SX Bet)
 ├── arb_finder.py                   # Standalone arb finder (reads a pre-built aggregated games JSON)
 ├── run.py                          # Legacy launcher (full fetch → JSON outputs)
 ├── portfolio.py                    # Wallet balance and active bet monitor
+├── watch_bet.py                    # Live watcher: polls scan output and monitors active bet status
+├── analyse_bets.py                 # Post-hoc bet analysis and P&L reporting
+├── menu.py                         # Interactive CLI menu for common pipeline operations
+├── vpn_proxy_bridge.py             # SOCKS5 bridge: 127.0.0.1:1081 → upstream via Mullvad tunnel
+├── matchbook_bet.py                # Dev utility: direct Matchbook order placement for testing
+├── polymarket_bet.py               # Dev utility: direct Polymarket CLOB order placement for testing
+├── pm_geo_check.py                 # Dev utility: verify Polymarket geo-access via VPN bridge
 ├── find_smarkets_event_ids.py      # Dev utility: discover Smarkets competition IDs
 ├── find_sx_bet_league_ids.py       # Dev utility: discover SX Bet league IDs
 ├── src/matched_betting/
@@ -58,7 +67,13 @@ python -m venv .venv
 source .venv/bin/activate        # Windows: .venv\Scripts\activate
 ```
 
-No additional packages are required — the project uses only the Python standard library.
+Install the package and its dependencies:
+
+```bash
+pip install -e .
+```
+
+The only non-stdlib dependency is `requests` (used by the HTTP client and the notifier).
 
 ## Configuration
 
@@ -124,6 +139,10 @@ KELLY_HIGH_FRACTION=0.25
 MAX_STAKE_USDC=200             # hard cap per arb regardless of Kelly output
 MIN_STAKE_USDC=5               # skip arbs that would size below this
 MIN_BANKROLL_USDC=20           # minimum computed bankroll before Kelly kicks in
+# SX Bet / Polymarket arbs use a steeper 3-anchor piecewise curve (bridge fee breakeven at kink)
+SX_PM_KINK_PROFIT=0.44         # kink point = bridge fee threshold
+SX_PM_KINK_FRACTION=0.15       # fraction at kink
+SX_PM_HIGH_FRACTION=0.40       # fraction at KELLY_HIGH_PROFIT (vs 0.25 for other arbs)
 
 # Rebalancer — alerts when a platform USDC balance falls below MIN_BALANCE_USDC
 REBALANCER_ENABLED=true
@@ -134,27 +153,51 @@ Providers without credentials will be skipped with a warning rather than crashin
 
 ### VPN / Proxy routing
 
-Polymarket and SX Bet are geo-restricted in some regions. The pipeline supports routing their traffic through Mullvad's SOCKS5 proxy while keeping Matchbook, Smarkets, and Azuro on a direct connection.
+Polymarket and SX Bet require a non-blocked IP for trading. The pipeline routes their traffic through a local SOCKS5 bridge (`vpn_proxy_bridge.py`) while keeping Matchbook, Smarkets, and Azuro on a direct connection. **Matchbook must never be routed through the VPN** — it will suspend accounts that connect from a proxy or VPN IP.
 
-Set `VPN_PROXY_URL` in `.env`. When Mullvad VPN is connected, use the in-tunnel address — no credentials required:
+**How it works:**
+
+`vpn_proxy_bridge.py` is a lightweight SOCKS5 server that listens on `127.0.0.1:1081`. It runs as `pythonw.exe`, which sits inside the Mullvad VPN tunnel. When scan.py (running as `python.exe`, excluded from the tunnel) makes a request through the bridge, the upstream TCP connection is created by `pythonw.exe` and exits through the Mullvad relay — never through the raw Azure IP.
+
+Start the bridge before running the pipeline:
 
 ```
-VPN_PROXY_URL=socks5h://10.64.0.1:1080
+pythonw vpn_proxy_bridge.py
 ```
 
-The `socks5h` scheme sends hostnames to the proxy for DNS resolution, preventing DNS leaks.
+Then set `VPN_PROXY_URL` in `.env`:
+
+```
+VPN_PROXY_URL=socks5h://127.0.0.1:1081
+```
+
+The `socks5h` scheme sends hostnames to the bridge for resolution, preventing DNS leaks.
+
+**Mullvad relay:** Polymarket blocks trading from both US and Swedish IPs. Set the relay to Canada before starting:
+
+```
+mullvad relay set location ca
+```
+
+Montreal relays (`ca-mtr-*`) work reliably. Verify with:
+
+```
+mullvad status
+```
+
+**Split-tunnel exclusion:** Only `python.exe` (and `svchost.exe`) should be in Mullvad's split-tunnel exclusion list. `pythonw.exe` must remain inside the tunnel so the bridge's upstream connections exit via Mullvad.
 
 **Provider routing:**
 
 | Provider | Connection |
 |---|---|
-| Matchbook | Direct (always) |
+| Matchbook | Direct (always — VPN would get the account suspended) |
 | Smarkets | Direct (always) |
 | Azuro | Direct (always) |
-| Polymarket | Proxied if `VPN_PROXY_URL` is set, otherwise direct |
-| SX Bet | Proxied if `VPN_PROXY_URL` is set, otherwise direct |
+| Polymarket | Via bridge if `VPN_PROXY_URL` is set, otherwise direct |
+| SX Bet | Via bridge if `VPN_PROXY_URL` is set, otherwise direct |
 
-Before scanning, `scan.py` tests that the proxy is reachable via a TCP connect. If it is not, you are warned and asked whether to continue — requests to Polymarket and SX Bet will fail or expose your real IP if you proceed without the proxy running.
+Before scanning, `scan.py` tests that the bridge is reachable via a TCP connect. If it is not, you are warned — requests to Polymarket and SX Bet will fail or expose your real IP if you proceed without the bridge running.
 
 Leave `VPN_PROXY_URL` blank to disable proxying entirely.
 
@@ -175,7 +218,7 @@ python ids.py --out outputs/my_ids.json
 python ids.py --debug
 ```
 
-Supported leagues: `nba`, `mlb`, `mlb_spread`, `ucl`, `epl`, `uel`, `nhl`, `ipl`, `seria`, `laliga`.
+Supported leagues: `nba`, `wnba`, `mlb`, `mlb_spread`, `mlb_totals`, `ucl`, `epl`, `uel`, `nhl`, `ipl`, `seria`, `laliga`, `mls`, `mls_spread`, `mls_totals`.
 
 ### Stage 2 — scan live odds
 
@@ -203,11 +246,22 @@ Pass `--auto-bet` to automatically place every arb found. Requires `--budget` (m
 ```bash
 python scan.py --auto-bet --budget 50
 python scan.py --auto-bet --budget 50 --bet-dry-run   # build and sign orders but do not submit
+python scan.py --auto-bet --budget 50 --allow-topup   # enable incremental top-ups (see below)
 ```
 
 When `KELLY_ENABLED=true` (the default), the actual stake is determined by a profit-scaled Kelly fraction of the current bankroll rather than `--budget` directly. `--budget` acts as a hard cap. Kelly sizing is skipped if any platform balance is unavailable or the computed bankroll falls below `MIN_BANKROLL_USDC`.
 
 When both a sure bet and a back-lay arb are found on the same game, `--auto-bet` places only the **single highest-profit arb** across both lists. Lower-profit arbs for the same game are skipped and a count is printed.
+
+#### Incremental top-ups (`--allow-topup`)
+
+When `--allow-topup` is passed, if an arb is found on a game where a bet was already placed in the last 36 hours with **exactly the same leg structure** (same platform, side, and outcome on every leg), and the new profit is at least **0.1% higher** than the prior bet, an additional top-up stake is placed equal to:
+
+```
+top-up stake = Kelly(new_edge) - Kelly(prior_edge)   (evaluated at current bankroll)
+```
+
+This brings the total committed stake up to what Kelly would have sized at the higher edge from the start. If the delta falls below `MIN_STAKE_USDC` the top-up is skipped. Top-up bets are logged with status `PLACED_TOPUP` in `bet_log.jsonl`, and subsequent top-ups always delta against the highest previously committed edge for that game. Off by default — enable once bankroll is large enough for the deltas to clear the minimum stake threshold.
 
 After each successful bet, the rebalancer checks USDC balances on Polymarket (Polygon) and SX Bet (SX Network). If either drops below `MIN_BALANCE_USDC`, an alert is sent via the configured webhook.
 
@@ -282,16 +336,56 @@ SMARKETS_ZERO_COMMISSION=false
 
 ## Kelly bet sizing
 
-When `KELLY_ENABLED=true`, `--auto-bet` sizes each stake as a clamped linear function of the arb's net profit percentage, applied to the current bankroll:
+When `KELLY_ENABLED=true`, `--auto-bet` sizes each stake as a profit-scaled fraction of the current bankroll:
 
 ```
-bankroll = min(pm_balance_usd, sx_balance_usd, mb_balance_usd) × 3
-fraction = linear interpolation between (KELLY_LOW_PROFIT, KELLY_LOW_FRACTION)
-                                      and (KELLY_HIGH_PROFIT, KELLY_HIGH_FRACTION)
+bankroll = min(balances of the platforms involved in this arb) × 3
 stake    = bankroll × fraction  (clamped to [MIN_STAKE_USDC, MAX_STAKE_USDC])
 ```
 
-The ×3 factor reflects having three platforms; using the minimum balance ensures sizing is limited by whichever platform is most depleted. If any balance is unavailable, Kelly is skipped and `--budget` is used as the fixed stake.
+Only the platforms actually involved in the arb contribute to the bankroll calculation. The ×3 multiplier is fixed regardless of how many platforms are involved, so sizing is always anchored to the weakest leg. If any relevant balance is unavailable or the computed bankroll falls below `MIN_BANKROLL_USDC`, Kelly is skipped and `--budget` is used as the fixed stake.
+
+#### Standard curve (all arbs except SX Bet / Polymarket)
+
+The fraction is a clamped linear interpolation between two anchors:
+
+```
+fraction = linear interpolation between (KELLY_LOW_PROFIT,  KELLY_LOW_FRACTION)
+                                      and (KELLY_HIGH_PROFIT, KELLY_HIGH_FRACTION)
+```
+
+Example with defaults — bankroll $100:
+
+| Profit | Fraction | Stake |
+|--------|----------|-------|
+| 0.20%  | 10.0%    | $10.00 |
+| 0.50%  | 13.5%    | $13.46 |
+| 1.00%  | 19.2%    | $19.23 |
+| 1.50%  | 25.0%    | $25.00 |
+
+#### SX Bet / Polymarket arbs — kinked curve
+
+SX Bet / Polymarket arbs use a steeper 3-anchor piecewise curve. The kink sits at the bridge fee breakeven point (`SX_PM_KINK_PROFIT`): below the kink the curve rises faster than the standard linear, and above it continues to a higher ceiling (`SX_PM_HIGH_FRACTION`).
+
+```
+fraction = piecewise linear over:
+  (KELLY_LOW_PROFIT,      KELLY_LOW_FRACTION)    # 0.20% → 10%
+  (SX_PM_KINK_PROFIT,     SX_PM_KINK_FRACTION)   # 0.44% → 15%  (bridge breakeven)
+  (KELLY_HIGH_PROFIT,     SX_PM_HIGH_FRACTION)   # 1.50% → 40%
+```
+
+Example with defaults — bankroll $100:
+
+| Profit  | Fraction | Stake  | vs standard |
+|---------|----------|--------|-------------|
+| 0.20%   | 10.0%    | $10.00 | — |
+| 0.30%   | 12.1%    | $12.08 | +$0.93 |
+| 0.44% * | 15.0%    | $15.00 | +$2.23 |
+| 0.50%   | 16.4%    | $16.42 | +$2.96 |
+| 1.00%   | 28.2%    | $28.21 | +$8.98 |
+| 1.50%   | 40.0%    | $40.00 | +$15.00 |
+
+\* bridge fee breakeven — kink point
 
 ## Output
 
@@ -370,7 +464,7 @@ ids.py
 scan.py
     ├── load_settings (config.py)
     ├── calculator.configure(commission)
-    ├── build_provider_registry
+    ├── build_provider_registry (with proxied HttpClient for Polymarket/SX Bet)
     └── for each game:
           ├── ThreadPoolExecutor               # all providers in parallel for this game
           │     ├── MatchbookProvider.fetch_odds_by_ids
@@ -382,6 +476,15 @@ scan.py
           ├── calculator.find_sure_bets
           ├── calculator.find_back_lay_arbs    # print arbs immediately
           └── (if --auto-bet) kelly sizing → place bets → rebalancer check
+
+run.py  (legacy, no VPN proxy)
+    ├── load_settings (config.py)
+    ├── ThreadPoolExecutor                      # parallel full-discovery fetches
+    ├── is_game_win_loss_record filter
+    ├── match_records_to_canonical_events
+    ├── build_aggregated_games_payload
+    └── write outputs/latest_odds_{all_odds,aggregated_games,market_index}.json
+        (--update mode uses stored market IDs from market_index for targeted re-fetch)
 ```
 
 ### Step-by-step data flow
@@ -514,6 +617,8 @@ python find_sx_bet_league_ids.py --search "premier"
 
 - **Investigate liquidity numbers** — verify that `*_back_avail` / `*_lay_avail` figures (Matchbook order depth, Smarkets contract liquidity, SX Bet taker-available, Polymarket CLOB size) are computed and converted to GBP consistently.
 
-- **Investigate SX Bet further** — `type == 1` for soccer markets has not been validated against live EPL/UCL data. The back/lay probability derivation from P2P maker orders needs end-to-end verification once live soccer markets are available.
+- **Investigate SX Bet soccer markets** — `type == 1` for soccer markets has not been validated against live EPL/UCL data. The back/lay probability derivation from P2P maker orders needs end-to-end verification once live soccer markets are available.
 
 - **Azuro NHL/MLB slugs** — league slugs for NHL and MLB on the Polygon subgraph are unverified; those leagues may return 0 records gracefully until confirmed live.
+
+- **Validate MLS coverage** — MLS moneyline, spread, and totals markets (`mls`, `mls_spread`, `mls_totals`) are wired up across Polymarket, Matchbook, and SX Bet but have not been validated end-to-end against live MLS data.

@@ -70,7 +70,7 @@ except ImportError:
 import arb_finder as _arb
 import bet_executor as _exec
 
-DEFAULT_LEAGUES = ["nba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
 DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet"]  # Smarkets and Azuro excluded by default
 DEFAULT_IDS = Path("outputs/active_game_ids.json")
 
@@ -573,7 +573,7 @@ def main() -> None:
         default=DEFAULT_LEAGUES,
         choices=DEFAULT_LEAGUES,
         metavar="LEAGUE",
-        help="Leagues to scan: nba mlb mlb_spread mlb_totals ucl epl uel nhl ipl seria laliga mls mls_spread mls_totals (default: all).",
+        help="Leagues to scan: nba wnba mlb mlb_spread mlb_totals ucl epl uel nhl ipl seria laliga mls mls_spread mls_totals (default: all).",
     )
     parser.add_argument(
         "--providers",
@@ -662,6 +662,16 @@ def main() -> None:
         "--bet-dry-run",
         action="store_true",
         help="With --auto-bet: build and sign orders but do not submit them.",
+    )
+    parser.add_argument(
+        "--allow-topup",
+        action="store_true",
+        help=(
+            "With --auto-bet: place an incremental top-up bet when the same arb "
+            "is found again with a profit_pct at least 0.1%% higher than the "
+            "previously placed bet. The extra stake equals Kelly(new_edge) - "
+            "Kelly(prior_edge) against the current bankroll. Off by default."
+        ),
     )
     args = parser.parse_args()
 
@@ -834,9 +844,7 @@ def main() -> None:
                 if _exec._HALT:
                     print("  ⛔  AUTO-BET HALTED after a leg failure — restart process to resume.")
                     continue
-                if not args.bet_dry_run and _exec.game_already_bet(game):
-                    print("  ⚠  Skipping — a bet has already been placed on this game.")
-                    continue
+                # Direction check is now deferred to candidate selection below.
                 mode = "DRY RUN" if args.bet_dry_run else "LIVE"
                 print(f"  AUTO-BET [{mode}]  budget: ${args.budget:.2f} USDC per arb")
 
@@ -866,23 +874,85 @@ def main() -> None:
                 if not candidates:
                     print("    (no executable arbs for this game)")
                 else:
-                    best_pct, best_type, best_arb = max(candidates, key=lambda c: c[0])
-                    skipped = len(candidates) - 1
-                    if skipped:
-                        print(f"    {skipped} lower-profit arb(s) skipped — placing best only.")
+                    # Pick the highest-profit candidate, allowing top-ups when
+                    # the same legs were already placed at a lower edge.
+                    candidates.sort(key=lambda c: c[0], reverse=True)
+                    chosen = None
+                    chosen_topup_prior_profit: float | None = None
+                    total_skipped = 0
+                    for cand_pct, cand_type, cand_arb in candidates:
+                        if not args.bet_dry_run:
+                            cand_legs = _exec._arb_legs(cand_type, cand_arb)
+                            if args.allow_topup:
+                                prior_entry = _exec.find_exact_prior_bet(game, proposed_legs=cand_legs)
+                                if prior_entry is not None:
+                                    prior_profit = prior_entry.get("profit_pct") or 0.0
+                                    if cand_pct < prior_profit + 0.1:
+                                        total_skipped += 1
+                                        continue
+                                    # Improvement is sufficient — top-up path
+                                    chosen = (cand_pct, cand_type, cand_arb)
+                                    chosen_topup_prior_profit = prior_profit
+                                    break
+                            if _exec.game_already_bet(game, proposed_legs=cand_legs):
+                                total_skipped += 1
+                                continue
+                        chosen = (cand_pct, cand_type, cand_arb)
+                        break
+
+                    if chosen is None:
+                        print(f"    (all {total_skipped} arb(s) skipped — prior bet covers this game)")
+                        print()
+                        continue
+
+                    best_pct, best_type, best_arb = chosen
+                    is_topup = chosen_topup_prior_profit is not None
+                    if is_topup:
+                        effective_budget = _exec.compute_topup_budget(
+                            best_arb, best_type, chosen_topup_prior_profit,
+                            settings, gbp_rate, args.budget,
+                        )
+                        if effective_budget == 0.0:
+                            print(f"    (top-up skipped — delta stake below minimum)")
+                            print()
+                            continue
+                    else:
+                        effective_budget = args.budget
+                    lower_skipped = len(candidates) - total_skipped - 1
+                    if lower_skipped:
+                        print(f"    {lower_skipped} lower-profit arb(s) skipped — placing best only.")
+
+                    # Merge fresh aggregation fields (e.g. sx_bet_outcome_one_team
+                    # for totals markets) on top of the static IDs-file game dict.
+                    # The IDs file is written once by ids.py and may lack fields
+                    # that build_aggregated_games_payload computes from live records;
+                    # without this merge, _sx_outcome_for falls back to team-name
+                    # matching which always fails for Over/Under, routing both legs
+                    # to the same outcome side.
+                    #
+                    # Only overlay NON-NONE values from the fresh payload: the
+                    # aggregation initialises polymarket_*_clob_token_id to None
+                    # (because _fetch_clob_records_by_token stores the key as
+                    # "token_id", not "clob_token_id", so aggregation can't
+                    # re-derive them mid-scan).  Overwriting with None would
+                    # erase the correct token IDs that ids.py stored via the full
+                    # fetch path, which does use "clob_token_id".
+                    _fresh = games_payload[0] if games_payload else {}
+                    _bet_game = {**game, **{k: v for k, v in _fresh.items() if v is not None}}
 
                     if best_type == "sure_bet":
                         providers_in_arb = {best_arb["team1_back_provider"], best_arb["team2_back_provider"]}
                         if best_arb.get("draw_back_provider"):
                             providers_in_arb.add(best_arb["draw_back_provider"])
-                        print(f"    Placing sure-bet ({best_pct:.2f}% net)  "
+                        topup_label = f" [top-up from {chosen_topup_prior_profit:.2f}%]" if is_topup else ""
+                        print(f"    Placing sure-bet ({best_pct:.2f}% net{topup_label})  "
                               f"legs: {' | '.join(providers_in_arb)}")
                         kelly_on = getattr(settings, "kelly", None) and settings.kelly.enabled
                         if kelly_on:
                             bal_issues, bal_warns = [], []
                         else:
                             bal_issues, bal_warns = _exec.check_balances_for_arb(
-                                "sure_bet", best_arb, args.budget, settings, gbp_rate,
+                                "sure_bet", best_arb, effective_budget, settings, gbp_rate,
                             )
                         for w in bal_warns:
                             print(f"    ⚠  Balance: {w}")
@@ -892,12 +962,12 @@ def main() -> None:
                             print("    Arb skipped — insufficient funds to cover all legs.")
                         else:
                             results = _exec.place_sure_bet(
-                                best_arb, game, args.budget, settings, gbp_rate, args.bet_dry_run,
+                                best_arb, _bet_game, effective_budget, settings, gbp_rate, args.bet_dry_run,
                             )
                             _exec.print_bet_results(results)
                             if _exec.all_legs_ok(results):
                                 print("  [WATCH] ALL LEGS PLACED")
-                                _exec.log_arb_success(best_type, best_arb, game, results=results, dry_run=args.bet_dry_run)
+                                _exec.log_arb_success(best_type, best_arb, _bet_game, results=results, dry_run=args.bet_dry_run, topup=is_topup)
                                 from matched_betting import rebalancer as _rebalancer
                                 _rebalancer.run_post_bet_rebalance(settings, dry_run=args.bet_dry_run)
                                 if not args.bet_dry_run and _exec.check_bankroll_halt(settings, gbp_rate):
@@ -907,16 +977,17 @@ def main() -> None:
                         lay_note = ""
                         if best_arb["lay_provider"] == "sx_bet" and best_arb.get("market_type") == "three_way":
                             slot = best_arb.get("outcome_slot", "")
-                            if not game.get(f"sx_bet_{slot}_market_hash"):
+                            if not _bet_game.get(f"sx_bet_{slot}_market_hash"):
                                 lay_note = "  ⚠ SX Bet lay = back-opposite only (draw not covered)"
-                        print(f"    Placing back-lay ({best_pct:.2f}% net)  "
+                        topup_label = f" [top-up from {chosen_topup_prior_profit:.2f}%]" if is_topup else ""
+                        print(f"    Placing back-lay ({best_pct:.2f}% net{topup_label})  "
                               f"back: {best_arb['back_provider']} / lay: {best_arb['lay_provider']}{lay_note}")
                         kelly_on = getattr(settings, "kelly", None) and settings.kelly.enabled
                         if kelly_on:
                             bal_issues, bal_warns = [], []
                         else:
                             bal_issues, bal_warns = _exec.check_balances_for_arb(
-                                "back_lay", best_arb, args.budget, settings, gbp_rate,
+                                "back_lay", best_arb, effective_budget, settings, gbp_rate,
                             )
                         for w in bal_warns:
                             print(f"    ⚠  Balance: {w}")
@@ -926,12 +997,12 @@ def main() -> None:
                             print("    Arb skipped — insufficient funds to cover all legs.")
                         else:
                             results = _exec.place_back_lay_arb(
-                                best_arb, game, args.budget, settings, gbp_rate, args.bet_dry_run,
+                                best_arb, _bet_game, effective_budget, settings, gbp_rate, args.bet_dry_run,
                             )
                             _exec.print_bet_results(results)
                             if _exec.all_legs_ok(results):
                                 print("  [WATCH] ALL LEGS PLACED")
-                                _exec.log_arb_success(best_type, best_arb, game, results=results, dry_run=args.bet_dry_run)
+                                _exec.log_arb_success(best_type, best_arb, _bet_game, results=results, dry_run=args.bet_dry_run, topup=is_topup)
                                 from matched_betting import rebalancer as _rebalancer
                                 _rebalancer.run_post_bet_rebalance(settings, dry_run=args.bet_dry_run)
                                 if not args.bet_dry_run and _exec.check_bankroll_halt(settings, gbp_rate):

@@ -13,6 +13,7 @@ from matched_betting.providers.base import GameContext, OddsProvider
 
 LEAGUE_TO_SPORT = {
     "nba": "basketball",
+    "wnba": "basketball",
     "mlb": "baseball",
     "mlb_spread": "baseball",
     "mlb_totals": "baseball",
@@ -31,6 +32,7 @@ LEAGUE_TO_SPORT = {
 # SX Bet league IDs (from GET /leagues)
 _LEAGUE_IDS: dict[str, int | None] = {
     "nba": 1,
+    "wnba": 1384,
     "mlb": 171,
     "mlb_spread": 171,
     "mlb_totals": 171,
@@ -819,7 +821,8 @@ class SxBetProvider(OddsProvider):
             # teamOne is the side at -1.5 when spread < 0; teamTwo when spread > 0.
             # Storing this lets event_matching.py apply the home-perspective flip
             # the same way it does for Polymarket records.
-            spread_favourite = team_one if (spread is not None and spread <= 0) else team_two
+            if spread is not None:
+                spread_favourite = team_one if spread <= 0 else team_two
 
             # For MLS spread, only accept half-ball lines (0.5, 1.5, 2.5 …).
             # Integers (1.0, 2.0 …) can push; quarter-balls (0.25, 0.75 …)

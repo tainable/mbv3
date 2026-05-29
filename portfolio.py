@@ -43,16 +43,17 @@ from matched_betting.http import HttpClient
 # ── Optional deps ─────────────────────────────────────────────────────────────
 
 try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import (
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import (
         AssetType,
         BalanceAllowanceParams,
-        MarketOrderArgs,
+        MarketOrderArgsV2 as MarketOrderArgs,
         OpenOrderParams,
+        OrderPayload,
         OrderType,
         TradeParams,
     )
-    from py_clob_client.order_builder.constants import SELL as _PM_SELL
+    from py_clob_client_v2.order_builder.constants import SELL as _PM_SELL
     _PM_AVAILABLE = True
 except ImportError:
     _PM_AVAILABLE = False
@@ -88,6 +89,10 @@ _PM_USDC_NATIVE    = "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
 # SELL orders require setApprovalForAll(operator, true) from the token holder;
 # without it the CTF Exchange cannot transfer tokens and rejects the order.
 _PM_CTF_CONTRACT     = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
+# Collateral adapters used to redeem resolved positions.
+# redeemPositions(address,bytes32,bytes32,uint256[]) — burns tokens, returns pUSD.
+_PM_CTF_ADAPTER          = "0xAdA100Db00Ca00073811820692005400218FcE1f"
+_PM_NEG_RISK_CTF_ADAPTER = "0xadA2005600Dec949baf300f4C6120000bDB6eAab"
 _PM_CTF_OPERATORS    = [
     "0xE111180000d2663C0091e4f400237545B87B996B",  # CTF Exchange V2
     "0xe2222d279d744050d28e00520010520000310F59",  # Neg Risk CTF Exchange V2
@@ -152,12 +157,13 @@ def _pm_erc20_balance(token: str, address: str, rpc_list: list[str]) -> float:
     return int(raw, 16) / 1e6
 
 
-def _pm_ensure_ctf_approval(private_key: str, address: str, rpc_list: list[str]) -> None:
-    """Submit setApprovalForAll on the CTF contract for each exchange operator if not already set.
+def _pm_ensure_ctf_approval(private_key: str, address: str, rpc_list: list[str],
+                            extra_operators: list[str] | None = None) -> None:
+    """Submit setApprovalForAll on the CTF contract for each operator if not already set.
 
-    Required before the first SELL order — BUY orders use a USDC allowance; SELL orders
-    need a separate ERC1155 setApprovalForAll so the CTF Exchange can transfer tokens.
-    Each approval is a one-time on-chain transaction (~0.001 MATIC gas).
+    Required before SELL orders (exchange operators) and before redeeming via the
+    collateral adapters (extra_operators). Each approval is a one-time on-chain
+    transaction (~0.001 MATIC gas).
     """
     import time as _time
     from eth_account import Account as _EthAcct
@@ -166,7 +172,7 @@ def _pm_ensure_ctf_approval(private_key: str, address: str, rpc_list: list[str])
     gas_price = int(int(_pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
     offset    = 0
 
-    for operator in _PM_CTF_OPERATORS:
+    for operator in (_PM_CTF_OPERATORS + (extra_operators or [])):
         owner_pad    = bytes.fromhex("000000000000000000000000" + address.lower().replace("0x", ""))
         operator_pad = bytes.fromhex("000000000000000000000000" + operator.lower().replace("0x", ""))
         call_data    = "0x" + (_PM_IS_APPROVED_SEL + owner_pad + operator_pad).hex()
@@ -307,7 +313,7 @@ def fetch_polymarket(settings) -> dict:
         return result
     try:
         client  = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=_PM_CHAIN_ID)
-        client.set_api_creds(client.create_or_derive_api_creds())
+        client.set_api_creds(client.derive_api_key())
         address = client.signer.address()
         result["address"] = address
 
@@ -345,7 +351,7 @@ def fetch_polymarket(settings) -> dict:
 
         # Open (unmatched) orders
         try:
-            orders = client.get_orders(OpenOrderParams()) or []
+            orders = client.get_open_orders() or []
             result["open_orders"] = [
                 {
                     "id":           o.get("id", "?"),
@@ -368,6 +374,10 @@ def fetch_polymarket(settings) -> dict:
         # The CLOB API uses "match_time" for the trade timestamp, not "created_at".
         try:
             trades = client.get_trades(TradeParams(maker_address=address)) or []
+            trades.sort(
+                key=lambda t: t.get("match_time") or t.get("created_at") or "",
+                reverse=True,
+            )
             result["recent_trades"] = [
                 {
                     "side":    (t.get("side") or "?").upper(),
@@ -375,7 +385,11 @@ def fetch_polymarket(settings) -> dict:
                     "price":   t.get("price", "?"),
                     "size":    float(t.get("size", 0)),
                     "status":  t.get("status", "?"),
-                    "created": _fmt_ts(t.get("match_time") or t.get("created_at")),
+                    "created": (
+                        _fmt_ts(t.get("match_time"), unix=True)
+                        if t.get("match_time")
+                        else _fmt_ts(t.get("created_at"))
+                    ),
                 }
                 for t in trades[:20]
             ]
@@ -385,10 +399,17 @@ def fetch_polymarket(settings) -> dict:
 
         # Build token → earliest BUY timestamp from recent trades so positions
         # can show when they were opened (the Data API /positions has no timestamp).
-        _buy_time: dict[str, str] = {}
-        for t in reversed(result.get("recent_trades", [])):
+        # _buy_time_ts keeps the raw epoch int for sorting; _buy_time keeps the
+        # formatted string for display.  Iterating newest-first and always
+        # overwriting means the final value per token is the oldest (earliest) buy.
+        _buy_time:    dict[str, str] = {}
+        _buy_time_ts: dict[str, int] = {}
+        for t in result.get("recent_trades", []):
             if t.get("side", "").upper() == "BUY" and t.get("token") and t.get("created"):
                 _buy_time[t["token"]] = t["created"]
+        for t in trades:
+            if (t.get("side") or "").upper() == "BUY" and t.get("asset_id") and t.get("match_time"):
+                _buy_time_ts[t["asset_id"]] = int(t["match_time"])
 
         # Positions (Data API — no auth required)
         try:
@@ -398,23 +419,30 @@ def fetch_polymarket(settings) -> dict:
                 timeout=15,
             )
             positions = resp.json() if resp.ok else []
-            result["positions"] = [
-                {
-                    "title":    (p.get("title") or "")[:70],
-                    "outcome":  p.get("outcome", "?"),
-                    "size":     round(float(p.get("size", 0)), 2),
-                    "avg":      round(float(p.get("avgPrice", 0)), 4),
-                    "cur":      round(float(p.get("curPrice", 0)), 4),
-                    "value":    round(float(p.get("size", 0)) * float(p.get("curPrice", 0)), 2),
-                    "pnl":      round(
-                        (float(p.get("curPrice", 0)) - float(p.get("avgPrice", 0)))
-                        * float(p.get("size", 0)), 2
-                    ),
-                    "token_id": p.get("asset", ""),
-                    "created":  _buy_time.get(p.get("asset", ""), ""),
-                }
-                for p in positions
-            ]
+            result["positions"] = sorted(
+                [
+                    {
+                        "title":    (p.get("title") or "")[:70],
+                        "outcome":  p.get("outcome", "?"),
+                        "size":     round(float(p.get("size", 0)), 2),
+                        "avg":      round(float(p.get("avgPrice", 0)), 4),
+                        "cur":      round(float(p.get("curPrice", 0)), 4),
+                        "value":    round(float(p.get("size", 0)) * float(p.get("curPrice", 0)), 2),
+                        "pnl":      round(
+                            (float(p.get("curPrice", 0)) - float(p.get("avgPrice", 0)))
+                            * float(p.get("size", 0)), 2
+                        ),
+                        "token_id":    p.get("asset", ""),
+                        "created":     _buy_time.get(p.get("asset", ""), ""),
+                        "redeemable":  p.get("redeemable", False),
+                        "condition_id": p.get("conditionId", ""),
+                        "neg_risk":    p.get("negativeRisk", False),
+                    }
+                    for p in positions
+                ],
+                key=lambda p: _buy_time_ts.get(p["token_id"], 0),
+                reverse=True,
+            )
         except Exception as exc:
             result["positions_error"] = str(exc)
             result["positions"]       = []
@@ -432,11 +460,11 @@ def cancel_polymarket_orders(settings, order_id: str = "") -> None:
     if not pk:
         sys.exit("ERROR: POLYMARKET_PRIVATE_KEY not set")
     client = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=_PM_CHAIN_ID)
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client.set_api_creds(client.derive_api_key())
     if order_id:
-        resp = client.cancel(order_id)
+        resp = client.cancel_order(OrderPayload(orderID=order_id))
     else:
-        orders = client.get_orders(OpenOrderParams()) or []
+        orders = client.get_open_orders() or []
         if not orders:
             print("  No open Polymarket orders to cancel.")
             return
@@ -457,8 +485,11 @@ def sell_polymarket_position(settings, token_id: str, amount: float,
     pk = settings.polymarket.private_key
     if not pk:
         sys.exit("ERROR: POLYMARKET_PRIVATE_KEY not set")
+    if settings.vpn_proxy_url:
+        os.environ["HTTP_PROXY"]  = settings.vpn_proxy_url
+        os.environ["HTTPS_PROXY"] = settings.vpn_proxy_url
     client = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=_PM_CHAIN_ID)
-    client.set_api_creds(client.create_or_derive_api_creds())
+    client.set_api_creds(client.derive_api_key())
     from eth_account import Account as _EthAcct
     address  = _EthAcct.from_key(pk).address
     rpc_list = (
@@ -476,6 +507,129 @@ def sell_polymarket_position(settings, token_id: str, amount: float,
     )
     resp = client.post_order(order, OrderType.FOK)
     print(json.dumps(resp, indent=2, default=str))
+
+
+def redeem_polymarket_positions(settings, dry_run: bool = False) -> None:
+    """Redeem all resolved Polymarket positions where redeemable=True.
+
+    Calls redeemPositions() on the CTF collateral adapter once per unique
+    conditionId, burning the outcome tokens and returning pUSD to the wallet.
+    """
+    if not _ETH_AVAILABLE:
+        sys.exit("ERROR: eth-account not installed  (pip install eth-account)")
+    pk = settings.polymarket.private_key
+    if not pk:
+        sys.exit("ERROR: POLYMARKET_PRIVATE_KEY not set")
+
+    import time as _time
+    from eth_account import Account as _EthAcct
+
+    address  = _EthAcct.from_key(pk).address
+    rpc_list = (
+        [settings.polymarket.polygon_rpc_url] + _PM_RPCS
+        if settings.polymarket.polygon_rpc_url else _PM_RPCS
+    )
+
+    print(f"  Wallet: {address}")
+    resp = _requests.get(
+        f"{_PM_DATA_API}/positions",
+        params={"user": address, "sizeThreshold": "0.01"},
+        timeout=15,
+    )
+    if not resp.ok:
+        sys.exit(f"ERROR: Data API returned {resp.status_code}")
+
+    redeemable = [p for p in resp.json() if p.get("redeemable")]
+    if not redeemable:
+        print("  No redeemable positions found.")
+        return
+
+    # Deduplicate by conditionId — one tx redeems all outcomes for a market
+    seen: set[str] = set()
+    markets: list[dict] = []
+    for p in redeemable:
+        cid = p.get("conditionId", "")
+        if not cid or cid in seen:
+            continue
+        seen.add(cid)
+        markets.append({
+            "condition_id": cid,
+            "neg_risk":     p.get("negativeRisk", False),
+            "title":        (p.get("title") or "")[:60],
+        })
+
+    print(f"  Found {len(redeemable)} redeemable position(s) across {len(markets)} market(s):")
+    for m in markets:
+        tag = "  [neg-risk]" if m["neg_risk"] else ""
+        print(f"    {m['title']}{tag}")
+    print()
+
+    if dry_run:
+        print("  [DRY RUN] — no transactions submitted.")
+        return
+
+    # The collateral adapters transfer ERC-1155 tokens from the caller, so they
+    # need setApprovalForAll on the CTF contract before redeemPositions will work.
+    _pm_ensure_ctf_approval(pk, address, rpc_list,
+                            extra_operators=[_PM_CTF_ADAPTER, _PM_NEG_RISK_CTF_ADAPTER])
+
+    # Function selector: keccak256("redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+    try:
+        from eth_hash.auto import keccak as _keccak
+        redeem_sel = _keccak(b"redeemPositions(address,bytes32,bytes32,uint256[])")[:4]
+    except ImportError:
+        redeem_sel = bytes.fromhex("01b7037c")  # pre-computed from successful on-chain tx
+
+    pusd_padded  = bytes.fromhex("000000000000000000000000" + _PM_PUSD_CONTRACT.lower().replace("0x", ""))
+    parent_bytes = b"\x00" * 32
+    offset_bytes = (128).to_bytes(32, "big")   # offset to uint256[] (4 words into params)
+    length_bytes = (2).to_bytes(32, "big")      # array length = 2
+    idx1_bytes   = (1).to_bytes(32, "big")      # indexSets[0] = 1  (outcome slot 0)
+    idx2_bytes   = (2).to_bytes(32, "big")      # indexSets[1] = 2  (outcome slot 1)
+
+    nonce     = int(_pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
+    gas_price = int(int(_pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
+
+    for i, market in enumerate(markets):
+        cid_bytes = bytes.fromhex(market["condition_id"].replace("0x", ""))
+        calldata  = "0x" + (
+            redeem_sel + pusd_padded + parent_bytes + cid_bytes
+            + offset_bytes + length_bytes + idx1_bytes + idx2_bytes
+        ).hex()
+
+        contract = _PM_NEG_RISK_CTF_ADAPTER if market["neg_risk"] else _PM_CTF_ADAPTER
+        tx = {
+            "nonce":    nonce + i,
+            "gasPrice": gas_price,
+            "gas":      800_000 if market["neg_risk"] else 400_000,
+            "to":       contract,
+            "value":    0,
+            "data":     calldata,
+            "chainId":  _PM_CHAIN_ID,
+        }
+        signed  = _EthAcct.sign_transaction(tx, pk)
+        tx_hash = _pm_rpc("eth_sendRawTransaction",
+                          ["0x" + signed.raw_transaction.hex()], rpc_list)
+
+        print(f"  Redeeming: {market['title']}")
+        print(f"  tx: {tx_hash}")
+        print("    waiting", end="", flush=True)
+        for _ in range(90):
+            receipt = _pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
+            if receipt:
+                if int(receipt.get("status", "0x0"), 16) == 1:
+                    print(" OK")
+                else:
+                    print(" REVERTED")
+                    print(f"    WARNING: tx reverted — {tx_hash}")
+                break
+            _time.sleep(1)
+            print(".", end="", flush=True)
+        else:
+            print(f"\n  WARNING: tx not confirmed after 90s: {tx_hash}")
+
+    print()
+    print("  Done. Check updated pUSD balance with:  python portfolio.py --polymarket")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -829,15 +983,19 @@ def _print_polymarket(data: dict, detail: bool) -> None:
     elif "usdc_error" in data:
         print(f"  pUSD (CLOB): (error: {data['usdc_error']})")
 
-    open_orders = data.get("open_orders", [])
-    positions   = data.get("positions", [])
-    trades      = data.get("recent_trades", [])
-    total_pnl   = sum(p["pnl"]   for p in positions)
-    total_value = sum(p["value"] for p in positions)
-    pnl_str = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+    open_orders      = data.get("open_orders", [])
+    positions        = data.get("positions", [])
+    trades           = data.get("recent_trades", [])
+    total_pnl        = sum(p["pnl"]   for p in positions)
+    total_value      = sum(p["value"] for p in positions)
+    redeemable_count = sum(1 for p in positions if p.get("redeemable"))
+    pnl_str          = f"+${total_pnl:.2f}" if total_pnl >= 0 else f"-${abs(total_pnl):.2f}"
+    redeem_note      = f"  {redeemable_count} redeemable" if redeemable_count else ""
 
     print(f"  Open orders : {len(open_orders)}")
-    print(f"  Positions   : {len(positions)}  (value ${total_value:.2f}  PnL {pnl_str})")
+    print(f"  Positions   : {len(positions)}  (value ${total_value:.2f}  PnL {pnl_str}{redeem_note})")
+    if redeemable_count:
+        print(f"  (run --redeem-pm to collect {redeemable_count} resolved winning position(s))")
     print(f"  Recent trades: {len(trades)}")
 
     if "open_orders_error" in data:
@@ -865,14 +1023,15 @@ def _print_polymarket(data: dict, detail: bool) -> None:
             print(f"      id: {o['id']}")
 
     if positions:
-        _section("In-play positions  (matched — awaiting result  |  --sell-pm TOKEN to close)")
+        _section("In-play positions  (--sell-pm TOKEN to close  |  --redeem-pm to collect wins)")
         for p in positions:
             pnl_str     = f"+${p['pnl']:.2f}" if p["pnl"] >= 0 else f"-${abs(p['pnl']):.2f}"
             created_str = f"  placed {p['created']}" if p.get("created") else ""
+            redeem_str  = "  [REDEEM]" if p.get("redeemable") else ""
             print(
                 f"    {p['outcome']:<8}  {p['size']:.2f} shares"
                 f"  avg={p['avg']:.4f}  cur={p['cur']:.4f}"
-                f"  value=${p['value']:.2f}  PnL {pnl_str}{created_str}"
+                f"  value=${p['value']:.2f}  PnL {pnl_str}{created_str}{redeem_str}"
             )
             print(f"      {p['title']}")
             if p.get("token_id"):
@@ -1045,9 +1204,14 @@ def main() -> None:
         help="Number of shares to sell (required with --sell-pm).",
     )
     g.add_argument(
+        "--redeem-pm",
+        action="store_true",
+        help="Redeem all redeemable Polymarket positions (resolved markets).",
+    )
+    g.add_argument(
         "--dry-run",
         action="store_true",
-        help="With --sell-pm: build the order but do not submit it.",
+        help="With --sell-pm or --redeem-pm: preview without submitting transactions.",
     )
     g.add_argument(
         "--cancel-sx",
@@ -1060,6 +1224,12 @@ def main() -> None:
     settings = load_settings(_ROOT)
 
     # ── Cancel actions (no status fetch needed) ───────────────────────────
+    if args.redeem_pm:
+        mode = "DRY RUN — " if args.dry_run else ""
+        print(f"Redeeming resolved Polymarket positions  [{mode}Polymarket]...")
+        redeem_polymarket_positions(settings, dry_run=args.dry_run)
+        return
+
     if args.cancel_mb:
         print(f"Cancelling Matchbook offer {args.cancel_mb}...")
         cancel_matchbook_offer(settings, args.cancel_mb)

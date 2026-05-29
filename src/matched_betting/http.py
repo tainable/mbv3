@@ -80,11 +80,21 @@ class HttpClient:
                     continue
                 raise
             except HTTPError as exc:
-                if exc.response is not None and exc.response.status_code == 429 and attempt < self.max_retries:
+                status = exc.response.status_code if exc.response is not None else None
+                if status == 429 and attempt < self.max_retries:
                     delay = 2 ** (attempt + 1) + random.uniform(0, 0.5)
                     print(
                         f"  [http] 429 rate-limited by {url} — "
                         f"sleeping {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})",
+                        file=sys.stderr,
+                    )
+                    time.sleep(delay)
+                    continue
+                if status is not None and 500 <= status < 600 and attempt < self.max_retries:
+                    delay = 2 ** (attempt + 1) + random.uniform(0, 0.5)
+                    print(
+                        f"  [http] {status} server error from {url} — "
+                        f"retrying in {delay:.1f}s (attempt {attempt + 1}/{self.max_retries})",
                         file=sys.stderr,
                     )
                     time.sleep(delay)
@@ -96,5 +106,5 @@ class HttpClient:
                     except Exception:
                         pass
                 raise RuntimeError(
-                    f"HTTP {exc.response.status_code if exc.response is not None else '?'} {url}: {body}"
+                    f"HTTP {status if status is not None else '?'} {url}: {body}"
                 ) from exc
