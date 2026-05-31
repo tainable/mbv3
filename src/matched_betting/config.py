@@ -52,7 +52,8 @@ class SxBetSettings:
 
 @dataclass(frozen=True)
 class AzuroSettings:
-    subgraph_url: str
+    api_url: str
+    environment: str = "PolygonUSDT"
 
 
 @dataclass(frozen=True)
@@ -142,10 +143,11 @@ def load_settings(project_root: Path) -> Settings:
             explorer_url=os.getenv("SX_EXPLORER_URL") or "https://explorerl2.sx.technology/api",
         ),
         azuro=AzuroSettings(
-            subgraph_url=os.getenv(
-                "AZURO_SUBGRAPH_URL",
-                "https://thegraph-1.onchainfeed.org/subgraphs/name/azuro-protocol/azuro-data-feed-polygon",
+            api_url=os.getenv(
+                "AZURO_API_URL",
+                "https://api.onchainfeed.org/api/v1/public",
             ),
+            environment=os.getenv("AZURO_ENVIRONMENT", "PolygonUSDT"),
         ),
         vpn_proxy_url=os.getenv("VPN_PROXY_URL") or None,
         alert_webhook_url=os.getenv("ALERT_WEBHOOK_URL") or None,

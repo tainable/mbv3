@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -13,106 +12,49 @@ from matched_betting.normalization import normalize_team_name
 from matched_betting.providers.base import GameContext, OddsProvider
 
 
-# ── Azuro v3 data-feed schema notes ───────────────────────────────────────────
+# ── Azuro Backend API notes ────────────────────────────────────────────────────
 #
-# - conditionTypeId does NOT exist in v3. Market type is identified by
-#   outcomeId lookup against the Azuro dictionaries outcomes.json.
-# - state: Active  (not status: Created)
-# - currentOdds is a BigDecimal string (e.g. "1.72") — no 1e12 scaling.
-# - Outcome IDs are globally fixed across all Azuro deployments.
+# The data-feed subgraphs were deprecated in 2025 and no longer receive new
+# games. All feed data is fetched from the Backend REST API:
+#   https://api.onchainfeed.org/api/v1/public
 #
-# Moneyline outcomeId reference (from Azuro dictionaries outcomes.json):
+# Relevant endpoints:
+#   GET  /market-manager/games-by-filters   upcoming prematch games by league
+#   POST /market-manager/conditions-by-game-ids  conditions + odds for a batch
+#   POST /market-manager/condition-batch    targeted fetch by conditionId
 #
-#   NBA  — marketId=19, gamePeriodId=76, gameTypeId=76 "Match Winner incl. OT"
+# Odds field: "odds" (was "currentOdds" in the subgraph).
+# Pool-cap fields (maxOutcomePotentialLoss, potentialLoss) are not exposed by
+# the API; max_stake_usdc is omitted from metadata (arb_finder cap lines blank).
+#
+# Outcome IDs are globally fixed across all Azuro deployments:
+#
+#   NBA  — marketId=19, "Match Winner incl. OT"
 #           6983 = Team 1 wins,  6984 = Team 2 wins
 #
-#   EPL/UCL/UEL — marketId=1, gamePeriodId=1, gameTypeId=1 "1X2 Full Time"
+#   Soccer — marketId=1, "Full Time Result" (1X2)
 #           29 = Home (Team 1),  30 = Draw,  31 = Away (Team 2)
 #
-#   IPL  — marketId=19, gamePeriodId=76, gameTypeId=83 "Match Winner"
+#   IPL  — marketId=19, "Match Winner"
 #           7039 = Team 1 wins,  7040 = Team 2 wins
 #
-#   NHL  — marketId=19, gamePeriodId=853, gameTypeId=1 "Match Winner incl. OT/SO"
-#           16694 = Team 1 wins,  16695 = Team 2 wins
+#   NHL  — marketId=19, "Match Winner incl. OT/SO"
+#           16694 = Team 1 wins,  16695 = Team 2 wins  (unverified; no current games)
 #
-#   MLB  — marketId=19, gamePeriodId=1, gameTypeId=1 "Match Winner"
-#           6979 = Team 1 wins,  6980 = Team 2 wins
-#
-# Note: NHL and MLB slugs are unverified — those leagues may not be live on
-# the Polygon subgraph. The provider will return 0 records gracefully if so.
+#   MLB  — marketId=19, "Match Winner"
+#           7031 = Team 1 wins,  7032 = Team 2 wins
+#           (NB: 6979/6980 are soccer Draw-no-bet IDs — wrong in old code)
 
-# ── GraphQL queries ────────────────────────────────────────────────────────────
+_PER_PAGE = 50
 
-# Single parameterised query used for every league.
-# $moneylineIds filters conditions server-side to only the target market.
-_GQL_FETCH_GAMES = """
-query FetchGames(
-  $sportSlug:    String!
-  $leagueSlug:   String!
-  $after:        BigInt!
-  $moneylineIds: [String!]!
-) {
-  games(
-    where: {
-      sport_:  { slug: $sportSlug }
-      league_: { slug: $leagueSlug }
-      startsAt_gt: $after
-    }
-    orderBy: startsAt
-    orderDirection: asc
-    first: 200
-  ) {
-    gameId
-    startsAt
-    participants { name }
-    conditions(
-      where: {
-        state: Active
-        outcomesIds_contains: $moneylineIds
-      }
-    ) {
-      conditionId
-      state
-      maxOutcomePotentialLoss
-      outcomes(orderBy: sortOrder) {
-        outcomeId
-        currentOdds
-        sortOrder
-        potentialLoss
-      }
-    }
-  }
-}
-"""
-
-_GQL_FETCH_CONDITION = """
-query FetchCondition($conditionId: String!) {
-  condition(id: $conditionId) {
-    conditionId
-    state
-    maxOutcomePotentialLoss
-    outcomes(orderBy: sortOrder) {
-      outcomeId
-      currentOdds
-      sortOrder
-      potentialLoss
-    }
-    game {
-      gameId
-      startsAt
-      participants { name }
-    }
-  }
-}
-"""
 
 # ── Per-league configuration ───────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class _LeagueConfig:
     """All Azuro-specific parameters for one league."""
-    sport_slug: str               # Azuro subgraph sport slug
-    league_slug: str              # Azuro subgraph league slug
+    sport_slug: str               # Azuro sport slug
+    league_slug: str              # Azuro league slug
     sport: str                    # Internal sport name for OddsRecord
     moneyline_ids: frozenset[int] # Fixed global outcomeIds for the moneyline
     slot_map: dict[int, str]      # outcomeId → "team1" | "draw" | "team2"
@@ -122,7 +64,6 @@ class _LeagueConfig:
 
 
 # ── Basketball ─────────────────────────────────────────────────────────────────
-# marketId=19, gamePeriodId=76, gameTypeId=76 = "Match Winner incl. OT"
 _NBA = _LeagueConfig(
     sport_slug="basketball",
     league_slug="nba",
@@ -135,8 +76,6 @@ _NBA = _LeagueConfig(
 )
 
 # ── Football / Soccer ──────────────────────────────────────────────────────────
-# marketId=1, gamePeriodId=1, gameTypeId=1 = "1X2 Full Time"
-# outcomeId 29 = Home (sortOrder 0), 30 = Draw (sortOrder 1), 31 = Away (sortOrder 2)
 _SOCCER_ML_IDS   = frozenset({29, 30, 31})
 _SOCCER_SLOT_MAP = {29: "team1", 30: "draw", 31: "team2"}
 
@@ -148,7 +87,7 @@ _EPL = _LeagueConfig(
     slot_map=_SOCCER_SLOT_MAP,
     market_type="three_way",
     market_key="1-1-1",
-    market_label="1X2 Full Time",
+    market_label="Full Time Result",
 )
 
 _UCL = _LeagueConfig(
@@ -159,7 +98,7 @@ _UCL = _LeagueConfig(
     slot_map=_SOCCER_SLOT_MAP,
     market_type="three_way",
     market_key="1-1-1",
-    market_label="1X2 Full Time",
+    market_label="Full Time Result",
 )
 
 _UEL = _LeagueConfig(
@@ -170,7 +109,7 @@ _UEL = _LeagueConfig(
     slot_map=_SOCCER_SLOT_MAP,
     market_type="three_way",
     market_key="1-1-1",
-    market_label="1X2 Full Time",
+    market_label="Full Time Result",
 )
 
 _SERIA = _LeagueConfig(
@@ -181,10 +120,9 @@ _SERIA = _LeagueConfig(
     slot_map=_SOCCER_SLOT_MAP,
     market_type="three_way",
     market_key="1-1-1",
-    market_label="1X2 Full Time",
+    market_label="Full Time Result",
 )
 
-# TODO: verify the Azuro subgraph league slug for La Liga
 _LALIGA = _LeagueConfig(
     sport_slug="football",
     league_slug="la-liga",
@@ -193,12 +131,10 @@ _LALIGA = _LeagueConfig(
     slot_map=_SOCCER_SLOT_MAP,
     market_type="three_way",
     market_key="1-1-1",
-    market_label="1X2 Full Time",
+    market_label="Full Time Result",
 )
 
 # ── Cricket ────────────────────────────────────────────────────────────────────
-# marketId=19, gamePeriodId=76, gameTypeId=83 = "Match Winner"
-# Azuro league slug "premier-league" under sport "cricket" = IPL
 _IPL = _LeagueConfig(
     sport_slug="cricket",
     league_slug="premier-league",
@@ -211,9 +147,6 @@ _IPL = _LeagueConfig(
 )
 
 # ── Ice Hockey ─────────────────────────────────────────────────────────────────
-# marketId=19, gamePeriodId=853, gameTypeId=1 = "Match Winner incl. OT/SO"
-# NOTE: NHL has not been observed in the Polygon subgraph; the provider will
-# return 0 records gracefully if the league slug is wrong or unavailable.
 _NHL = _LeagueConfig(
     sport_slug="ice-hockey",
     league_slug="nhl",
@@ -226,15 +159,12 @@ _NHL = _LeagueConfig(
 )
 
 # ── Baseball ───────────────────────────────────────────────────────────────────
-# marketId=19, gamePeriodId=1, gameTypeId=1 = "Match Winner"
-# NOTE: MLB has not been observed in the Polygon subgraph; as above, the
-# provider returns 0 records gracefully if unavailable.
 _MLB = _LeagueConfig(
     sport_slug="baseball",
     league_slug="mlb",
     sport="baseball",
-    moneyline_ids=frozenset({6979, 6980}),
-    slot_map={6979: "team1", 6980: "team2"},
+    moneyline_ids=frozenset({7031, 7032}),
+    slot_map={7031: "team1", 7032: "team2"},
     market_type="two_way",
     market_key="19-1-1",
     market_label="Match Winner",
@@ -277,46 +207,67 @@ class AzuroProvider(OddsProvider):
         retrieved_at = utc_now_iso()
         records: list[OddsRecord] = []
         warnings: list[str] = []
-        now_unix = str(int(time.time()))
 
         for league_key in requested:
             cfg = _LEAGUE_CONFIGS[league_key]
-            self.debug(
-                f"{self.name}: fetching {league_key} "
-                f"({cfg.sport_slug}/{cfg.league_slug}) after unix={now_unix}"
-            )
+            self.debug(f"{self.name}: fetching {league_key} ({cfg.sport_slug}/{cfg.league_slug})")
+
             try:
-                response = self._gql(
-                    _GQL_FETCH_GAMES,
-                    {
-                        "sportSlug":    cfg.sport_slug,
-                        "leagueSlug":   cfg.league_slug,
-                        "after":        now_unix,
-                        "moneylineIds": [str(oid) for oid in sorted(cfg.moneyline_ids)],
-                    },
-                )
+                games = self._fetch_games(cfg.sport_slug, cfg.league_slug)
             except Exception as exc:
-                warnings.append(f"Azuro: {league_key} fetch failed: {exc}")
+                warnings.append(f"Azuro: {league_key} games fetch failed: {exc}")
                 continue
 
-            gql_errors = response.get("errors")
-            if gql_errors:
-                warnings.append(f"Azuro: {league_key} GraphQL errors: {gql_errors}")
+            if not games:
+                self.debug(f"{self.name}: {league_key} — 0 upcoming games")
                 continue
 
-            games = (response.get("data") or {}).get("games", [])
-            self.debug(f"{self.name}: {len(games)} {league_key} games returned from subgraph")
+            self.debug(f"{self.name}: {len(games)} upcoming {league_key} games")
 
-            for game in games:
+            # Index participant names and start times by gameId for condition lookup
+            game_info: dict[str, dict[str, Any]] = {
+                g["gameId"]: {
+                    "participants": [p["name"] for p in g.get("participants", [])],
+                    "startsAt": g.get("startsAt"),
+                }
+                for g in games
+            }
+
+            try:
+                conditions = self._fetch_conditions_by_game_ids(list(game_info))
+            except Exception as exc:
+                warnings.append(f"Azuro: {league_key} conditions fetch failed: {exc}")
+                continue
+
+            self.debug(f"{self.name}: {len(conditions)} conditions for {league_key}")
+
+            for condition in conditions:
+                if condition.get("state") != "Active":
+                    continue
+
+                outcome_ids = {int(o.get("outcomeId", 0)) for o in condition.get("outcomes", [])}
+                if not outcome_ids.issuperset(cfg.moneyline_ids):
+                    continue
+
+                game_id = (condition.get("game") or {}).get("gameId")
+                info = game_info.get(game_id, {})
+                participant_names = info.get("participants", [])
+                event_name = _build_event_name(participant_names)
+                event_start = _parse_starts_at(info.get("startsAt"))
+
                 try:
-                    game_records = self._game_to_records(game, league_key, cfg, retrieved_at)
-                    records.extend(game_records)
+                    cond_records = self._condition_to_records(
+                        condition, participant_names, league_key, cfg,
+                        event_name, event_start, retrieved_at,
+                    )
+                    records.extend(cond_records)
                     self.debug(
-                        f"{self.name}: game {game.get('gameId')} -> {len(game_records)} records"
+                        f"{self.name}: condition {condition.get('conditionId')} "
+                        f"-> {len(cond_records)} records"
                     )
                 except Exception as exc:
                     warnings.append(
-                        f"Azuro: skipped {league_key} game {game.get('gameId')}: {exc}"
+                        f"Azuro: skipped condition {condition.get('conditionId')}: {exc}"
                     )
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
@@ -341,100 +292,93 @@ class AzuroProvider(OddsProvider):
                 continue
             cfg = _LEAGUE_CONFIGS[league_key]
 
-            self.debug(
-                f"{self.name}: targeted fetch {league_key} conditionId={condition_id}"
-            )
+            self.debug(f"{self.name}: targeted fetch {league_key} conditionId={condition_id}")
             try:
-                response = self._gql(_GQL_FETCH_CONDITION, {"conditionId": condition_id})
-                gql_errors = response.get("errors")
-                if gql_errors:
-                    warnings.append(
-                        f"Azuro: GraphQL errors for {condition_id}: {gql_errors}"
-                    )
-                    continue
-                condition = (response.get("data") or {}).get("condition")
-                if not condition:
-                    warnings.append(
-                        f"Azuro: condition {condition_id} not found in subgraph"
-                    )
-                    continue
-                if condition.get("state") != "Active":
-                    self.debug(
-                        f"{self.name}: condition {condition_id} "
-                        f"state={condition.get('state')!r} — skipping"
-                    )
-                    continue
-                # Verify the condition is still the expected moneyline market
-                outcome_ids = {
-                    int(o.get("outcomeId", 0))
-                    for o in condition.get("outcomes", [])
-                }
-                if not outcome_ids.issuperset(cfg.moneyline_ids):
-                    self.debug(
-                        f"{self.name}: condition {condition_id} outcomeIds={outcome_ids} "
-                        f"— not the expected moneyline for {league_key}, skipping"
-                    )
-                    continue
-                game_data = condition.get("game") or {}
-                participant_names = _extract_participant_names(
-                    game_data.get("participants", [])
+                resp = self._api_post(
+                    "market-manager/condition-batch",
+                    {"conditionIds": [condition_id], "environment": self.settings.environment},
                 )
-                event_name = _build_event_name(participant_names)
-                event_start = _parse_starts_at(game_data.get("startsAt"))
-                condition_records = self._condition_to_records(
+            except Exception as exc:
+                warnings.append(f"Azuro: condition {condition_id} fetch failed: {exc}")
+                continue
+
+            conditions = resp.get("conditions", [])
+            if not conditions:
+                warnings.append(f"Azuro: condition {condition_id} not found")
+                continue
+
+            condition = conditions[0]
+            if condition.get("state") != "Active":
+                self.debug(
+                    f"{self.name}: condition {condition_id} "
+                    f"state={condition.get('state')!r} — skipping"
+                )
+                continue
+
+            outcome_ids = {int(o.get("outcomeId", 0)) for o in condition.get("outcomes", [])}
+            if not outcome_ids.issuperset(cfg.moneyline_ids):
+                self.debug(
+                    f"{self.name}: condition {condition_id} outcomeIds={outcome_ids} "
+                    f"— not the expected moneyline for {league_key}, skipping"
+                )
+                continue
+
+            # Participant names come from the aggregated game context (already normalised)
+            participant_names = [
+                game.get("team1") or "participant_0",
+                game.get("team2") or "participant_1",
+            ]
+            event_name = _build_event_name(participant_names)
+            event_start = game.get("date_time")
+
+            try:
+                cond_records = self._condition_to_records(
                     condition, participant_names, league_key, cfg,
                     event_name, event_start, retrieved_at,
                 )
-                records.extend(condition_records)
+                records.extend(cond_records)
                 self.debug(
                     f"{self.name}: targeted fetch conditionId={condition_id} "
-                    f"-> {len(condition_records)} records"
+                    f"-> {len(cond_records)} records"
                 )
             except Exception as exc:
-                warnings.append(
-                    f"Azuro: skipped condition {condition_id}: {exc}"
-                )
+                warnings.append(f"Azuro: skipped condition {condition_id}: {exc}")
 
         return ProviderPayload(provider=self.name, records=records, warnings=warnings)
 
     # ── Private helpers ────────────────────────────────────────────────────────
 
-    def _game_to_records(
-        self,
-        game: dict[str, Any],
-        league_key: str,
-        cfg: _LeagueConfig,
-        retrieved_at: str,
-    ) -> list[OddsRecord]:
-        participant_names = _extract_participant_names(game.get("participants", []))
-        event_name = _build_event_name(participant_names)
-        event_start = _parse_starts_at(game.get("startsAt"))
-        conditions = game.get("conditions", [])
-        self.debug(
-            f"{self.name}: game {game.get('gameId')} event_name={event_name!r} "
-            f"start={event_start} moneyline_conditions={len(conditions)}"
-        )
-
-        records: list[OddsRecord] = []
-        for condition in conditions:
-            outcome_ids = {
-                int(o.get("outcomeId", 0))
-                for o in condition.get("outcomes", [])
-            }
-            if not outcome_ids.issuperset(cfg.moneyline_ids):
-                # GQL filter should prevent this, but guard defensively
-                self.debug(
-                    f"{self.name}: skipping condition {condition.get('conditionId')} "
-                    f"outcomeIds={outcome_ids} (not the expected moneyline)"
-                )
-                continue
-            records.extend(
-                self._condition_to_records(
-                    condition, participant_names, league_key, cfg,
-                    event_name, event_start, retrieved_at,
-                )
+    def _fetch_games(self, sport_slug: str, league_slug: str) -> list[dict[str, Any]]:
+        """Fetch all upcoming prematch games for a sport/league, paginating as needed."""
+        all_games: list[dict[str, Any]] = []
+        page = 1
+        while True:
+            resp = self._api_get(
+                "market-manager/games-by-filters",
+                params={
+                    "gameState": "Prematch",
+                    "environment": self.settings.environment,
+                    "sportSlug": sport_slug,
+                    "leagueSlug": league_slug,
+                    "orderBy": "startsAt",
+                    "orderDirection": "asc",
+                    "page": page,
+                    "perPage": _PER_PAGE,
+                },
             )
-        return records
+            games = resp.get("games", [])
+            all_games.extend(games)
+            if len(games) < _PER_PAGE or page >= resp.get("totalPages", 1):
+                break
+            page += 1
+        return all_games
+
+    def _fetch_conditions_by_game_ids(self, game_ids: list[str]) -> list[dict[str, Any]]:
+        resp = self._api_post(
+            "market-manager/conditions-by-game-ids",
+            {"gameIds": game_ids, "environment": self.settings.environment},
+        )
+        return resp.get("conditions", [])
 
     def _condition_to_records(
         self,
@@ -449,20 +393,13 @@ class AzuroProvider(OddsProvider):
         condition_id = str(condition.get("conditionId"))
         records: list[OddsRecord] = []
 
-        # Per-outcome pool cap (max profit available to a single bettor per side).
-        # Remaining capacity = cap − already allocated losses.
-        try:
-            max_outcome_cap = float(condition.get("maxOutcomePotentialLoss") or 0)
-        except (TypeError, ValueError):
-            max_outcome_cap = 0.0
-
         for o in condition.get("outcomes", []):
             oid = int(o.get("outcomeId", 0))
             slot = cfg.slot_map.get(oid)
             if slot is None:
                 continue
 
-            raw_odds = o.get("currentOdds")
+            raw_odds = o.get("odds")
             if raw_odds is None:
                 continue
             try:
@@ -478,13 +415,9 @@ class AzuroProvider(OddsProvider):
             if slot == "draw":
                 selection_name = "draw"
             elif slot == "team1":
-                raw_name = (
-                    participant_names[0]
-                    if participant_names
-                    else "participant_0"
-                )
+                raw_name = participant_names[0] if participant_names else "participant_0"
                 selection_name = normalize_team_name(raw_name, league_key)
-            else:  # team2
+            else:
                 raw_name = (
                     participant_names[1]
                     if len(participant_names) > 1
@@ -492,22 +425,9 @@ class AzuroProvider(OddsProvider):
                 )
                 selection_name = normalize_team_name(raw_name, league_key)
 
-            # Max stake = remaining win capacity / (odds − 1)
-            try:
-                already_allocated = float(o.get("potentialLoss") or 0)
-            except (TypeError, ValueError):
-                already_allocated = 0.0
-            remaining_win = max(0.0, max_outcome_cap - already_allocated)
-            max_stake_usdc = (
-                round(remaining_win / (decimal_odds - 1), 2)
-                if decimal_odds > 1.0 and remaining_win > 0
-                else 0.0
-            )
-
             self.debug(
                 f"{self.name}: outcome {oid} slot={slot} "
-                f"-> selection={selection_name!r} odds={decimal_odds} "
-                f"max_stake_usdc={max_stake_usdc}"
+                f"-> selection={selection_name!r} odds={decimal_odds}"
             )
 
             records.append(
@@ -531,16 +451,21 @@ class AzuroProvider(OddsProvider):
                         "outcome_id": oid,
                         "market_key": cfg.market_key,
                         "market_name": cfg.market_label,
-                        "max_stake_usdc": max_stake_usdc,
                     },
                 )
             )
         return records
 
-    def _gql(self, query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def _api_get(self, path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self.http_client.get_json(
+            f"{self.settings.api_url}/{path}",
+            params=params,
+        )
+
+    def _api_post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
         return self.http_client.post_json(
-            self.settings.subgraph_url,
-            payload={"query": query, "variables": variables},
+            f"{self.settings.api_url}/{path}",
+            payload=payload,
         )
 
 
