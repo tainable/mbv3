@@ -247,7 +247,7 @@ async def _main_async(args: argparse.Namespace) -> None:
     # Matchbook provider (reused across all on-demand fetches)
     from matched_betting.providers.registry import build_provider_registry
     mb_http     = HttpClient(proxy_url=None)  # Matchbook always direct, never proxied
-    mb_registry = build_provider_registry(settings, http_client=mb_http, proxy_http_client=mb_http)
+    mb_registry = build_provider_registry(settings, http_client=mb_http)
     mb_provider = mb_registry.get("matchbook")
     if mb_provider:
         print("  Matchbook: on-demand fetch on every WS price change")

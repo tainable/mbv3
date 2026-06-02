@@ -189,7 +189,9 @@ async def _open_ws(uri: str, proxy_url: str | None):
     dest_port = parsed.port or (443 if parsed.scheme == "wss" else 80)
 
     from python_socks.async_.asyncio import Proxy
-    proxy = Proxy.from_url(proxy_url)
+    # python_socks doesn't recognise socks5h:// — strip the h, rdns handled by bridge
+    url = proxy_url.replace("socks5h://", "socks5://")
+    proxy = Proxy.from_url(url)
     raw_sock = await proxy.connect(dest_host=dest_host, dest_port=dest_port)
 
     ssl_ctx = ssl.create_default_context() if parsed.scheme == "wss" else None

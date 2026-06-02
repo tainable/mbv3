@@ -33,12 +33,15 @@ class OddsCache:
     # ------------------------------------------------------------------
 
     def seed(self, games_payload: list[dict[str, Any]]) -> None:
-        """Initialise from the aggregated games list (active_game_ids.json)."""
+        """Initialise from the aggregated games list (active_game_ids.json).
+
+        Does NOT mark games dirty — Matchbook fetches are only triggered
+        by real WS price updates, not by the initial seed.
+        """
         with self._lock:
             for game in games_payload:
                 gid = game_id(game)
                 self._games[gid] = dict(game)
-                self._dirty.add(gid)
 
     # ------------------------------------------------------------------
     # Writes (called from WS threads and poll threads)
