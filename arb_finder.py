@@ -33,6 +33,7 @@ from matched_betting.http import HttpClient
 # Re-export the finders so scan.py can import them from here if desired.
 find_sure_bets = calculator.find_sure_bets
 find_back_lay_arbs = calculator.find_back_lay_arbs
+find_kbo_tie_aware_arbs = calculator.find_kbo_tie_aware_arbs
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +239,52 @@ def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: f
         if az_line:
             lines.append(az_line)
         lines.append("")
+        print("\n".join(lines))
+
+
+def _print_kbo_arbs(
+    arbs: list[dict],
+    gbp_rate: float | None = None,
+    budget: float | None = None,
+) -> None:
+    if not arbs:
+        print("  None found.\n")
+        return
+    for arb in arbs:
+        started_flag = "  *** GAME STARTED ***" if calculator._game_started(arb.get("date_time")) else ""
+
+        def _avail(val, provider) -> str:
+            if val is None:
+                return ""
+            cur = "USD" if provider in ("polymarket", "sx_bet") else "GBP"
+            gbp = calculator._to_gbp(val, cur)
+            return f"  [max ~£{gbp:,.0f}]" if gbp is not None else ""
+
+        stake_poly_str = ""
+        stake_sx_str   = ""
+        if budget is not None:
+            eff_poly = calculator._eff_back_odds(arb["poly_underdog_odds"], "polymarket")
+            eff_sx   = calculator._eff_back_odds(arb["sx_fav_odds"], "sx_bet")
+            net_m    = 1.0 / eff_poly + 1.0 / eff_sx
+            s_poly   = round(budget / (eff_poly * net_m), 2)
+            s_sx     = round(budget / (eff_sx   * net_m), 2)
+            stake_poly_str = f"  stake: ${s_poly:.2f}"
+            stake_sx_str   = f"  stake: ${s_sx:.2f}"
+
+        gross_str = (
+            f"  (gross: {arb['gross_profit_pct']:.4f}%)"
+            if arb.get("gross_profit_pct") != arb.get("profit_pct")
+            else ""
+        )
+        lines = [
+            f"  [KBO] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [two_way]{started_flag}",
+            f"    Back {arb['poly_underdog_name']:<30} {arb['poly_underdog_odds']:.4f}  (polymarket){_avail(arb.get('poly_underdog_avail'), 'polymarket')}{stake_poly_str}",
+            f"    Back {arb['sx_fav_name']:<30} {arb['sx_fav_odds']:.4f}  (sx_bet){_avail(arb.get('sx_fav_avail'), 'sx_bet')}{stake_sx_str}",
+            f"    Margin: {arb['margin']:.6f}  |  Net profit: {arb['profit_pct']:.4f}%{gross_str}"
+            + (f"  |  24h: +{arb['profit_24h_pct']:.4f}%" if arb.get('profit_24h_pct') is not None else ""),
+            f"    Tie bonus: +{arb['tie_gain_pct']:.2f}% of staked  (PM pays 50c/token; SX Bet refunds)",
+            "",
+        ]
         print("\n".join(lines))
 
 

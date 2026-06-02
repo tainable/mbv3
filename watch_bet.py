@@ -53,6 +53,32 @@ _EXIT_HALT = 2
 _EXIT_BANKROLL = 3
 
 
+_HEARTBEAT_NTFY_INTERVAL = 3600  # send ntfy "alive" ping every hour
+
+_PM_STATUS_URL = "https://status.polymarket.com/api/v2/components.json"
+# Statuses that mean order placement may be blocked.
+_PM_DEGRADED_STATUSES = {"degraded_performance", "partial_outage", "major_outage", "under_maintenance"}
+
+
+def _check_polymarket_status() -> tuple[bool, str]:
+    """Return (is_operational, reason). Fails open — returns True if status page unreachable."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(_PM_STATUS_URL, headers={"User-Agent": "mbv2-watchbet/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+        degraded = [
+            f"{c.get('name', 'unknown')}: {c.get('status')}"
+            for c in data.get("components", [])
+            if c.get("status") in _PM_DEGRADED_STATUSES
+        ]
+        if degraded:
+            return False, "; ".join(degraded)
+        return True, ""
+    except Exception:
+        return True, ""  # unreachable — assume operational, don't block trading
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
@@ -157,6 +183,14 @@ def _send_alert(subject: str, body: str, settings) -> None:
         _log(f"  ALERT: {subject} — {body}")
 
 
+def _send_heartbeat(subject: str, body: str, settings) -> None:
+    try:
+        from matched_betting import notifier
+        notifier.send_heartbeat(subject, body, settings)
+    except Exception as exc:
+        _log(f"  (heartbeat delivery failed: {exc})")
+
+
 def _build_ids_cmd(args: argparse.Namespace) -> list[str]:
     cmd = [sys.executable, "ids.py"]
     if args.providers:
@@ -247,11 +281,14 @@ def main() -> None:
         settings = None
 
     started_at = _now()
+    daemon_start = time.monotonic()
     scan_count = 0
     crash_count = 0
     disabled_providers: set[str] = set()
+    status_disabled:    set[str] = set()  # subset of disabled_providers — disabled due to status page
     last_ids_refresh: float | None = time.monotonic() if args.skip_initial_ids else None
     last_redeem:      float | None = None  # None = run on first iteration
+    last_heartbeat_ntfy: float | None = None  # None = send on first scan completion
 
     mode = "DRY RUN" if args.bet_dry_run else "LIVE"
     _log(_SEP)
@@ -315,7 +352,8 @@ def main() -> None:
                         recheck = get_platform_balances_usd(settings, providers=list(args.providers or []))
                         newly_enabled = {
                             p for p in disabled_providers
-                            if (recheck.get(p) or 0.0) >= args.platform_balance_threshold
+                            if p not in status_disabled
+                            and (recheck.get(p) or 0.0) >= args.platform_balance_threshold
                         }
                         if newly_enabled:
                             disabled_providers -= newly_enabled
@@ -327,10 +365,24 @@ def main() -> None:
                         _log(f"  (platform re-enable check failed: {exc})")
                 last_redeem = time.monotonic()
 
+        # ── 1.75. Check Polymarket status page ────────────────────────────
+        if "polymarket" in (args.providers or []):
+            pm_ok, pm_reason = _check_polymarket_status()
+            if not pm_ok and "polymarket" not in status_disabled:
+                status_disabled.add("polymarket")
+                disabled_providers.add("polymarket")
+                _log(f"  WARNING: Polymarket status degraded -- disabled ({pm_reason})")
+                _send_alert("Polymarket disabled - status degraded", pm_reason, settings)
+            elif pm_ok and "polymarket" in status_disabled:
+                status_disabled.discard("polymarket")
+                disabled_providers.discard("polymarket")
+                _log("  Polymarket status recovered -- re-enabled")
+                _send_alert("Polymarket re-enabled - status recovered", "All components operational.", settings)
+
         # ── 2. Run scan ────────────────────────────────────────────────────
         active_providers = [p for p in (args.providers or []) if p not in disabled_providers]
         if not active_providers:
-            _log("  All providers disabled (low balance) -- skipping scan until next platform check.")
+            _log("  All providers disabled -- skipping scan until next platform check.")
             try:
                 time.sleep(args.interval)
             except KeyboardInterrupt:
@@ -384,6 +436,17 @@ def main() -> None:
             "consecutive_crashes":  crash_count,
             "disabled_providers":   sorted(disabled_providers),
         })
+
+        # ── 3.5. Hourly ntfy heartbeat ────────────────────────────────────
+        heartbeat_age = (time.monotonic() - last_heartbeat_ntfy) if last_heartbeat_ntfy is not None else None
+        if last_heartbeat_ntfy is None or heartbeat_age >= _HEARTBEAT_NTFY_INTERVAL:
+            uptime_mins = int((time.monotonic() - daemon_start) / 60)
+            _send_heartbeat(
+                "watch_bet alive",
+                f"Scan #{scan_count} complete. Uptime: {uptime_mins}m.",
+                settings,
+            )
+            last_heartbeat_ntfy = time.monotonic()
 
         # ── 4. Handle halt (failed-leg incident) ──────────────────────────
         if scan_rc == _EXIT_HALT:

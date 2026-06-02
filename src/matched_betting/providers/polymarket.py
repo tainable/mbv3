@@ -20,6 +20,7 @@ LEAGUE_TO_SPORT = {
     "mlb": "baseball",
     "mlb_spread": "baseball",
     "mlb_totals": "baseball",
+    "kbo": "baseball",
     "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
@@ -47,6 +48,7 @@ _LEAGUE_EVENT_TAGS: dict[str, str] = {
     "mlb": "mlb",
     "mlb_spread": "mlb",
     "mlb_totals": "mlb",
+    "kbo": "kbo",
     "nhl": "nhl",
     "ipl": "indian-premier-league",
     # MLS: tag slug is "mls"; base events (1x2) and -more-markets events (spread/totals)
@@ -161,6 +163,16 @@ class PolymarketProvider(OddsProvider):
                     'cin','bos','laa','hou','det','sd','tex','phi',
                     'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
                             candidate_markets.append((market, 'mlb_totals'))
+
+            # KBO moneyline slugs: kbo-{team1}-{team2}-{yyyy}-{mm}-{dd} (6 parts).
+            # Ties resolve 50-50 on Polymarket; only moneyline is supported.
+            _kbo_non_moneyline = {"spread", "total", "over", "under"}
+            if "kbo" in leagues and split_slug[0] == "kbo":
+                if len(split_slug) == 6 and not any(seg in _kbo_non_moneyline for seg in split_slug):
+                    kbo_slugs = team_index.get("kbo", [])
+                    if split_slug[1] in kbo_slugs and split_slug[2] in kbo_slugs:
+                        league = 'kbo'
+                        candidate_markets.append((market, league))
 
             # NHL moneyline slugs: nhl-{team1}-{team2}-{yyyy}-{mm}-{dd} (6 parts).
             _nhl_non_moneyline = {"spread", "total", "over", "under", "puck-line", "puckline"}
@@ -635,6 +647,9 @@ class PolymarketProvider(OddsProvider):
                 'cin','bos','laa','hou','det','sd','tex','phi',
                 'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']
 
+            elif league == "kbo":
+                index[league] = ['doo', 'han', 'kia', 'kiw', 'kt', 'lg', 'lot', 'nc', 'sam', 'ssg']
+
             elif league == "nhl":
 
                 index[league] = [
@@ -936,7 +951,7 @@ class PolymarketProvider(OddsProvider):
             # matching the ordering used by SX Bet (which lists home first as teamOneName).
             # Only use slug ordering when normalization resolves the codes to full names —
             # if the code isn't in the alias table it returns unchanged, signalling a miss.
-            _SLUG_ORDERED_LEAGUES = frozenset({"mlb", "mlb_spread", "mlb_totals", "nba", "nhl", "wnba"})
+            _SLUG_ORDERED_LEAGUES = frozenset({"mlb", "mlb_spread", "mlb_totals", "kbo", "nba", "nhl", "wnba"})
             slug = market.get("slug", "")
             slug_parts = slug.split("-")
             event_name_set = False

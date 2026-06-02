@@ -1,8 +1,8 @@
 # matched_betting
 
-Odds ingestion and arbitrage detection system for matched betting on NBA, WNBA, MLB (moneyline, spread, totals), UCL, EPL, UEL, NHL, IPL, Serie A, La Liga, and MLS (moneyline, spread, totals) games.
+Odds ingestion and arbitrage detection system for matched betting on NBA, WNBA, MLB (moneyline, spread, totals), KBO, UCL, EPL, UEL, NHL, IPL, Serie A, La Liga, Veikkausliiga, and MLS (moneyline, spread, totals) games.
 
-Fetches live odds from Matchbook, Smarkets, Polymarket, SX Bet, and Azuro, normalises them into a unified schema, matches records for the same game across providers, and scans for sure bets and back-lay arbs (after commission).
+Fetches live odds from Matchbook, Smarkets, Polymarket, SX Bet, and Azuro, normalises them into a unified schema, matches records for the same game across providers, and scans for sure bets, back-lay arbs, and KBO tie-aware arbs (after commission).
 
 The system runs as a two-stage pipeline:
 
@@ -24,6 +24,14 @@ mbv2-Default/
 ├── analyse_bets.py                 # Post-hoc bet analysis and P&L reporting
 ├── menu.py                         # Interactive CLI menu for common pipeline operations
 ├── vpn_proxy_bridge.py             # SOCKS5 bridge: 127.0.0.1:1081 → upstream via Mullvad tunnel
+├── specials_scan.py                # Specials scanner: read-only eval of one-off prediction markets
+├── specials_place.py               # Specials placement: executes strategies with live confirmation
+├── specials_close.py               # Specials close-out: sends closing orders for open specials positions
+├── specials_active.py              # List active/pending specials positions
+├── specials_registry.py            # Registry of named specials events and their strategies
+├── specials.py                     # Core specials orchestrator (fetching, evaluation, snapshots)
+├── specials_strategies.py          # Strategy definitions for specials (back/lay, arb, threshold)
+├── specials_size.py                # Kelly sizing for specials legs
 ├── matchbook_bet.py                # Dev utility: direct Matchbook order placement for testing
 ├── polymarket_bet.py               # Dev utility: direct Polymarket CLOB order placement for testing
 ├── pm_geo_check.py                 # Dev utility: verify Polymarket geo-access via VPN bridge
@@ -33,11 +41,12 @@ mbv2-Default/
 │   ├── __main__.py                 # Enables python -m matched_betting
 │   ├── cli.py                      # Argument parsing and orchestration (used by run.py)
 │   ├── config.py                   # Settings and CommissionSettings loaded from .env
-│   ├── calculator.py               # Pure arb maths: commission helpers, find_sure_bets, find_back_lay_arbs
+│   ├── calculator.py               # Pure arb maths: commission helpers, find_sure_bets, find_back_lay_arbs, find_kbo_tie_aware_arbs
 │   ├── kelly.py                    # Profit-scaled bet sizing (Kelly-inspired bankroll fraction)
-│   ├── notifier.py                 # Webhook alert delivery (ntfy.sh, Telegram, Discord, Slack, generic)
+│   ├── notifier.py                 # Webhook alert delivery (ntfy.sh, Telegram, Discord, Slack, generic) + heartbeat
 │   ├── rebalancer.py               # Post-bet balance monitor: alerts when USDC drops below threshold
 │   ├── aggregation.py              # Builds per-game aggregated odds payload from OddsRecord objects
+│   ├── event_log.py                # Append-only structured logging: arb_log.jsonl, warnings.log, crashes.log
 │   ├── http.py                     # HTTP client with retry logic
 │   ├── models.py                   # OddsRecord and ProviderPayload dataclasses
 │   ├── normalization.py            # Team name alias dictionaries and normalizer
@@ -51,7 +60,7 @@ mbv2-Default/
 │       ├── smarkets.py             # Smarkets authenticated API adapter
 │       ├── polymarket.py           # Polymarket public API adapter (CLOB v2)
 │       ├── sx_bet.py               # SX Bet public API adapter (P2P, no credentials required)
-│       └── azuro.py                # Azuro decentralised protocol adapter (Polygon subgraph)
+│       └── azuro.py                # Azuro decentralised protocol adapter (Polygon REST API)
 └── tests/
     ├── test_event_matching.py
     ├── test_game_filtering.py
@@ -153,16 +162,28 @@ Providers without credentials will be skipped with a warning rather than crashin
 
 ### VPN / Proxy routing
 
-Polymarket and SX Bet require a non-blocked IP for trading. The pipeline routes their traffic through a local SOCKS5 bridge (`vpn_proxy_bridge.py`) while keeping Matchbook, Smarkets, and Azuro on a direct connection. **Matchbook must never be routed through the VPN** — it will suspend accounts that connect from a proxy or VPN IP.
+Polymarket and SX Bet require a non-blocked IP for trading. The pipeline routes their traffic through a local SOCKS5 bridge (`vpn_proxy_bridge.py`) while keeping Matchbook, Smarkets, and Azuro on a direct connection.
+
+**Hard constraints — do not violate:**
+- **Matchbook must never be routed through the VPN.** Matchbook suspends accounts that connect from a proxy or VPN IP. It always uses a direct connection regardless of `VPN_PROXY_URL`.
+- **`svchost.exe` must always be in the Mullvad split-tunnel excluded list.** `svchost.exe` hosts the RDP server (TermService) and Azure VM heartbeat services. If it enters the VPN tunnel the RDP session drops and the VM becomes inaccessible.
 
 **How it works:**
 
-`vpn_proxy_bridge.py` is a lightweight SOCKS5 server that listens on `127.0.0.1:1081`. It runs as `pythonw.exe`, which sits inside the Mullvad VPN tunnel. When scan.py (running as `python.exe`, excluded from the tunnel) makes a request through the bridge, the upstream TCP connection is created by `pythonw.exe` and exits through the Mullvad relay — never through the raw Azure IP.
+`vpn_proxy_bridge.py` is a lightweight SOCKS5 server that listens on `127.0.0.1:1081`. The bridge process runs as `pythonw.exe` inside the Mullvad VPN tunnel. When `scan.py` (running as `python.exe`, excluded from the tunnel) makes a Polymarket or SX Bet request through `socks5h://127.0.0.1:1081`, the upstream connection is created by `pythonw.exe` and exits through the Mullvad relay — never through the raw Azure IP. Matchbook requests use a plain `HttpClient()` with no proxy.
 
-Start the bridge before running the pipeline:
+**Starting the bridge:**
+
+Use `menu.py` (the recommended path) or `start_vpn_bridge.bat` (standalone). Both ensure the bridge is correctly set up. Do **not** start the bridge manually with `pythonw vpn_proxy_bridge.py` unless it is run from an interactive terminal that is not a descendant of an excluded process (see the WFP note below).
 
 ```
-pythonw vpn_proxy_bridge.py
+python menu.py          # use the VPN menu → [v] → (Re)start bridge
+```
+
+or:
+
+```
+start_vpn_bridge.bat    # run from an interactive CMD window
 ```
 
 Then set `VPN_PROXY_URL` in `.env`:
@@ -173,31 +194,47 @@ VPN_PROXY_URL=socks5h://127.0.0.1:1081
 
 The `socks5h` scheme sends hostnames to the bridge for resolution, preventing DNS leaks.
 
-**Mullvad relay:** Polymarket blocks trading from both US and Swedish IPs. Set the relay to Canada before starting:
+**Mullvad relay:** Polymarket and SX Bet apply geo-restrictions at the IP level. Portugal relays (`pt-lis-wg-*`) are confirmed working. Set with:
 
 ```
-mullvad relay set location ca
+mullvad relay set location pt lis
 ```
 
-Montreal relays (`ca-mtr-*`) work reliably. Verify with:
+Verify with `mullvad status`. If a relay is blocked for trading, switch relays and use the VPN menu → [v] → [1] Check routing to confirm both platforms show OK before restarting the daemon.
+
+**Split-tunnel configuration:**
+
+Enable split tunneling and add exactly these two exclusions:
 
 ```
-mullvad status
+mullvad split-tunnel set on
+mullvad split-tunnel app add "C:\Windows\System32\svchost.exe"
+mullvad split-tunnel app add "C:\Program Files\Python312\python.exe"
 ```
 
-**Split-tunnel exclusion:** Only `python.exe` (and `svchost.exe`) should be in Mullvad's split-tunnel exclusion list. `pythonw.exe` must remain inside the tunnel so the bridge's upstream connections exit via Mullvad.
+`start_vpn_bridge.bat` runs these commands automatically. `pythonw.exe` must **not** be in the exclusion list — it must remain inside the tunnel so the bridge's upstream connections exit via Mullvad.
+
+**WFP inheritance — why the bridge must be started carefully:**
+
+Mullvad's Windows split-tunnel driver (WFP) propagates the excluded routing context transitively through the process tree, at least two levels deep. This has two implications:
+
+1. `python.exe` (excluded) cannot spawn the bridge directly — the child `pythonw.exe` process would inherit the excluded context and receive WinError 10013 when trying to reach `10.64.0.1:1080` (Mullvad's internal SOCKS5, only reachable from inside the tunnel).
+
+2. The Windows Task Scheduler (`mbv2-VpnProxyBridge` logon task) runs under `svchost.exe`, which is also excluded for RDP. Any bridge it spawns therefore also gets the excluded context. The logon task is disabled for this reason.
+
+`menu.py` works around this by using `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` (Windows API via `ctypes`) to create the bridge as a direct child of `explorer.exe` (not excluded), giving it the correct tunnel routing context regardless of which process calls `_start_bridge()`. If the bridge is already running but failing (WinError 10013 after a Mullvad config change), the menu auto-kills and restarts it so the new process picks up the current tunnel state.
+
+`start_vpn_bridge.bat`, when run from a standalone interactive CMD window (opened from the desktop or taskbar), starts `pythonw.exe` from `cmd.exe` whose parent is `explorer.exe` — the same clean context.
 
 **Provider routing:**
 
 | Provider | Connection |
 |---|---|
-| Matchbook | Direct (always — VPN would get the account suspended) |
-| Smarkets | Direct (always) |
-| Azuro | Direct (always) |
-| Polymarket | Via bridge if `VPN_PROXY_URL` is set, otherwise direct |
-| SX Bet | Via bridge if `VPN_PROXY_URL` is set, otherwise direct |
-
-Before scanning, `scan.py` tests that the bridge is reachable via a TCP connect. If it is not, you are warned — requests to Polymarket and SX Bet will fail or expose your real IP if you proceed without the bridge running.
+| Matchbook | Direct — always. Never proxied (account ban risk). |
+| Smarkets | Direct — always. |
+| Azuro | Direct — always. |
+| Polymarket | Via bridge if `VPN_PROXY_URL` is set, otherwise direct. |
+| SX Bet | Via bridge if `VPN_PROXY_URL` is set, otherwise direct. |
 
 Leave `VPN_PROXY_URL` blank to disable proxying entirely.
 
@@ -218,7 +255,7 @@ python ids.py --out outputs/my_ids.json
 python ids.py --debug
 ```
 
-Supported leagues: `nba`, `wnba`, `mlb`, `mlb_spread`, `mlb_totals`, `ucl`, `epl`, `uel`, `nhl`, `ipl`, `seria`, `laliga`, `mls`, `mls_spread`, `mls_totals`.
+Supported leagues: `nba`, `wnba`, `mlb`, `mlb_spread`, `mlb_totals`, `kbo`, `ucl`, `epl`, `uel`, `nhl`, `ipl`, `seria`, `laliga`, `mls`, `mls_spread`, `mls_totals`, `veikkausliiga`.
 
 ### Stage 2 — scan live odds
 
@@ -226,17 +263,27 @@ Supported leagues: `nba`, `wnba`, `mlb`, `mlb_spread`, `mlb_totals`, `ucl`, `epl
 python scan.py
 ```
 
-Reads the IDs JSON, iterates games one at a time. For each game, all providers are fetched simultaneously, the arb calculator runs immediately, and any arbs are printed before moving on to the next game.
+Reads the IDs JSON, iterates games one at a time. For each game, all providers are fetched simultaneously, the arb calculator runs immediately, and any arbs are printed before moving on to the next game. KBO games are evaluated separately with the tie-aware calculator.
 
 ```bash
 python scan.py --ids outputs/active_game_ids.json
 python scan.py --leagues nba epl
+python scan.py --leagues kbo                       # KBO tie-aware arbs only
 python scan.py --providers matchbook polymarket sx_bet azuro
 python scan.py --min-profit 0.5            # only show arbs ≥ 0.5% profit
 python scan.py --show-odds                 # print back/lay odds table per game
 python scan.py --azuro-cap                 # show max profit constrained by Azuro pool size
 python scan.py --polymarket-debug          # detailed Polymarket diagnostics per game
 python scan.py --debug
+```
+
+The summary line at the end of each run shows counts for all three arb types:
+
+```
+  Games scanned:  24
+  Sure bets:      1
+  Back-lay arbs:  2
+  KBO arbs:       1
 ```
 
 ### Auto-betting
@@ -306,6 +353,25 @@ python arb_finder.py --input outputs/latest_odds_aggregated_games.json
 python arb_finder.py --min-profit 0.5
 python arb_finder.py --no-refresh
 ```
+
+### Specials pipeline
+
+The specials pipeline handles one-off prediction market events (elections, award outcomes, non-recurring markets) that fall outside the sports game pipeline. Each event is registered in `specials_registry.py` with a catalog of provider market IDs and a list of strategies.
+
+```bash
+python specials_scan.py             # evaluate all registered events (read-only)
+python specials_scan.py --event makerfield_by_election_2026
+python specials_scan.py --list      # list all registered events
+python specials_scan.py --debug
+
+python specials_place.py            # place bets for all profitable strategies
+python specials_place.py --event makerfield_by_election_2026 --dry-run
+
+python specials_close.py            # send closing orders for open positions
+python specials_active.py           # list active / pending specials positions
+```
+
+Specials do not go through `ids.py` or `scan.py` — they use provider market IDs from the registry directly. Outputs (snapshots and audit logs) are written to `outputs/specials_<event>.json` and `outputs/specials_<event>_evaluations.jsonl`.
 
 ### Legacy full-fetch runner
 
@@ -443,6 +509,18 @@ Each game entry in the IDs file (and in the legacy `*_aggregated_games.json`) lo
 
 `null` means the provider had no record for that outcome/side. Three-way markets (e.g. football with draw) include additional `*_draw_*` fields. Market IDs are stored per provider to enable targeted re-fetching in Stage 2.
 
+### Event log (`outputs/`)
+
+Three append-only log files are written during each scan run:
+
+| File | Content |
+|---|---|
+| `arb_log.jsonl` | Every profitable arb detected (profit_pct > 0), one JSON object per line |
+| `warnings.log` | Provider warnings and soft fetch failures (network timeouts, partial data) |
+| `crashes.log` | Unhandled exceptions with full tracebacks from `_scan_game` |
+
+`arb_log.jsonl` records every arb regardless of `--min-profit` — it is a complete audit trail independent of display filters.
+
 ## How it works
 
 ### Pipeline architecture
@@ -473,8 +551,11 @@ scan.py
           │     └── AzuroProvider.fetch_odds_by_ids
           ├── match_records_to_canonical_events
           ├── build_aggregated_games_payload
-          ├── calculator.find_sure_bets
-          ├── calculator.find_back_lay_arbs    # print arbs immediately
+          ├── calculator.find_sure_bets         (non-KBO games)
+          ├── calculator.find_back_lay_arbs     (non-KBO games)
+          ├── calculator.find_kbo_tie_aware_arbs (KBO games)
+          ├── event_log.log_arb                 # append to arb_log.jsonl
+          ├── PRINT ARB IMMEDIATELY (no batching)
           └── (if --auto-bet) kelly sizing → place bets → rebalancer check
 
 run.py  (legacy, no VPN proxy)
@@ -502,7 +583,7 @@ Each provider implements `OddsProvider` (`base.py`) with two methods:
 
 All providers for a given stage are queried concurrently via `ThreadPoolExecutor`. Each returns a `ProviderPayload` containing a flat list of `OddsRecord` objects.
 
-Azuro is a decentralised protocol queried via a GraphQL subgraph on Polygon. It provides back odds only (no lay side); `--azuro-cap` constrains displayed profit by the pool's maximum stake per outcome.
+Azuro is a decentralised protocol queried via its REST Backend API on Polygon. It provides back odds only (no lay side); `--azuro-cap` constrains displayed profit by the pool's maximum stake per outcome.
 
 **3. Data model** (`models.py`)
 
@@ -514,7 +595,7 @@ Every record shares the same frozen `OddsRecord` dataclass: provider, sport, lea
 - **Smarkets**: integer prices (`0`–`10000`) → divide by 10000 → invert to decimal.
 - **Polymarket**: token IDs resolved from Gamma API; best ask/bid from CLOB v2 order book; prices converted `1 / p`.
 - **SX Bet**: odds as scaled integers (`maker_probability × 10²⁰`); taker decimal = `1 / (1 − maker_probability)`.
-- **Azuro**: `currentOdds` from the Polygon subgraph is already a decimal string; used directly.
+- **Azuro**: `currentOdds` from the Polygon REST API is already a decimal string; used directly.
 
 **5. Team name normalisation** (`normalization.py`)
 
@@ -592,6 +673,28 @@ Note the back formula deducts the fee directly from decimal odds (not just from 
 
 - `find_sure_bets()` — back-back(-back) across providers: net margin = sum of `1 / eff_back_odds` per leg. If margin < 1, it is a sure bet.
 - `find_back_lay_arbs()` — per outcome: if `eff_back_odds > eff_lay_odds` across providers, it is a back-lay arb.
+- `find_kbo_tie_aware_arbs()` — KBO-specific: back the underdog on Polymarket, back the favourite on SX Bet (see below).
+
+KBO games are excluded from `find_sure_bets()` and `find_back_lay_arbs()` and handled exclusively by `find_kbo_tie_aware_arbs()`.
+
+### KBO tie-aware arbs
+
+KBO (Korean Baseball Organization) games have a structurally different tie resolution between providers:
+
+- **Polymarket**: if a game ties, NO tokens resolve at 1.00 — both YES and NO tokens resolve at $0.50. An underdog token bought below $0.50 (odds > 2.00) therefore *gains* on a tie.
+- **SX Bet**: ties are treated as void — stakes refunded, no gain or loss.
+
+This asymmetry means backing the underdog on Polymarket and the favourite on SX Bet can be profitable even after accounting for the possibility of a tie. The calculator:
+
+1. Identifies the underdog (team with higher decimal odds on Polymarket).
+2. Calculates the two-way back-back margin using the underdog-on-Poly + favourite-on-SX direction only.
+3. Reports `profit_pct` (net after fees, ignoring ties) and `tie_gain_pct` (additional gain as % of total staked if the game ties).
+
+```
+tie_gain_pct = (0.50 − 1/O_poly) / (1/O_poly + 1/O_sx) × 100
+```
+
+The odds table in `--show-odds` mode displays a `KBO arb` hint line showing the direction and margin for each KBO game.
 
 ## Developer utilities
 
@@ -615,10 +718,14 @@ python find_sx_bet_league_ids.py --search "premier"
 
 ## TODO
 
+- **Validate KBO coverage** — KBO tie-aware arbs are wired up for Polymarket and SX Bet but the tie-resolution logic has not been validated end-to-end against live KBO settlement data.
+
+- **Validate Veikkausliiga coverage** — Veikkausliiga (Finnish football) is registered across providers but has not been validated against live match data.
+
 - **Investigate liquidity numbers** — verify that `*_back_avail` / `*_lay_avail` figures (Matchbook order depth, Smarkets contract liquidity, SX Bet taker-available, Polymarket CLOB size) are computed and converted to GBP consistently.
 
 - **Investigate SX Bet soccer markets** — `type == 1` for soccer markets has not been validated against live EPL/UCL data. The back/lay probability derivation from P2P maker orders needs end-to-end verification once live soccer markets are available.
 
-- **Azuro NHL/MLB slugs** — league slugs for NHL and MLB on the Polygon subgraph are unverified; those leagues may return 0 records gracefully until confirmed live.
+- **Azuro NHL/MLB slugs** — league slugs for NHL and MLB on the Polygon REST API are unverified; those leagues may return 0 records gracefully until confirmed live.
 
 - **Validate MLS coverage** — MLS moneyline, spread, and totals markets (`mls`, `mls_spread`, `mls_totals`) are wired up across Polymarket, Matchbook, and SX Bet but have not been validated end-to-end against live MLS data.

@@ -526,6 +526,23 @@ TEAM_ALIASES = {
         "orioles": "baltimore orioles",
         "cardinals": "st louis cardinals",
     },
+    "kbo": {
+        # Polymarket slug codes → canonical names
+        "doo": "doosan bears",
+        "han": "hanwha eagles",
+        "kia": "kia tigers",
+        "kiw": "kiwoom heroes",
+        "kt":  "kt wiz",
+        "lg":  "lg twins",
+        "lot": "lotte giants",
+        "nc":  "nc dinos",
+        "sam": "samsung lions",
+        "ssg": "ssg landers",
+        # SX Bet and Polymarket both use full names; normalize strips to lowercase
+        # so "KIA Tigers" → "kia tigers" → canonical without an alias entry.
+        # Add only the cases that differ from the canonical form after stripping:
+        "kia tigers": "kia tigers",   # Polymarket: "Kia Tigers"; SX Bet: "KIA Tigers"
+    },
     "laliga": {
         # Atletico Madrid — accent on 'e' strips to space in all three providers
         "atl tico de madrid":      "atletico de madrid",   # Matchbook
@@ -880,6 +897,14 @@ TEAM_ALIASES = {
         "st louis city sc": "st louis city sc",
         "st louis city": "st louis city sc",
         "vancouver whitecaps fc": "vancouver whitecaps",
+    },
+    "veikkausliiga": {
+        # Matchbook uses short abbreviations; SX Bet uses full city names.
+        # Canonical = the fuller/more specific form.
+        "ilves": "ilves tampere",
+        "sjk": "sjk seinajoki",
+        "turun palloseura tps": "tps",
+        "vps vaasan palloseura": "vps",
     },
 }
 

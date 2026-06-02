@@ -1462,71 +1462,6 @@ def _pm_liquidity_issues(tasks: list[tuple[str, Callable, dict]]) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Matchbook partial-fill guard
-# ---------------------------------------------------------------------------
-
-# Matchbook offers are always LIMIT orders that can match partially — their API has
-# no FOK / IOC / all-or-nothing mode. A partially-filled offer leaves us with a
-# matched position smaller than the requested stake, which the OTHER arb legs
-# would over-hedge if placed at full size. After each Matchbook leg we compare
-# matched-stake to the requested stake; a shortfall beyond MB_FILL_TOLERANCE_GBP
-# aborts the arb (the matched portion remains as a real, now-unhedged position
-# that the alert pipeline surfaces to the operator).
-#
-# Tolerance: 5p absolute, absorbing 1p–4p rounding in Matchbook's price-ladder
-# arithmetic without ignoring meaningful shortfalls. Tune via the constant.
-MB_FILL_TOLERANCE_GBP = 0.05
-
-
-def _check_matchbook_partial_fill(
-    r:        dict,
-    settings,
-    dry_run:  bool,
-) -> dict | None:
-    """Return a synthetic failure record when a Matchbook leg matched short.
-
-    No-op for non-Matchbook legs, dry runs, and legs that already failed.
-
-    The matched portion of the offer is a real on-exchange position; the
-    caller is expected to route the returned record through _on_leg_failure
-    so the unmatched remainder is cancelled (via the standard placed-leg
-    cancellation path) and the operator is alerted.
-    """
-    if dry_run:
-        return None
-    if not r.get("ok"):
-        return None
-    leg      = str(r.get("_leg") or "").lower()
-    platform = str(r.get("platform") or "").lower()
-    if "matchbook" not in leg and platform != "matchbook":
-        return None
-
-    requested = float(r.get("amount") or 0)
-    matched   = float(r.get("matched") or 0)
-    if requested <= 0:
-        return None
-
-    if matched + MB_FILL_TOLERANCE_GBP >= requested:
-        return None  # fill is within tolerance — treat as complete
-
-    pct = (matched / requested * 100) if requested > 0 else 0.0
-    return {
-        "platform":     "Matchbook",
-        "ok":           False,
-        "partial_fill": True,
-        "_leg":         r.get("_leg", "matchbook"),
-        "matched":      matched,
-        "amount":       requested,
-        "offer_id":     r.get("offer_id"),
-        "error": (
-            f"Matchbook partial fill: matched £{matched:.2f} of £{requested:.2f} "
-            f"({pct:.1f}%) — cancelling unmatched remainder and aborting arb. "
-            f"Matched portion is an open, unhedged position."
-        ),
-    }
-
-
-# ---------------------------------------------------------------------------
 # Main placement functions
 # ---------------------------------------------------------------------------
 
@@ -1677,15 +1612,6 @@ def place_sure_bet(
         if not r.get("ok"):
             placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
             _on_leg_failure("sure_bet", arb, game, placed, r, settings, dry_run)
-            break
-        partial_fail = _check_matchbook_partial_fill(r, settings, dry_run)
-        if partial_fail:
-            # Keep r in `placed` so _on_leg_failure treats the matched portion as an
-            # open position (HALT + uncovered-position alert) and _cancel_placed_legs
-            # DELETEs the offer (which Matchbook applies to the unmatched remainder only).
-            placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
-            _on_leg_failure("sure_bet", arb, game, placed, partial_fail, settings, dry_run)
-            results.append(partial_fail)  # so all_legs_ok() returns False
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
     if all_legs_ok(results) and not dry_run:
@@ -1960,12 +1886,6 @@ def place_back_lay_arb(
         if not r.get("ok"):
             placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
             _on_leg_failure("back_lay", arb, game, placed, r, settings, dry_run)
-            break
-        partial_fail = _check_matchbook_partial_fill(r, settings, dry_run)
-        if partial_fail:
-            placed = [x for x in results if x.get("ok") and "_timing_s" not in x]
-            _on_leg_failure("back_lay", arb, game, placed, partial_fail, settings, dry_run)
-            results.append(partial_fail)
             break
     results.append({"_timing_s": round(time.monotonic() - t0, 2)})
     if all_legs_ok(results) and not dry_run:

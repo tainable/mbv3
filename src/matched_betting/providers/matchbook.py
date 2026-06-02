@@ -82,7 +82,7 @@ class MatchbookProvider(OddsProvider):
         retrieved_at = utc_now_iso()
         self._login()
 
-        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals")):
+        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga")):
             self._log_available_sports()
 
         records: list[OddsRecord] = []
@@ -299,6 +299,12 @@ class MatchbookProvider(OddsProvider):
             # Fallback: meta-tag url-names vary; check event name directly.
             event_name_lower = str(event.get("name") or "").lower()
             return "ipl" in event_name_lower or "indian premier league" in event_name_lower
+        if league == "veikkausliiga":
+            # TODO: verify exact url-name via find_matchbook_league_tags.py --search "finland"
+            return any(
+                tag.get("url-name") in ("veikkausliiga", "finland-veikkausliiga", "finnish-premier-league")
+                for tag in meta_tags
+            )
         return False
 
     def _event_to_records(
@@ -642,7 +648,7 @@ class MatchbookProvider(OddsProvider):
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria", "laliga", "mls") else "two_way"
+            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria", "laliga", "mls", "veikkausliiga") else "two_way"
             for runner in market.get("runners", []):
                 best_by_side = _best_prices_per_side(runner.get("prices", []))
                 for side, price in best_by_side.items():
@@ -838,6 +844,7 @@ LEAGUE_SPORT_IDS = {
     "mls_spread": 15,  # MLS goal-line handicap; filtered by run-line market name
     "mls_totals": 15,  # MLS goal totals; filtered by totals market name
     "ipl": 110,  # Cricket — sport ID 110 covers all cricket; filtered by meta-tag below
+    "veikkausliiga": 15,  # Finnish Premier League — same soccer sport ID
 }
 
 LEAGUE_TO_SPORT = {
@@ -856,4 +863,5 @@ LEAGUE_TO_SPORT = {
     "mls_spread": "soccer",
     "mls_totals": "soccer",
     "ipl": "cricket",
+    "veikkausliiga": "soccer",
 }

@@ -44,6 +44,7 @@ import argparse
 import json
 import os
 import random
+import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -320,23 +321,35 @@ def pm_place_bet(settings, token_id: str, amount: float, side: str = "BUY",
     pk = settings.polymarket.private_key
     if not pk:
         return {"platform": "Polymarket", "ok": False, "error": "POLYMARKET_PRIVATE_KEY not set"}
-    try:
-        client = _pm_build_client(pk)
-        decimal_odds = _pm_best_decimal_odds(token_id, side)
-        client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
-        order  = client.create_market_order(
-            MarketOrderArgs(token_id=token_id, amount=amount, side=side)
-        )
-        resp = client.post_order(order, OrderType.FOK)
-        execution_odds = _pm_confirmed_odds(client, token_id)
-        _log_bet({"platform": "Polymarket", "token_id": token_id,
-                  "amount": amount, "side": side, "decimal_odds": decimal_odds,
-                  "execution_odds": execution_odds, "response": resp})
-        return {"platform": "Polymarket", "ok": True, "response": resp,
-                "amount": amount, "side": side, "decimal_odds": decimal_odds,
-                "execution_odds": execution_odds}
-    except Exception as e:
-        return {"platform": "Polymarket", "ok": False, "error": str(e)}
+    for attempt in range(3):
+        try:
+            client = _pm_build_client(pk)
+            decimal_odds = _pm_best_decimal_odds(token_id, side)
+            client.update_balance_allowance(BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+            order  = client.create_market_order(
+                MarketOrderArgs(token_id=token_id, amount=amount, side=side)
+            )
+            resp = client.post_order(order, OrderType.FOK)
+            execution_odds = _pm_confirmed_odds(client, token_id)
+            _log_bet({"platform": "Polymarket", "token_id": token_id,
+                      "amount": amount, "side": side, "decimal_odds": decimal_odds,
+                      "execution_odds": execution_odds, "response": resp})
+            return {"platform": "Polymarket", "ok": True, "response": resp,
+                    "amount": amount, "side": side, "decimal_odds": decimal_odds,
+                    "execution_odds": execution_odds}
+        except Exception as e:
+            err_str = str(e)
+            if "post_only_mode" in err_str and attempt < 2:
+                m = re.search(r"retry_after_seconds['\"]?\s*:\s*(\d+)", err_str)
+                wait = int(m.group(1)) + 2 if m else 120
+                print(
+                    f"  Polymarket post-only mode — waiting {wait}s then retrying"
+                    f" (attempt {attempt + 1}/2) ...",
+                    file=sys.stderr,
+                )
+                time.sleep(wait)
+                continue
+            return {"platform": "Polymarket", "ok": False, "error": err_str}
 
 
 def pm_approve(settings) -> None:
@@ -576,6 +589,68 @@ def mb_cancel_offer(settings, offer_id: int) -> None:
         headers={"session-token": token, "Accept": "application/json"},
     )
     print(f"  Cancel response: {resp}")
+
+
+def mb_get_positions(settings, event_id: int | None = None) -> list[dict]:
+    """Return per-runner net positions from Matchbook (GET /edge/rest/positions).
+
+    Each item has runner-level exposure (potential profit/loss).
+    Optionally filter to a single event via event_id.
+    """
+    mb = settings.matchbook
+    if not (mb.username and mb.password):
+        return []
+    try:
+        http   = HttpClient()
+        token  = _mb_login(http, mb.base_url, mb.username, mb.password)
+        params: dict = {}
+        if event_id:
+            params["event-ids"] = event_id
+        resp = http.get_json(
+            f"{mb.base_url}/edge/rest/positions",
+            params=params,
+            headers={"session-token": token, "Accept": "application/json"},
+        )
+        return resp.get("positions", [])
+    except Exception:
+        return []
+
+
+def mb_get_runner_prices(
+    settings,
+    event_id:  int,
+    market_id: int,
+    runner_id: int,
+) -> dict[str, float | None]:
+    """Return current best back/lay odds for a specific runner.
+
+    Used when evaluating close prices for an open position.
+    Returns {"back_odds": float|None, "lay_odds": float|None}.
+    """
+    mb = settings.matchbook
+    if not (mb.username and mb.password):
+        return {"back_odds": None, "lay_odds": None}
+    try:
+        http   = HttpClient()
+        token  = _mb_login(http, mb.base_url, mb.username, mb.password)
+        event  = http.get_json(
+            f"{mb.base_url}/edge/rest/events/{event_id}",
+            headers={"session-token": token, "Accept": "application/json"},
+        )
+        for market in event.get("markets", []):
+            if market.get("id") != market_id:
+                continue
+            for runner in market.get("runners", []):
+                if runner.get("id") != runner_id:
+                    continue
+                prices = runner.get("prices", [])
+                return {
+                    "back_odds": _mb_best_price(prices, "back"),
+                    "lay_odds":  _mb_best_price(prices, "lay"),
+                }
+    except Exception:
+        pass
+    return {"back_odds": None, "lay_odds": None}
 
 
 # ============================================================================

@@ -77,6 +77,38 @@ def send_alert(subject: str, body: str, settings: "Settings") -> None:
         print(f"  (alert webhook failed: {exc})", file=sys.stderr)
 
 
+def send_heartbeat(subject: str, body: str, settings: "Settings") -> None:
+    """Send a low-priority heartbeat to ntfy (or fall back to stderr)."""
+    if not getattr(settings, "alert_enabled", True):
+        return
+
+    url = getattr(settings, "alert_webhook_url", None)
+    if not url:
+        _to_stderr(subject, body)
+        return
+
+    try:
+        import requests
+        _no_proxy = {"https": None, "http": None}
+        if "ntfy.sh" in url:
+            requests.post(
+                url,
+                data=_ntfy_body(body).encode("utf-8"),
+                headers={
+                    "Title": _ntfy_title(subject),
+                    "Priority": "default",
+                },
+                proxies=_no_proxy,
+                timeout=10,
+            )
+        else:
+            full = f"{subject}\n\n{body}" if body else subject
+            requests.post(url, json={"content": full, "text": full}, proxies=_no_proxy, timeout=10)
+    except Exception as exc:
+        _to_stderr(subject, body)
+        print(f"  (heartbeat webhook failed: {exc})", file=sys.stderr)
+
+
 def _to_stderr(subject: str, body: str) -> None:
     print(f"\nALERT: {subject}", file=sys.stderr)
     if body:

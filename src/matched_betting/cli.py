@@ -26,8 +26,8 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
-ALL_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
+ALL_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"]
 
 
@@ -43,6 +43,7 @@ def build_parser() -> argparse.ArgumentParser:
     league_shortcuts.add_argument("--ucl", action="store_true", help="Shortcut for --leagues ucl")
     league_shortcuts.add_argument("--epl", action="store_true", help="Shortcut for --leagues epl")
     league_shortcuts.add_argument("--ipl", action="store_true", help="Shortcut for --leagues ipl")
+    league_shortcuts.add_argument("--veikkausliiga", action="store_true", help="Shortcut for --leagues veikkausliiga")
     parser.add_argument(
         "--providers",
         nargs="+",
@@ -104,7 +105,8 @@ def fetch_aggregated_games(
         project_root = Path(__file__).resolve().parents[2]
     settings = load_settings(project_root)
     http_client = HttpClient()
-    provider_registry = build_provider_registry(settings, http_client, noop_debug)
+    proxied_http_client = HttpClient(proxy_url=settings.vpn_proxy_url) if settings.vpn_proxy_url else http_client
+    provider_registry = build_provider_registry(settings, http_client, noop_debug, proxied_http_client=proxied_http_client)
 
     records: list[OddsRecord] = []
 
@@ -160,7 +162,8 @@ def _run_full_fetch(
 ) -> int:
     """Run a full discovery fetch across all providers."""
     http_client = HttpClient()
-    providers = build_provider_registry(settings, http_client, debug)
+    proxied_http_client = HttpClient(proxy_url=settings.vpn_proxy_url) if settings.vpn_proxy_url else http_client
+    providers = build_provider_registry(settings, http_client, debug, proxied_http_client=proxied_http_client)
     debug(
         f"starting run providers={','.join(args.providers)} leagues={','.join(leagues)}"
     )
@@ -348,7 +351,8 @@ def _run_index_only(
     all_odds and aggregated_games. Only the market index is updated (additively).
     """
     http_client = HttpClient()
-    providers = build_provider_registry(settings, http_client, debug)
+    proxied_http_client = HttpClient(proxy_url=settings.vpn_proxy_url) if settings.vpn_proxy_url else http_client
+    providers = build_provider_registry(settings, http_client, debug, proxied_http_client=proxied_http_client)
     debug(f"--index-only: providers={','.join(args.providers)} leagues={','.join(leagues)}")
 
     records: list[OddsRecord] = []
@@ -511,7 +515,8 @@ def _run_update(
     debug(f"--update: {len(game_contexts)} game contexts for leagues {leagues}")
 
     http_client = HttpClient()
-    providers = build_provider_registry(settings, http_client, debug)
+    proxied_http_client = HttpClient(proxy_url=settings.vpn_proxy_url) if settings.vpn_proxy_url else http_client
+    providers = build_provider_registry(settings, http_client, debug, proxied_http_client=proxied_http_client)
 
     records: list[OddsRecord] = []
     warnings: list[str] = []
@@ -672,7 +677,7 @@ def _game_index_key(game: dict[str, Any]) -> tuple:
     )
 
 
-_KNOWN_LEAGUE_ORDER = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+_KNOWN_LEAGUE_ORDER = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
 
 
 def _merge_market_index_additive(
@@ -860,6 +865,8 @@ def _resolve_leagues(args: argparse.Namespace) -> list[str]:
         return ["epl"]
     if args.ipl:
         return ["ipl"]
+    if args.veikkausliiga:
+        return ["veikkausliiga"]
     return list(args.leagues)
 
 

@@ -273,6 +273,8 @@ def find_sure_bets(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]
     """Return sure bets (back-back[-back] across providers) sorted by net profit."""
     results = []
     for game in games:
+        if game.get("league") == "kbo":
+            continue  # handled by find_kbo_tie_aware_arbs
         three_way = _is_three_way(game)
         is_totals = game.get("league") in ("mlb_totals", "mls_totals")
         slot1 = "over" if is_totals else "team1"
@@ -323,6 +325,8 @@ def find_sure_bets(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]
             "date_time": game.get("date_time"),
             "team1": "Over" if is_totals else game.get("team1"),
             "team2": "Under" if is_totals else game.get("team2"),
+            "game_team1": game.get("team1"),
+            "game_team2": game.get("team2"),
             "spread": game.get("spread"),
             "total_line": game.get("total_line"),
             "team1_back_odds": team1_odds,
@@ -354,6 +358,8 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
     """Return back-lay arbs sorted by net profit."""
     results = []
     for game in games:
+        if game.get("league") == "kbo":
+            continue  # handled by find_kbo_tie_aware_arbs
         if game.get("league") in ("mlb_totals", "mls_totals"):
             slots = ("over", "under")
         elif _is_three_way(game):
@@ -412,6 +418,90 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
         return p24 if p24 is not None else p
 
     results.sort(key=_sort_key, reverse=True)
+    return results
+
+
+def find_kbo_tie_aware_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]:
+    """KBO moneyline arbs: back underdog on Polymarket, back favourite on SX Bet.
+
+    KBO ties resolve 50-50 on Polymarket (underdog tokens bought below $0.50 pay
+    $0.50 on a tie — a gain) while SX Bet refunds on ties.  Stakes use the standard
+    two-way back-back formula; the tie outcome is shown as an informational bonus.
+    Only the underdog-on-Poly + favourite-on-SX direction is considered.
+    """
+    results = []
+    for game in games:
+        if game.get("league") != "kbo":
+            continue
+
+        poly_t1 = game.get("polymarket_team1_back_odds")
+        poly_t2 = game.get("polymarket_team2_back_odds")
+        sx_t1   = game.get("sx_bet_team1_back_odds")
+        sx_t2   = game.get("sx_bet_team2_back_odds")
+
+        if not poly_t1 or not poly_t2:
+            continue
+
+        # Underdog on Polymarket = team with higher decimal odds (lower implied prob).
+        # We back that team on Poly and the other (favourite) on SX Bet.
+        if poly_t1 >= poly_t2:
+            poly_underdog_odds = poly_t1
+            sx_fav_odds        = sx_t2
+            poly_underdog_slot = "team1"
+            sx_fav_slot        = "team2"
+        else:
+            poly_underdog_odds = poly_t2
+            sx_fav_odds        = sx_t1
+            poly_underdog_slot = "team2"
+            sx_fav_slot        = "team1"
+
+        if not sx_fav_odds:
+            continue
+
+        eff_poly = _eff_back_odds(poly_underdog_odds, "polymarket")
+        eff_sx   = _eff_back_odds(sx_fav_odds, "sx_bet")
+        gross_margin = 1.0 / poly_underdog_odds + 1.0 / sx_fav_odds
+        net_margin   = 1.0 / eff_poly + 1.0 / eff_sx
+
+        if net_margin >= 1.0:
+            continue
+
+        net_profit_pct = (1.0 / net_margin - 1.0) * 100
+        profit_24h_pct = _profit_24h(net_profit_pct, game.get("date_time"))
+        effective_pct  = min(net_profit_pct, profit_24h_pct) if profit_24h_pct is not None else net_profit_pct
+        if effective_pct < min_profit_pct:
+            continue
+
+        # Tie bonus: the underdog token costs 1/O_poly < $0.50; a tie pays $0.50/token.
+        # Gain on Poly leg = stake * (O_poly/2 - 1); SX refunds (no gain/loss).
+        # As % of gross total staked (1/O_poly + 1/O_sx):
+        tie_gain_pct = (0.5 - 1.0 / poly_underdog_odds) / gross_margin * 100
+
+        results.append({
+            "market_type": "two_way",
+            "league": "kbo",
+            "date_time": game.get("date_time"),
+            "team1": game.get("team1"),
+            "team2": game.get("team2"),
+            "poly_underdog_slot": poly_underdog_slot,
+            "poly_underdog_name": game.get(poly_underdog_slot) or poly_underdog_slot,
+            "poly_underdog_odds": round(poly_underdog_odds, 4),
+            "poly_underdog_avail": game.get(f"polymarket_{poly_underdog_slot}_back_avail"),
+            "sx_fav_slot": sx_fav_slot,
+            "sx_fav_name": game.get(sx_fav_slot) or sx_fav_slot,
+            "sx_fav_odds": round(sx_fav_odds, 4),
+            "sx_fav_avail": game.get(f"sx_bet_{sx_fav_slot}_back_avail"),
+            "margin": round(gross_margin, 6),
+            "profit_pct": round(net_profit_pct, 4),
+            "profit_24h_pct": profit_24h_pct,
+            "gross_profit_pct": round((1.0 / gross_margin - 1.0) * 100, 4),
+            "tie_gain_pct": round(tie_gain_pct, 2),
+        })
+
+    results.sort(
+        key=lambda x: x["profit_24h_pct"] if x["profit_24h_pct"] is not None else x["profit_pct"],
+        reverse=True,
+    )
     return results
 
 

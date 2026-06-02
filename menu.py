@@ -8,6 +8,8 @@ Usage:
 """
 from __future__ import annotations
 
+import ctypes
+import ctypes.wintypes as _wt
 import json
 import os
 import socket
@@ -122,16 +124,115 @@ def _kill_bridge() -> None:
 
 
 def _start_bridge() -> bool:
-    """Launch vpn_proxy_bridge.py via pythonw.exe.  Returns True if port becomes reachable."""
-    try:
-        subprocess.Popen(
-            [str(_PYTHONW), str(_BRIDGE_SCRIPT)],
-            cwd=_ROOT,
-            creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW,
-        )
-    except Exception as exc:
-        print(f"  ERROR launching bridge: {exc}")
+    """Launch vpn_proxy_bridge.py reparented under explorer.exe.
+
+    Both python.exe and svchost.exe (Task Scheduler) are in Mullvad's
+    split-tunnel excluded list.  Mullvad's WFP driver propagates the excluded
+    routing context at least two levels deep through the process tree, so any
+    bridge spawned as a descendant of python.exe or svchost.exe cannot reach
+    10.64.0.1:1080 (WinError 10013).
+
+    Fix: use PROC_THREAD_ATTRIBUTE_PARENT_PROCESS to create the bridge as a
+    child of explorer.exe (not excluded), giving it the tunnel routing context.
+    """
+    _k32 = ctypes.windll.kernel32
+    _PROCESS_CREATE_PROCESS      = 0x0080
+    _CREATE_NO_WINDOW            = 0x08000000
+    _EXTENDED_STARTUPINFO_PRESENT = 0x00080000
+    _PROC_THREAD_ATTR_PARENT     = 0x00020000  # PROC_THREAD_ATTRIBUTE_PARENT_PROCESS
+
+    # --- find explorer.exe PID ---
+    r = subprocess.run(
+        ["tasklist", "/fi", "imagename eq explorer.exe", "/fo", "csv", "/nh"],
+        capture_output=True, text=True,
+    )
+    explorer_pid = None
+    for line in r.stdout.strip().splitlines():
+        parts = [p.strip('"') for p in line.strip().split('","')]
+        if len(parts) >= 2 and parts[0].lower() == "explorer.exe":
+            try:
+                explorer_pid = int(parts[1])
+                break
+            except ValueError:
+                pass
+    if not explorer_pid:
+        print("  ERROR launching bridge: could not find explorer.exe")
         return False
+
+    # --- open explorer with PROCESS_CREATE_PROCESS permission ---
+    h_parent = _k32.OpenProcess(_PROCESS_CREATE_PROCESS, False, explorer_pid)
+    if not h_parent:
+        print(f"  ERROR launching bridge: OpenProcess failed ({ctypes.GetLastError()})")
+        return False
+
+    try:
+        # --- build PROC_THREAD_ATTRIBUTE_LIST ---
+        attr_size = ctypes.c_size_t(0)
+        _k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(attr_size))
+        attr_buf = ctypes.create_string_buffer(attr_size.value)
+        if not _k32.InitializeProcThreadAttributeList(attr_buf, 1, 0, ctypes.byref(attr_size)):
+            print(f"  ERROR launching bridge: InitializeProcThreadAttributeList failed ({ctypes.GetLastError()})")
+            return False
+        try:
+            h_val = _wt.HANDLE(h_parent)
+            if not _k32.UpdateProcThreadAttribute(
+                attr_buf, 0,
+                _PROC_THREAD_ATTR_PARENT,
+                ctypes.byref(h_val), ctypes.sizeof(h_val),
+                None, None,
+            ):
+                print(f"  ERROR launching bridge: UpdateProcThreadAttribute failed ({ctypes.GetLastError()})")
+                return False
+
+            # --- STARTUPINFOEX ---
+            class _STARTUPINFO(ctypes.Structure):
+                _fields_ = [
+                    ("cb", _wt.DWORD), ("lpReserved", _wt.LPWSTR),
+                    ("lpDesktop", _wt.LPWSTR), ("lpTitle", _wt.LPWSTR),
+                    ("dwX", _wt.DWORD), ("dwY", _wt.DWORD),
+                    ("dwXSize", _wt.DWORD), ("dwYSize", _wt.DWORD),
+                    ("dwXCountChars", _wt.DWORD), ("dwYCountChars", _wt.DWORD),
+                    ("dwFillAttribute", _wt.DWORD), ("dwFlags", _wt.DWORD),
+                    ("wShowWindow", _wt.WORD), ("cbReserved2", _wt.WORD),
+                    ("lpReserved2", ctypes.POINTER(_wt.BYTE)),
+                    ("hStdInput", _wt.HANDLE), ("hStdOutput", _wt.HANDLE),
+                    ("hStdError", _wt.HANDLE),
+                ]
+
+            class _STARTUPINFOEX(ctypes.Structure):
+                _fields_ = [
+                    ("StartupInfo", _STARTUPINFO),
+                    ("lpAttributeList", ctypes.c_void_p),
+                ]
+
+            class _PROCESS_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("hProcess", _wt.HANDLE), ("hThread", _wt.HANDLE),
+                    ("dwProcessId", _wt.DWORD), ("dwThreadId", _wt.DWORD),
+                ]
+
+            si = _STARTUPINFOEX()
+            si.StartupInfo.cb = ctypes.sizeof(_STARTUPINFOEX)
+            si.lpAttributeList = ctypes.cast(attr_buf, ctypes.c_void_p).value
+            pi = _PROCESS_INFORMATION()
+
+            cmd = f'"{_PYTHONW}" "{_BRIDGE_SCRIPT}"'
+            ok = _k32.CreateProcessW(
+                None, cmd, None, None, False,
+                _CREATE_NO_WINDOW | _EXTENDED_STARTUPINFO_PRESENT,
+                None, str(_ROOT),
+                ctypes.byref(si), ctypes.byref(pi),
+            )
+            if not ok:
+                print(f"  ERROR launching bridge: CreateProcessW failed ({ctypes.GetLastError()})")
+                return False
+            _k32.CloseHandle(pi.hProcess)
+            _k32.CloseHandle(pi.hThread)
+        finally:
+            _k32.DeleteProcThreadAttributeList(attr_buf)
+    finally:
+        _k32.CloseHandle(h_parent)
+
     time.sleep(2)
     return _vpn_bridge_running()
 
@@ -195,7 +296,25 @@ def _ensure_vpn_bridge() -> None:
         time.sleep(2)
 
     elif probe == "error":
-        if not bridge_was_running:
+        if bridge_was_running:
+            # Bridge is up but failing (e.g. WinError 10013 after Mullvad config change).
+            # Kill and restart so the new process picks up the current tunnel state.
+            print()
+            print("  Bridge is UP but connections are failing — restarting ...")
+            _kill_bridge()
+            time.sleep(1)
+            if not _start_bridge():
+                print("  ERROR: could not restart bridge.")
+                time.sleep(2)
+                return
+            probe2 = _probe_pm_trading()
+            if probe2 == "ok":
+                print("  VPN routing confirmed — bridge restarted.")
+            else:
+                print("  WARNING: still failing after restart.")
+                print("           Ensure Mullvad is connected, then press [v] -> [1] to diagnose.")
+            time.sleep(2)
+        else:
             print("  Bridge started but could not reach Polymarket through it.")
             print("  Ensure Mullvad VPN is connected.")
             time.sleep(2)
@@ -421,7 +540,7 @@ def _run(cmd: list[str]) -> None:
 
 # ─── Persistent config ────────────────────────────────────────────────────────
 
-_ALL_LEAGUES   = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+_ALL_LEAGUES   = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
 _ALL_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro", "smarkets"]
 
 _cfg: dict = {
@@ -1101,8 +1220,8 @@ def main() -> None:
                 elif vc == "2":
                     if _vpn_bridge_running():
                         print()
-                        print("  Bridge is already UP.  Launching a fresh instance alongside it.")
-                        print("  The old process will exit once existing connections close.")
+                        print("  Killing existing bridge process ...")
+                        _kill_bridge()
                         time.sleep(1)
                     _ensure_vpn_bridge()
                     _pause()

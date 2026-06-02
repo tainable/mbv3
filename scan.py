@@ -47,6 +47,7 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 from matched_betting.aggregation import build_aggregated_games_payload
 from matched_betting import calculator
+from matched_betting import event_log as _event_log
 
 try:
     import requests as _requests
@@ -70,7 +71,7 @@ except ImportError:
 import arb_finder as _arb
 import bet_executor as _exec
 
-DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals"]
+DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
 DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet"]  # Smarkets and Azuro excluded by default
 DEFAULT_IDS = Path("outputs/active_game_ids.json")
 
@@ -213,16 +214,18 @@ def _scan_game(
     registry: dict,
     min_profit_pct: float,
     debug: Any,
-) -> tuple[list[dict], list[dict], list[dict], list[OddsRecord]]:
+) -> tuple[list[dict], list[dict], list[dict], list[dict], list[OddsRecord], list[tuple[str, str]]]:
     """Fetch all providers for one game in parallel and run the arb calculator.
 
-    Returns (sure_bets, back_lay_arbs, games_payload, raw_records). All stdout
-    printing is handled by the caller so the progress line can be cleared cleanly.
+    Returns (sure_bets, back_lay_arbs, kbo_arbs, games_payload, raw_records, issues).
+    issues is a list of (source, message) tuples for warnings and soft failures.
+    All stdout printing is handled by the caller so the progress line can be cleared cleanly.
     raw_records contains all OddsRecords before win/loss filtering.
     """
     label = f"{game.get('team1')} vs {game.get('team2')}  [{game.get('league', '').upper()}]"
 
     raw_records: list[OddsRecord] = []
+    issues: list[tuple[str, str]] = []
     game_t0 = time.monotonic()
     with ThreadPoolExecutor(max_workers=len(providers)) as executor:
         futures = {
@@ -239,17 +242,19 @@ def _scan_game(
                 debug(f"  {label}  {name}: {len(payload.records)} records  ({elapsed:.1f}s)")
                 for w in payload.warnings:
                     debug(f"  {label}  {name}: WARNING — {w}")
+                    issues.append((name, f"{label}: {w}"))
             except ProviderNotReadyError:
                 pass
             except Exception as exc:
                 debug(f"  {label}  {name}: failed — {exc}  ({elapsed:.1f}s)")
+                issues.append((name, f"{label}: fetch failed — {exc}"))
     game_elapsed = time.monotonic() - game_t0
     if game_elapsed > 3:
         debug(f"  {label}  SLOW GAME: total fetch took {game_elapsed:.1f}s")
 
     records = [r for r in raw_records if is_game_win_loss_record(r)]
     if not records:
-        return [], [], [], raw_records
+        return [], [], [], [], raw_records, issues
 
     canonical_assignment, canonical_events = match_records_to_canonical_events(records)
     games_payload = build_aggregated_games_payload(records, canonical_assignment, canonical_events)
@@ -288,8 +293,9 @@ def _scan_game(
 
     sure_bets = _arb.find_sure_bets(games_payload, min_profit_pct=min_profit_pct)
     back_lay_arbs = _arb.find_back_lay_arbs(games_payload, min_profit_pct=min_profit_pct)
+    kbo_arbs = _arb.find_kbo_tie_aware_arbs(games_payload, min_profit_pct=min_profit_pct)
 
-    return sure_bets, back_lay_arbs, games_payload, raw_records
+    return sure_bets, back_lay_arbs, kbo_arbs, games_payload, raw_records, issues
 
 
 # ---------------------------------------------------------------------------
@@ -412,10 +418,29 @@ def _print_odds_table(
         sign = "+" if p24 >= 0 else ""
         return f"{raw}  (24h: {sign}{p24:.2f}%)"
 
-    sb = calculator.best_sure_bet_opportunity(g)
-    bl = calculator.best_back_lay_opportunity(g)
+    is_kbo = g.get("league") == "kbo"
+    sb = None if is_kbo else calculator.best_sure_bet_opportunity(g)
+    bl = None if is_kbo else calculator.best_back_lay_opportunity(g)
 
     print(f"    {'':11s}  {'─' * max(20, col_w * len(slots) + 2 * (len(slots) - 1))}")
+
+    if is_kbo:
+        # Show KBO-direction hint: underdog on Polymarket, favourite on SX Bet
+        poly_t1 = g.get("polymarket_team1_back_odds")
+        poly_t2 = g.get("polymarket_team2_back_odds")
+        sx_t1   = g.get("sx_bet_team1_back_odds")
+        sx_t2   = g.get("sx_bet_team2_back_odds")
+        if poly_t1 and poly_t2 and sx_t1 and sx_t2:
+            if poly_t1 >= poly_t2:
+                und_name, und_odds, und_prov = _short(team1, 12), poly_t1, "PM"
+                fav_name, fav_odds, fav_prov = _short(team2, 12), sx_t2,   "SX"
+                margin = 1.0 / poly_t1 + 1.0 / sx_t2
+            else:
+                und_name, und_odds, und_prov = _short(team2, 12), poly_t2, "PM"
+                fav_name, fav_odds, fav_prov = _short(team1, 12), sx_t1,   "SX"
+                margin = 1.0 / poly_t2 + 1.0 / sx_t1
+            pct = (1.0 / margin - 1.0) * 100
+            print(f"    KBO arb:     {und_name} @{und_odds:.3f}({und_prov})  {fav_name} @{fav_odds:.3f}({fav_prov})  →  {_pct_str(pct)}")
 
     if sb:
         t1n = _short(team1, 12)
@@ -433,40 +458,6 @@ def _print_odds_table(
         b_part = f"back @{bl['back_odds']:.3f}({_sp(bl['back_provider'])})"
         l_part = f"lay @{bl['lay_odds']:.3f}({_sp(bl['lay_provider'])})"
         print(f"    Back-lay:    {outcome}  {b_part} / {l_part}  →  {_profit_str(bl)}")
-
-    # Azuro liquidity — show max stake per slot from OddsRecord metadata
-    if raw_records and "azuro" in providers:
-        az_records = {
-            r.selection_name: r
-            for r in raw_records
-            if r.provider == "azuro"
-        }
-        if az_records:
-            # Build stake cells aligned to the same slot columns
-            stake_cells = []
-            for slot in slots:
-                # Find the Azuro record for this slot
-                az_r = None
-                t1_lower = (g.get("team1") or "").lower()
-                t2_lower = (g.get("team2") or "").lower()
-                for r in raw_records:
-                    if r.provider != "azuro":
-                        continue
-                    sel = r.selection_name.lower()
-                    if slot == "draw" and sel == "draw":
-                        az_r = r
-                        break
-                    elif slot == "team1" and sel == t1_lower:
-                        az_r = r
-                        break
-                    elif slot == "team2" and sel == t2_lower:
-                        az_r = r
-                        break
-                usdc = (az_r.metadata or {}).get("max_stake_usdc", 0.0) if az_r else 0.0
-                cell = _fmt_stake(usdc, gbp_rate)
-                stake_cells.append(f"{cell:<{col_w}}")
-            print(f"    {'Azuro liq: ':11s}  {'  '.join(stake_cells)}")
-            print(f"    {'':11s}  (max stake per leg, USDC pool)")
 
     print()
 
@@ -573,7 +564,7 @@ def main() -> None:
         default=DEFAULT_LEAGUES,
         choices=DEFAULT_LEAGUES,
         metavar="LEAGUE",
-        help="Leagues to scan: nba wnba mlb mlb_spread mlb_totals ucl epl uel nhl ipl seria laliga mls mls_spread mls_totals (default: all).",
+        help="Leagues to scan: nba wnba mlb mlb_spread mlb_totals kbo ucl epl uel nhl ipl seria laliga mls mls_spread mls_totals veikkausliiga (default: all).",
     )
     parser.add_argument(
         "--providers",
@@ -784,6 +775,7 @@ def main() -> None:
 
     total_sure_bets: list[dict] = []
     total_back_lay_arbs: list[dict] = []
+    total_kbo_arbs: list[dict] = []
     progress_on_screen = False
     _is_tty = sys.stdout.isatty()
 
@@ -808,15 +800,45 @@ def main() -> None:
                         break
                     time.sleep(_ANIM_TICK)
 
-            sure_bets, back_lay_arbs, games_payload, raw_records = _future.result()
+            try:
+                sure_bets, back_lay_arbs, kbo_arbs, games_payload, raw_records, _issues = _future.result()
+            except Exception as _exc:
+                _event_log.log_crash(
+                    "scan_game", _exc, _PROJECT_ROOT,
+                    context=f"{game.get('team1')} vs {game.get('team2')} [{(game.get('league') or '').upper()}]",
+                )
+                sure_bets, back_lay_arbs, kbo_arbs, games_payload, raw_records, _issues = [], [], [], [], [], []
         else:
-            sure_bets, back_lay_arbs, games_payload, raw_records = _scan_game(
-                game, args.providers, args.leagues, registry, args.min_profit, debug
-            )
+            try:
+                sure_bets, back_lay_arbs, kbo_arbs, games_payload, raw_records, _issues = _scan_game(
+                    game, args.providers, args.leagues, registry, args.min_profit, debug
+                )
+            except Exception as _exc:
+                _event_log.log_crash(
+                    "scan_game", _exc, _PROJECT_ROOT,
+                    context=f"{game.get('team1')} vs {game.get('team2')} [{(game.get('league') or '').upper()}]",
+                )
+                sure_bets, back_lay_arbs, kbo_arbs, games_payload, raw_records, _issues = [], [], [], [], [], []
+
+        for _src, _msg in _issues:
+            _event_log.log_warning(_src, _msg, _PROJECT_ROOT)
+
+        # Log all profitable arbs (regardless of min_profit display threshold)
+        _all_sure = calculator.find_sure_bets(games_payload, min_profit_pct=0.0)
+        _all_bl = calculator.find_back_lay_arbs(games_payload, min_profit_pct=0.0)
+        _all_kbo = calculator.find_kbo_tie_aware_arbs(games_payload, min_profit_pct=0.0)
+        for _entry in _all_sure:
+            _event_log.log_arb("sure_bet", _entry, _PROJECT_ROOT)
+        for _entry in _all_bl:
+            _event_log.log_arb("back_lay", _entry, _PROJECT_ROOT)
+        for _entry in _all_kbo:
+            _event_log.log_arb("kbo", _entry, _PROJECT_ROOT)
+
         total_sure_bets.extend(sure_bets)
         total_back_lay_arbs.extend(back_lay_arbs)
+        total_kbo_arbs.extend(kbo_arbs)
 
-        if sure_bets or back_lay_arbs:
+        if sure_bets or back_lay_arbs or kbo_arbs:
             # Clear the progress line before printing arb details
             sys.stdout.write("\r" + " " * (tw - 1) + "\r\n")
             sys.stdout.flush()
@@ -837,6 +859,9 @@ def main() -> None:
             if back_lay_arbs:
                 print(f"  Back-lay arbs ({len(back_lay_arbs)}):")
                 _arb._print_back_lay_arbs(back_lay_arbs, game=_game_ctx, gbp_rate=gbp_rate, budget=args.budget)
+            if kbo_arbs:
+                print(f"  KBO tie-aware arbs ({len(kbo_arbs)}):")
+                _arb._print_kbo_arbs(kbo_arbs, gbp_rate=gbp_rate, budget=args.budget)
             print()
 
             # ── Auto-bet ──────────────────────────────────────────────────
@@ -1037,6 +1062,7 @@ def main() -> None:
     print(f"  Games scanned:  {len(games)}")
     print(f"  Sure bets:      {len(total_sure_bets)}")
     print(f"  Back-lay arbs:  {len(total_back_lay_arbs)}")
+    print(f"  KBO arbs:       {len(total_kbo_arbs)}")
     print(_hr(tw))
 
     if args.auto_bet and _exec._HALT:

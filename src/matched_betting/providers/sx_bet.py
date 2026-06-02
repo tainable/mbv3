@@ -17,6 +17,7 @@ LEAGUE_TO_SPORT = {
     "mlb": "baseball",
     "mlb_spread": "baseball",
     "mlb_totals": "baseball",
+    "kbo": "baseball",
     "nhl": "ice_hockey",
     "ucl": "soccer",
     "epl": "soccer",
@@ -27,6 +28,7 @@ LEAGUE_TO_SPORT = {
     "mls_spread": "soccer",
     "mls_totals": "soccer",
     "ipl": "cricket",
+    "veikkausliiga": "soccer",
 }
 
 # SX Bet league IDs (from GET /leagues)
@@ -36,6 +38,7 @@ _LEAGUE_IDS: dict[str, int | None] = {
     "mlb": 171,
     "mlb_spread": 171,
     "mlb_totals": 171,
+    "kbo": 1389,
     "nhl": 3,
     "ucl": 30,
     "epl": 29,
@@ -46,10 +49,11 @@ _LEAGUE_IDS: dict[str, int | None] = {
     "mls_spread": 1115,
     "mls_totals": 1115,
     "ipl": 1192,
+    "veikkausliiga": 1626,
 }
 
 # Leagues that use binary Yes/No markets per outcome rather than a moneyline
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls", "veikkausliiga"})
 
 # Cricket leagues: two-way match winner markets (no draw, no overtime)
 _CRICKET_LEAGUES: frozenset[str] = frozenset({"ipl"})
