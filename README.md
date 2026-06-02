@@ -23,7 +23,7 @@ mbv2-Default/
 ├── watch_bet.py                    # Live watcher: polls scan output and monitors active bet status
 ├── analyse_bets.py                 # Post-hoc bet analysis and P&L reporting
 ├── menu.py                         # Interactive CLI menu for common pipeline operations
-├── vpn_proxy_bridge.py             # SOCKS5 bridge: 127.0.0.1:1081 → upstream via Mullvad tunnel
+├── vpn_proxy_bridge.py             # SOCKS5 bridge: 127.0.0.1:1082 → upstream via Mullvad tunnel
 ├── specials_scan.py                # Specials scanner: read-only eval of one-off prediction markets
 ├── specials_place.py               # Specials placement: executes strategies with live confirmation
 ├── specials_close.py               # Specials close-out: sends closing orders for open specials positions
@@ -170,7 +170,7 @@ Polymarket and SX Bet require a non-blocked IP for trading. The pipeline routes 
 
 **How it works:**
 
-`vpn_proxy_bridge.py` is a lightweight SOCKS5 server that listens on `127.0.0.1:1081`. The bridge process runs as `pythonw.exe` inside the Mullvad VPN tunnel. When `scan.py` (running as `python.exe`, excluded from the tunnel) makes a Polymarket or SX Bet request through `socks5h://127.0.0.1:1081`, the upstream connection is created by `pythonw.exe` and exits through the Mullvad relay — never through the raw Azure IP. Matchbook requests use a plain `HttpClient()` with no proxy.
+`vpn_proxy_bridge.py` is a lightweight SOCKS5 server that listens on `127.0.0.1:1082`. The bridge process runs as `pythonw.exe` inside the Mullvad VPN tunnel. When `scan.py` (running as `python.exe`, excluded from the tunnel) makes a Polymarket or SX Bet request through `socks5h://127.0.0.1:1082`, the upstream connection is created by `pythonw.exe` and exits through the Mullvad relay — never through the raw Azure IP. Matchbook requests use a plain `HttpClient()` with no proxy.
 
 **Starting the bridge:**
 
@@ -189,7 +189,7 @@ start_vpn_bridge.bat    # run from an interactive CMD window
 Then set `VPN_PROXY_URL` in `.env`:
 
 ```
-VPN_PROXY_URL=socks5h://127.0.0.1:1081
+VPN_PROXY_URL=socks5h://127.0.0.1:1082
 ```
 
 The `socks5h` scheme sends hostnames to the bridge for resolution, preventing DNS leaks.

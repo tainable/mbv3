@@ -26,7 +26,7 @@ _PYTHONW = Path(sys.executable).parent / "pythonw.exe"
 # ─── VPN bridge ───────────────────────────────────────────────────────────────
 
 _VPN_BRIDGE_HOST = "127.0.0.1"
-_VPN_BRIDGE_PORT = 1081
+_VPN_BRIDGE_PORT = 1082
 _BRIDGE_SCRIPT   = _ROOT / "vpn_proxy_bridge.py"
 _VPN_PROXY_HX    = f"socks5://127.0.0.1:{_VPN_BRIDGE_PORT}"  # httpx uses socks5://, not socks5h://
 _VPN_BRIDGE_LOG  = _ROOT / "vpn_bridge.log"
@@ -36,7 +36,7 @@ _IP_ECHO_URL     = "https://ifconfig.me/ip"
 
 
 def _vpn_bridge_running() -> bool:
-    """Return True if the SOCKS5 bridge is listening on 127.0.0.1:1081."""
+    """Return True if the SOCKS5 bridge is listening on 127.0.0.1:1082."""
     try:
         s = socket.create_connection((_VPN_BRIDGE_HOST, _VPN_BRIDGE_PORT), timeout=1)
         s.close()
@@ -247,7 +247,7 @@ def _ensure_vpn_bridge() -> None:
       3. Bridge running but DIRECT     → stale pre-VPN process; kill + restart + re-probe.
 
     A bridge started before Mullvad connects has no tunnel to route through and will
-    silently pass port-1081 checks while actually sending traffic via the Azure public IP.
+    silently pass port-1082 checks while actually sending traffic via the Azure public IP.
     """
     bridge_was_running = _vpn_bridge_running()
 
@@ -256,7 +256,7 @@ def _ensure_vpn_bridge() -> None:
         print()
         print("  VPN bridge not running -- starting vpn_proxy_bridge.py ...")
         if not _start_bridge():
-            print("  WARNING: bridge launched but port 1081 is not yet reachable.")
+            print("  WARNING: bridge launched but port 1082 is not yet reachable.")
             print("           Ensure Mullvad VPN is connected, then press [v] to retry.")
             time.sleep(2)
             return
@@ -340,7 +340,7 @@ def _check_routing() -> None:
         _pause()
         return
 
-    print("  Bridge : UP on 127.0.0.1:1081")
+    print("  Bridge : UP on 127.0.0.1:1082")
     print()
 
     try:

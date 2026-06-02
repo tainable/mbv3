@@ -1,5 +1,5 @@
 """
-SOCKS5 bridge: 127.0.0.1:1081  ->  Mullvad SOCKS5 (10.64.0.1:1080)  ->  target host
+SOCKS5 bridge: 127.0.0.1:1082  ->  Mullvad SOCKS5 (10.64.0.1:1080)  ->  target host
 
 Accepts SOCKS5 CONNECT requests from python.exe (which is excluded from the
 Mullvad VPN tunnel) and forwards them through the Mullvad built-in SOCKS5 proxy
@@ -22,7 +22,7 @@ import os
 import datetime
 
 LISTEN_HOST = "127.0.0.1"
-LISTEN_PORT = 1081
+LISTEN_PORT = 1082
 
 # Mullvad's built-in SOCKS5 proxy — only reachable from pythonw.exe (inside tunnel).
 # Using this as the upstream guarantees VPN exit regardless of Windows WFP socket tagging.

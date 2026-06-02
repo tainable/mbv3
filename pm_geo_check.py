@@ -2,7 +2,7 @@
 import httpx
 import sys
 
-PROXY = "socks5://127.0.0.1:1081"
+PROXY = "socks5://127.0.0.1:1082"
 HOST  = "https://clob.polymarket.com"
 
 print("Exit IP via bridge ...")
