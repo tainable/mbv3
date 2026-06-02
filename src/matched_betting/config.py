@@ -41,6 +41,7 @@ class PolymarketSettings:
     clob_base_url: str
     private_key: str | None
     polygon_rpc_url: str | None
+    ws_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,9 @@ class SxBetSettings:
     base_url: str
     base_token: str
     explorer_url: str = "https://explorerl2.sx.technology/api"  # block explorer for balance queries
+    api_key: str | None = None
+    realtime_url: str = "wss://realtime.sx.bet/connection/websocket"
+    realtime_token_url: str = "https://api.sx.bet/user/realtime-token/api-key"
 
 
 @dataclass(frozen=True)
@@ -141,6 +145,7 @@ def load_settings(project_root: Path) -> Settings:
                 "SX_BET_BASE_TOKEN", "0x6629Ce1Cf35Cc1329ebB4F63202F3f197b3F050B"
             ),
             explorer_url=os.getenv("SX_EXPLORER_URL") or "https://explorerl2.sx.technology/api",
+            api_key=os.getenv("SX_BET_API_KEY") or None,
         ),
         azuro=AzuroSettings(
             api_url=os.getenv(
