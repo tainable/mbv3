@@ -247,7 +247,7 @@ def _hours_until(date_time: str | None) -> float | None:
 def _profit_24h(profit_pct: float, date_time: str | None) -> float | None:
     """Compound-annualise profit_pct to a 24-hour rate. Returns None when hours unavailable."""
     h = _hours_until(date_time)
-    if h is None:
+    if h is None or h < 1 / 60:  # < 1 min to start — meaningless and overflows float
         return None
     return round(((1 + profit_pct / 100) ** (24 / h) - 1) * 100, 4)
 
@@ -360,6 +360,8 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
     for game in games:
         if game.get("league") == "kbo":
             continue  # handled by find_kbo_tie_aware_arbs
+        if game.get("league") in ("mlb_spread", "mls_spread"):
+            continue  # Polymarket binary tokens cannot be short-sold; no real lay market
         if game.get("league") in ("mlb_totals", "mls_totals"):
             slots = ("over", "under")
         elif _is_three_way(game):
@@ -375,6 +377,13 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
                 continue
 
             if back_provider == lay_provider:
+                continue
+
+            # Polymarket only has a genuine lay side for three-way (football 1x2)
+            # markets where the "No" token covers draw + opponent.  For binary
+            # two-way markets the "No" token is just backing the other team, which
+            # is a sure-bet leg, not a real lay.
+            if lay_provider == "polymarket" and not _is_three_way(game):
                 continue
 
             eff_back = _eff_back_odds(back_odds, back_provider)
