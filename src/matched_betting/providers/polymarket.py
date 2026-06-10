@@ -31,10 +31,13 @@ LEAGUE_TO_SPORT = {
     "mls_spread": "soccer",
     "mls_totals": "soccer",
     "ipl": "cricket",
+    "wc": "soccer",
+    "wc_spread": "soccer",
+    "wc_totals": "soccer",
 }
 
 # Leagues that use Yes/No binary markets per outcome (soccer-style)
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls", "wc"})
 
 # Game markets live in /events (not /markets); map league → Polymarket tag_slug
 _LEAGUE_EVENT_TAGS: dict[str, str] = {
@@ -55,6 +58,12 @@ _LEAGUE_EVENT_TAGS: dict[str, str] = {
     "mls": "mls",
     "mls_spread": "mls",
     "mls_totals": "mls",
+    # FIFA World Cup 2026 — per-match 1x2 events and spread/totals more-markets events
+    # all share the "fifa-world-cup" tag.  Spread/totals events have slug suffix
+    # "-more-markets" and contain child markets like fifwc-{t1}-{t2}-{date}-spread-{side}-{line}.
+    "wc": "fifa-world-cup",
+    "wc_spread": "fifa-world-cup",
+    "wc_totals": "fifa-world-cup",
 }
 
 
@@ -80,8 +89,6 @@ class PolymarketProvider(OddsProvider):
         records: list[OddsRecord] = []
         warnings: list[str] = []
 
-        half_segments = {"1h", "2h", "1st-half", "2nd-half", "first-half", "second-half", "halftime"}
-
         candidate_markets: list[tuple[dict[str, Any], str]] = []
         _seen_ipl_pairs: set[frozenset] = set()
         _seen_market_ids: set[str] = set()
@@ -97,8 +104,11 @@ class PolymarketProvider(OddsProvider):
 
             split_slug = market['slug'].split("-")
 
-            # Skip 1st/2nd half markets (e.g. nba-bos-lal-1h)
-            if any(seg in half_segments for seg in split_slug):
+            # Skip 1st/2nd half markets. Compound keywords (e.g. "first-half") are
+            # lost when the slug is split by "-", so check those against the raw slug.
+            _half_raw = {"first-half", "second-half", "1st-half", "2nd-half", "halftime"}
+            _half_seg = {"1h", "2h"}
+            if any(kw in market['slug'] for kw in _half_raw) or any(seg in _half_seg for seg in split_slug):
                 continue
 
             # NBA moneyline slugs are exactly: nba-{team1}-{team2}-{yyyy}-{mm}-{dd} (6 parts).
@@ -155,7 +165,8 @@ class PolymarketProvider(OddsProvider):
 
             _mlb_totals_keywords = {"total"}
             if "mlb_totals" in leagues and split_slug[0] == "mlb":
-                if any(seg in _mlb_totals_keywords for seg in split_slug):
+                # Excludes per-team totals (...-team-total-home/away-...) — see wc_totals comment.
+                if any(seg in _mlb_totals_keywords for seg in split_slug) and "team" not in split_slug:
                     if len(split_slug) >= 3 and split_slug[1] in ['cws','mil','wsh','chc','min','bal',
                     'cin','bos','laa','hou','det','sd','tex','phi',
                     'tb','stl','ari','lad','cle','sea','nyy','sf','oak','tor','col','mia','kc','atl', 'pit','nym']:
@@ -240,8 +251,26 @@ class PolymarketProvider(OddsProvider):
                     if "mls_spread" in leagues and "spread" in split_slug:
                         candidate_markets.append((market, "mls_spread"))
                     # Totals: mls-{t1}-{t2}-{yyyy}-{mm}-{dd}-total-{Xpt5}  (8 parts)
-                    if "mls_totals" in leagues and "total" in split_slug:
+                    # Excludes per-team totals (...-team-total-home/away-...) — see wc_totals comment.
+                    if "mls_totals" in leagues and "total" in split_slug and "team" not in split_slug:
                         candidate_markets.append((market, "mls_totals"))
+
+            # FIFA World Cup — slug prefix "fifwc"; no predefined team-code list.
+            if split_slug[0] == "fifwc" and len(split_slug) >= 3:
+                # 1x2: fifwc-{t1}-{t2}-{yyyy}-{mm}-{dd}-{team_or_draw}  (7 parts)
+                if "wc" in leagues and len(split_slug) == 7:
+                    outcome = split_slug[-1]
+                    if outcome == "draw" or (outcome.isalpha() and 2 <= len(outcome) <= 4):
+                        candidate_markets.append((market, "wc"))
+                # Spread: fifwc-{t1}-{t2}-{yyyy}-{mm}-{dd}-spread-...
+                if "wc_spread" in leagues and "spread" in split_slug:
+                    candidate_markets.append((market, "wc_spread"))
+                # Totals: fifwc-{t1}-{t2}-{yyyy}-{mm}-{dd}-total-...
+                # Excludes per-team totals (...-team-total-home/away-...), which use
+                # the same "total" segment but track a single team's goals, not the
+                # match total — they'd otherwise collide with match totals on total_line.
+                if "wc_totals" in leagues and "total" in split_slug and "team" not in split_slug:
+                    candidate_markets.append((market, "wc_totals"))
 
             _cricket_non_moneyline = {"innings", "runs", "wickets", "fours", "sixes", "total", "over", "under"}
             if "ipl" in leagues and split_slug[0] == "cricipl":
@@ -264,7 +293,7 @@ class PolymarketProvider(OddsProvider):
             )
             #print(market['question'])
             try:
-                market_records, market_warnings = self._market_to_records(market, league, retrieved_at)
+                market_records, market_warnings = self._market_to_records(market, league, retrieved_at, skip_token_liquidity=True)
                 records.extend(market_records)
                 warnings.extend(market_warnings)
                 self.debug(
@@ -355,7 +384,7 @@ class PolymarketProvider(OddsProvider):
                         except Exception as exc:
                             warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")
                             self.debug(f"{self.name}: CLOB: skipped market {market_id}: {exc}")
-            elif league in ("mlb_totals", "mls_totals"):
+            elif league in ("mlb_totals", "mls_totals", "wc_totals"):
                 market_id = game.get("polymarket_market_id")
                 over_token = game.get("polymarket_over_clob_token_id")
                 under_token = game.get("polymarket_under_clob_token_id")
@@ -403,7 +432,7 @@ class PolymarketProvider(OddsProvider):
                 # so we inject them from the stored game context here — the same
                 # pattern as total_line injection for totals markets.
                 _spread_meta: dict = {}
-                if league in ("mlb_spread", "mls_spread"):
+                if league in ("mlb_spread", "mls_spread", "wc_spread"):
                     _ctx_spread = game.get("spread")
                     _ctx_fav = game.get("spread_favourite")
                     if _ctx_spread is not None:
@@ -714,6 +743,11 @@ class PolymarketProvider(OddsProvider):
                     'pun',  'sun', 'luc', 'guj','raj'
                 ]
 
+            elif league in ("wc", "wc_spread", "wc_totals"):
+                # No Polymarket per-match WC markets (only tournament-level props).
+                # Return empty set so _stream_event_markets skips this league.
+                index[league] = set()
+
             else:
                 raw_teams = self.http_client.get_json(
                     f"{self.settings.gamma_base_url}/teams",
@@ -842,6 +876,7 @@ class PolymarketProvider(OddsProvider):
         market: dict[str, Any],
         league: str,
         retrieved_at: str,
+        skip_token_liquidity: bool = False,
     ) -> tuple[list[OddsRecord], list[str]]:
         outcomes = _parse_stringified_json_list(market.get("outcomes"))
         clob_token_ids = _parse_stringified_json_list(market.get("clobTokenIds"))
@@ -850,7 +885,7 @@ class PolymarketProvider(OddsProvider):
         _spread_value: float | None = None
         _spread_favourite: str | None = None
         _total_line_value: float | None = None
-        if league in ("mlb_spread", "mls_spread"):
+        if league in ("mlb_spread", "mls_spread", "wc_spread"):
             _spread_value, _spread_found = _extract_spread(market)
             _spread_favourite = _extract_spread_favourite(market)
             if not _spread_found:
@@ -859,7 +894,7 @@ class PolymarketProvider(OddsProvider):
                 method_warnings.append(
                     f"{league} market {market_id} ({slug}): spread not found in market data, defaulted to -1.5"
                 )
-        elif league in ("mlb_totals", "mls_totals"):
+        elif league in ("mlb_totals", "mls_totals", "wc_totals"):
             _total_line_value = _extract_total_line_pm(market)
 
         lay_probs: list[float | None] = []
@@ -895,13 +930,14 @@ class PolymarketProvider(OddsProvider):
             # liquidity figure. Gamma's liquidityNum is an aggregate and identical for
             # both outcomes, which hides the real per-side imbalance.
             token_liq_usd = [None, None]
-            for _i, _token in enumerate(clob_token_ids[:2]):
-                if _token:
-                    try:
-                        _, _, _ask_size = self._fetch_clob_book(_token)
-                        token_liq_usd[_i] = _ask_size * 2  # matches CLOB-path convention
-                    except Exception:
-                        pass
+            if not skip_token_liquidity:
+                for _i, _token in enumerate(clob_token_ids[:2]):
+                    if _token:
+                        try:
+                            _, _, _ask_size = self._fetch_clob_book(_token)
+                            token_liq_usd[_i] = _ask_size * 2  # matches CLOB-path convention
+                        except Exception:
+                            pass
         else:
             raise ValueError(f"unexpected outcome count: {len(outcomes)}")
 
@@ -997,9 +1033,9 @@ class PolymarketProvider(OddsProvider):
             market_name = "Run Line"
         elif league == "mlb_totals":
             market_name = "Total Runs"
-        elif league == "mls_spread":
+        elif league in ("mls_spread", "wc_spread"):
             market_name = "Goal Line"
-        elif league == "mls_totals":
+        elif league in ("mls_totals", "wc_totals"):
             market_name = "Total Goals"
         else:
             market_name = market.get("groupItemTitle") or market.get("question") or "Unknown market"
@@ -1007,7 +1043,7 @@ class PolymarketProvider(OddsProvider):
         # For single-outcome Yes/No remapped markets, infer_market_type would return "multi_way"
         # (only 1 outcome left). UCL markets are three-way (home/draw/away); all other
         # single-outcome remapped markets fall back to two_way for the moneyline filter.
-        if league in ("mlb_spread", "mlb_totals", "mls_spread", "mls_totals"):
+        if league in ("mlb_spread", "mlb_totals", "mls_spread", "mls_totals", "wc_spread", "wc_totals"):
             # These are always two-outcome markets; _infer_market_type would return
             # "handicap" or "total" from slug keywords, which the moneyline filter would drop.
             market_type = "two_way"
@@ -1039,9 +1075,9 @@ class PolymarketProvider(OddsProvider):
                 "market_type_raw": market.get("marketType"),
                 "sports_market_type_raw": market.get("sportsMarketType"),
                 "liquidity_usd": market.get("liquidityNum"),
-                "spread": _spread_value if league in ("mlb_spread", "mls_spread") else None,
-                "spread_favourite": _spread_favourite if league in ("mlb_spread", "mls_spread") else None,
-                "total_line": _total_line_value if league in ("mlb_totals", "mls_totals") else None,
+                "spread": _spread_value if league in ("mlb_spread", "mls_spread", "wc_spread") else None,
+                "spread_favourite": _spread_favourite if league in ("mlb_spread", "mls_spread", "wc_spread") else None,
+                "total_line": _total_line_value if league in ("mlb_totals", "mls_totals", "wc_totals") else None,
             },
         )
 

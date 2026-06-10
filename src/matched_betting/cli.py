@@ -26,8 +26,8 @@ from matched_betting.providers.base import ProviderNotReadyError
 from matched_betting.providers.registry import build_provider_registry
 
 
-DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
-ALL_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
+DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "nhl", "veikkausliiga", "wc", "wc_spread", "wc_totals"]
+ALL_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga", "wc", "wc_spread", "wc_totals"]
 DEFAULT_PROVIDERS = ["matchbook", "smarkets", "polymarket", "sx_bet", "azuro"]
 
 
@@ -677,7 +677,7 @@ def _game_index_key(game: dict[str, Any]) -> tuple:
     )
 
 
-_KNOWN_LEAGUE_ORDER = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
+_KNOWN_LEAGUE_ORDER = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga", "wc", "wc_spread", "wc_totals"]
 
 
 def _merge_market_index_additive(

@@ -20,8 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 _ROOT    = Path(__file__).resolve().parent
-_PY      = sys.executable
-_PYTHONW = Path(sys.executable).parent / "pythonw.exe"
+_VENV_PY = _ROOT / ".venv" / "Scripts" / "python.exe"
+_PY      = str(_VENV_PY) if _VENV_PY.exists() else sys.executable
+_PYTHONW = _ROOT / ".venv" / "Scripts" / "pythonw.exe"
+if not Path(_PYTHONW).exists():
+    _PYTHONW = Path(sys.executable).parent / "pythonw.exe"
+_PYTHONW = str(_PYTHONW)
 
 # ─── VPN bridge ───────────────────────────────────────────────────────────────
 
@@ -525,26 +529,27 @@ def _pause() -> None:
         pass
 
 
-def _run(cmd: list[str]) -> None:
+def _run(cmd: list[str], env: dict[str, str] | None = None) -> None:
     """Print the command then stream its output."""
     print()
     print(_hr("─"))
     print(f"  $ {' '.join(cmd)}")
     print(_hr("─"))
     print()
+    merged = {**os.environ, **(env or {})}
     try:
-        subprocess.run(cmd, cwd=_ROOT)
+        subprocess.run(cmd, cwd=_ROOT, env=merged)
     except KeyboardInterrupt:
         print("\n  (interrupted)")
 
 
 # ─── Persistent config ────────────────────────────────────────────────────────
 
-_ALL_LEAGUES   = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
+_ALL_LEAGUES   = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga", "wc", "wc_spread", "wc_totals"]
 _ALL_PROVIDERS = ["matchbook", "polymarket", "sx_bet", "azuro", "smarkets"]
 
 _cfg: dict = {
-    "leagues":          list(_ALL_LEAGUES),
+    "leagues":          ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "nhl", "veikkausliiga", "wc", "wc_spread", "wc_totals"],
     "providers":        ["matchbook", "polymarket", "sx_bet"],
     "min_profit":       0.33,
     "budget":           10.0,
@@ -557,6 +562,32 @@ _cfg: dict = {
     "max_runtime":      0,   # 0 = unlimited
     "skip_imminent":    True,
     "imminent_minutes": 10,
+    "skip_far":         True,
+    "max_days_ahead":   7,
+    # Stream-specific
+    "stream_no_matchbook":        False,
+    "stream_poll_only_mb":        True,  # disable on-demand MB fetches; use periodic poll only
+    "stream_no_arb_log":          False,
+    "stream_log":                 False,
+    "stream_min_start":           10.0,  # minutes before start to exclude games
+    "stream_alert":               False,
+    "stream_autobet":             False,
+    "stream_autobet_test":        False,
+    "stream_dry_run":             False,
+    "stream_autobet_delay":       10.0,
+    "stream_autobet_min_profit":  None,  # None = same as min_profit
+    # Kelly bet sizing (injected as env vars into subprocesses)
+    "kelly_enabled":          True,
+    "kelly_max_stake":        200.0,
+    "kelly_min_stake":        2.0,
+    "kelly_low_profit":       0.2,
+    "kelly_high_profit":      1.5,
+    "kelly_low_frac":         0.10,
+    "kelly_high_frac":        0.25,
+    # SX+PM piecewise kink (only applies to sx_bet+polymarket arbs)
+    "kelly_sx_pm_kink_profit":   0.44,
+    "kelly_sx_pm_kink_fraction": 0.15,
+    "kelly_sx_pm_high_fraction": 0.40,
     # Daemon (watch_bet.py) settings
     "daemon_interval":      600,   # seconds between scan.py runs
     "daemon_ids_refresh":   360,   # minutes between ids.py re-runs
@@ -565,6 +596,11 @@ _cfg: dict = {
     "daemon_max_restarts":  10,    # consecutive crash limit before circuit-breaker pause
     "daemon_log":           "",    # path to log file; empty = stream to stdout
     "daemon_skip_initial_ids": False,  # skip ids.py at startup and use existing file
+    # Stream daemon (watch_stream.py) settings
+    "stream_daemon_ids_refresh":      360,   # minutes between IDs refresh (kill+restart stream.py)
+    "stream_daemon_max_restarts":     10,    # consecutive crash limit before circuit-breaker pause
+    "stream_daemon_log":              "",    # path to log file; empty = stream to stdout
+    "stream_daemon_skip_initial_ids": False, # skip ids.py at startup
 }
 
 
@@ -574,6 +610,73 @@ def _ls() -> str:
 
 def _ps() -> str:
     return "  ".join(_cfg["providers"]) or "(none)"
+
+
+def _kelly_summary() -> str:
+    if not _cfg["kelly_enabled"]:
+        return "off"
+    return (
+        f"on  max=${_cfg['kelly_max_stake']:.0f}  min=${_cfg['kelly_min_stake']:.0f}  "
+        f"[{_cfg['kelly_low_profit']:.1f}%->{_cfg['kelly_low_frac']:.0%}  "
+        f"{_cfg['kelly_high_profit']:.1f}%->{_cfg['kelly_high_frac']:.0%}]"
+    )
+
+
+def _build_kelly_env() -> dict[str, str]:
+    """Env-var overrides that inject the current Kelly settings into subprocesses."""
+    return {
+        "KELLY_ENABLED":          "true" if _cfg["kelly_enabled"] else "false",
+        "MAX_STAKE_USDC":         str(_cfg["kelly_max_stake"]),
+        "MIN_STAKE_USDC":         str(_cfg["kelly_min_stake"]),
+        "KELLY_LOW_PROFIT":       str(_cfg["kelly_low_profit"]),
+        "KELLY_HIGH_PROFIT":      str(_cfg["kelly_high_profit"]),
+        "KELLY_LOW_FRACTION":     str(_cfg["kelly_low_frac"]),
+        "KELLY_HIGH_FRACTION":    str(_cfg["kelly_high_frac"]),
+        "SX_PM_KINK_PROFIT":      str(_cfg["kelly_sx_pm_kink_profit"]),
+        "SX_PM_KINK_FRACTION":    str(_cfg["kelly_sx_pm_kink_fraction"]),
+        "SX_PM_HIGH_FRACTION":    str(_cfg["kelly_sx_pm_high_fraction"]),
+    }
+
+
+# ─── Kelly submenu ────────────────────────────────────────────────────────────
+
+def kelly_menu() -> None:
+    while True:
+        _header("Kelly Sizing")
+        print(f"  [1]  Enabled         :  {'on' if _cfg['kelly_enabled'] else 'off'}")
+        print(f"  [2]  Max stake       :  ${_cfg['kelly_max_stake']:.0f} USDC  (hard ceiling per arb)")
+        print(f"  [3]  Min stake       :  ${_cfg['kelly_min_stake']:.2f} USDC  (skip arb if Kelly < this)")
+        print()
+        print("  All arbs (standard 2-anchor curve)")
+        print("  " + "─" * 44)
+        print(f"  [4]  Low profit      :  {_cfg['kelly_low_profit']:.2f}%  =>  {_cfg['kelly_low_frac']:.0%} of bankroll")
+        print(f"  [5]  Low fraction    :  {_cfg['kelly_low_frac']:.2%}")
+        print(f"  [6]  High profit     :  {_cfg['kelly_high_profit']:.2f}%  =>  {_cfg['kelly_high_frac']:.0%} of bankroll")
+        print(f"  [7]  High fraction   :  {_cfg['kelly_high_frac']:.2%}")
+        print()
+        print("  SX Bet + Polymarket arbs only (3-anchor piecewise curve)")
+        print("  " + "─" * 44)
+        print(f"  [8]  Kink profit     :  {_cfg['kelly_sx_pm_kink_profit']:.2f}%  =>  {_cfg['kelly_sx_pm_kink_fraction']:.0%}  (bridge-fee threshold)")
+        print(f"  [9]  Kink fraction   :  {_cfg['kelly_sx_pm_kink_fraction']:.2%}")
+        print(f"  [10] SX/PM high frac :  {_cfg['kelly_sx_pm_high_fraction']:.2%}  (at high profit, replaces standard high fraction)")
+        print()
+        print("  Bankroll = min(involved platform balances) x 3")
+        print("  Test mode bypasses Kelly entirely (flat $10 stake)")
+        print()
+        print("  [0]  Back")
+        print()
+        c = _ask("Choice")
+        if   c == "0":  break
+        elif c == "1":  _cfg["kelly_enabled"]              = not _cfg["kelly_enabled"]
+        elif c == "2":  _cfg["kelly_max_stake"]             = max(1.0,  _ask_float("Max stake (USDC)", _cfg["kelly_max_stake"]))
+        elif c == "3":  _cfg["kelly_min_stake"]             = max(0.1,  _ask_float("Min stake (USDC)", _cfg["kelly_min_stake"]))
+        elif c == "4":  _cfg["kelly_low_profit"]            = max(0.01, _ask_float("Low profit anchor (%)", _cfg["kelly_low_profit"]))
+        elif c == "5":  _cfg["kelly_low_frac"]              = min(1.0,  max(0.001, _ask_float("Low fraction (e.g. 0.10)", _cfg["kelly_low_frac"])))
+        elif c == "6":  _cfg["kelly_high_profit"]           = max(0.01, _ask_float("High profit anchor (%)", _cfg["kelly_high_profit"]))
+        elif c == "7":  _cfg["kelly_high_frac"]             = min(1.0,  max(0.001, _ask_float("High fraction (e.g. 0.25)", _cfg["kelly_high_frac"])))
+        elif c == "8":  _cfg["kelly_sx_pm_kink_profit"]     = max(0.01, _ask_float("SX/PM kink profit anchor (%)", _cfg["kelly_sx_pm_kink_profit"]))
+        elif c == "9":  _cfg["kelly_sx_pm_kink_fraction"]   = min(1.0,  max(0.001, _ask_float("SX/PM kink fraction (e.g. 0.15)", _cfg["kelly_sx_pm_kink_fraction"])))
+        elif c == "10": _cfg["kelly_sx_pm_high_fraction"]   = min(1.0,  max(0.001, _ask_float("SX/PM high fraction (e.g. 0.40)", _cfg["kelly_sx_pm_high_fraction"])))
 
 
 # ─── Multi-select toggle ──────────────────────────────────────────────────────
@@ -623,6 +726,9 @@ def settings_menu() -> None:
         print(f"  [5b] Max runtime      :  {max_s}  (loop mode)")
         print(f"  [5c] Imminent games   :  {imminent}")
         print(f"  [5d] Imminent cutoff  :  {_cfg['imminent_minutes']} minutes")
+        far = f"skip >{_cfg['max_days_ahead']}d" if _cfg["skip_far"] else "include all"
+        print(f"  [5e] Far-future games :  {far}")
+        print(f"  [5f] Far-future cutoff:  {_cfg['max_days_ahead']} days")
         print(f"  [6]  Debug            :  {'on' if _cfg['debug'] else 'off'}")
         print(f"  [7]  Show odds     :  {'on' if _cfg['show_odds'] else 'off'}")
         print(f"  [8]  Auto-bet      :  {auto_s}")
@@ -645,6 +751,10 @@ def settings_menu() -> None:
             _cfg["skip_imminent"] = not _cfg["skip_imminent"]
         elif c == "5d":
             _cfg["imminent_minutes"] = max(1, _ask_int("Imminent cutoff (minutes)", _cfg["imminent_minutes"]))
+        elif c == "5e":
+            _cfg["skip_far"] = not _cfg["skip_far"]
+        elif c == "5f":
+            _cfg["max_days_ahead"] = max(1, _ask_int("Far-future cutoff (days)", _cfg["max_days_ahead"]))
         elif c == "6": _cfg["debug"]        = not _cfg["debug"]
         elif c == "7": _cfg["show_odds"]    = not _cfg["show_odds"]
         elif c == "8": _cfg["auto_bet"]     = not _cfg["auto_bet"]
@@ -704,6 +814,10 @@ def _build_scan_cmd() -> list[str]:
         cmd.append("--no-skip-imminent")
     elif _cfg["imminent_minutes"] != 10:
         cmd += ["--imminent-minutes", str(_cfg["imminent_minutes"])]
+    if not _cfg["skip_far"]:
+        cmd.append("--no-skip-far")
+    elif _cfg["max_days_ahead"] != 7:
+        cmd += ["--max-days-ahead", str(_cfg["max_days_ahead"])]
     if _cfg["debug"]:             cmd.append("--debug")
     if _cfg["show_odds"]:         cmd.append("--show-odds")
     if _cfg["auto_bet"]:
@@ -723,8 +837,10 @@ def _scan_summary() -> None:
     print(f"  Show odds  : {'on' if _cfg['show_odds'] else 'off'}")
     topup_s = "on" if _cfg["allow_topup"] else "off"
     print(f"  Auto-bet   : {auto_s}   budget=${_cfg['budget']:.2f}   top-up={topup_s}")
-    imminent = "skip" if _cfg["skip_imminent"] else "include"
+    imminent = f"skip <{_cfg['imminent_minutes']}m" if _cfg["skip_imminent"] else "include"
+    far      = f"skip >{_cfg['max_days_ahead']}d"  if _cfg["skip_far"]      else "include"
     print(f"  Imminent   : {imminent}")
+    print(f"  Far-future : {far}")
     print(f"  Debug      : {'on' if _cfg['debug'] else 'off'}")
 
 
@@ -1139,11 +1255,329 @@ def run_daemon() -> None:
             print("  Daemon running — press Ctrl+C to stop.")
             print()
             try:
-                subprocess.run(cmd, cwd=_ROOT)
+                subprocess.run(cmd, cwd=_ROOT, env={**os.environ, **_build_kelly_env()})
             except KeyboardInterrupt:
                 print("\n  Daemon stopped.")
             _pause()
             break
+
+
+# ─── Stream (real-time WebSocket) ────────────────────────────────────────────
+
+def run_stream() -> None:
+    while True:
+        _header("Stream  (real-time WebSocket)")
+        if _cfg["stream_no_matchbook"]:
+            mb_s = "disabled"
+        elif _cfg["stream_poll_only_mb"]:
+            mb_s = "poll only"
+        else:
+            mb_s = "on-demand + poll"
+        ms      = _cfg["stream_min_start"]
+        ms_s    = f"exclude < {ms:.0f}m" if ms > 0 else "include all"
+        alert_s = "on" if _cfg["stream_alert"] else "off"
+
+        # Autobet status line
+        if _cfg["stream_autobet"]:
+            if _cfg["stream_autobet_test"]:
+                ab_mode = "TEST $5"
+            elif _cfg["stream_dry_run"]:
+                ab_mode = "DRY-RUN"
+            else:
+                ab_mode = "LIVE"
+            ab_thr = _cfg["stream_autobet_min_profit"]
+            ab_thr_s = f"{ab_thr:.2f}%" if ab_thr is not None else f"same as min-profit ({_cfg['min_profit']:.2f}%)"
+            ab_s = f"on [{ab_mode}]  threshold={ab_thr_s}  delay={_cfg['stream_autobet_delay']:.0f}s"
+        else:
+            ab_s = "off"
+
+        arb_log_s  = "off" if _cfg["stream_no_arb_log"] else "on"
+        stream_log_s = "on" if _cfg["stream_log"] else "off"
+        print(f"  Leagues    : {_ls()}")
+        print(f"  Matchbook  : {mb_s}")
+        print(f"  Imminent   : {ms_s}")
+        print(f"  Min profit : {_cfg['min_profit']:.1f}%")
+        print(f"  Budget     : ${_cfg['budget']:.2f} USDC")
+        print(f"  Arb log    : {arb_log_s}")
+        print(f"  Stream log : {stream_log_s}  (outputs/stream.db)")
+        print(f"  Autobet    : {ab_s}")
+        print(f"  Kelly      : {_kelly_summary()}")
+        print(f"  Alerts     : {alert_s}")
+        print()
+        print("  Subscribes to live Polymarket CLOB and SX Bet Centrifugo feeds.")
+        print("  Fires arb detection within 0.2s of every price change.")
+        print()
+        print(f"  [1]  Start stream")
+        print(f"  [2]  Change leagues")
+        print(f"  [3]  Change min profit / budget")
+        print(f"  [4]  Matchbook mode         ({mb_s})  [disabled / poll-only / on-demand+poll]")
+        print(f"  [5]  Imminent cutoff       ({ms_s})")
+        print(f"  [l]  Toggle arb log        ({arb_log_s})")
+        print(f"  [sl] Toggle stream log     ({stream_log_s})")
+        print(f"  [a]  Toggle ntfy alerts    ({alert_s})")
+        print()
+        print("  Autobet")
+        print("  " + "─" * 40)
+        print(f"  [ab] Toggle autobet        ({ab_s})")
+        if _cfg["stream_autobet"]:
+            test_s = "on  (flat $5, bypasses Kelly, pauses after each bet)" if _cfg["stream_autobet_test"] else "off"
+            dry_s  = "on" if _cfg["stream_dry_run"] else "off"
+            print(f"  [t]  Test mode             ({test_s})")
+            print(f"  [dr] Dry run               ({dry_s})")
+            print(f"  [ad] Autobet delay         ({_cfg['stream_autobet_delay']:.0f}s)")
+            ab_thr_disp = f"{_cfg['stream_autobet_min_profit']:.2f}%" if _cfg["stream_autobet_min_profit"] is not None else "same as min-profit"
+            print(f"  [at] Autobet threshold     ({ab_thr_disp})")
+        print()
+        print(f"  [k]  Kelly settings        ({_kelly_summary()})")
+        print()
+        print("  [0]  Back")
+        print()
+        c = _ask("Choice").lower()
+        if c == "0":
+            return
+        elif c == "2":
+            _toggle_list("leagues", _ALL_LEAGUES, "Leagues -- Stream")
+        elif c == "3":
+            _cfg["min_profit"] = _ask_float("Min profit %", _cfg["min_profit"])
+            _cfg["budget"]     = _ask_float("Budget (USDC)", _cfg["budget"])
+        elif c == "4":
+            # Cycle: disabled -> poll-only -> on-demand+poll -> disabled
+            if _cfg["stream_no_matchbook"]:
+                _cfg["stream_no_matchbook"] = False
+                _cfg["stream_poll_only_mb"] = True
+            elif _cfg["stream_poll_only_mb"]:
+                _cfg["stream_poll_only_mb"] = False
+            else:
+                _cfg["stream_no_matchbook"] = True
+        elif c == "5":
+            raw = _ask_float("Exclude games starting within N minutes (0 = off)", _cfg["stream_min_start"])
+            _cfg["stream_min_start"] = max(0.0, raw)
+        elif c == "l":
+            _cfg["stream_no_arb_log"] = not _cfg["stream_no_arb_log"]
+        elif c == "sl":
+            _cfg["stream_log"] = not _cfg["stream_log"]
+        elif c == "a":
+            _cfg["stream_alert"] = not _cfg["stream_alert"]
+        elif c == "ab":
+            _cfg["stream_autobet"] = not _cfg["stream_autobet"]
+        elif c == "t":
+            _cfg["stream_autobet_test"] = not _cfg["stream_autobet_test"]
+        elif c == "dr":
+            _cfg["stream_dry_run"] = not _cfg["stream_dry_run"]
+        elif c == "ad":
+            _cfg["stream_autobet_delay"] = max(0.0, _ask_float("Delay before placing (seconds)", _cfg["stream_autobet_delay"]))
+        elif c == "at":
+            raw = _ask("Autobet threshold % (leave blank = same as min-profit)", "")
+            _cfg["stream_autobet_min_profit"] = float(raw) if raw.strip() else None
+        elif c == "k":
+            kelly_menu()
+        elif c == "1":
+            cmd = [
+                _PY, "stream.py",
+                "--stream-leagues"] + _cfg["leagues"] + [
+                "--min-profit", str(_cfg["min_profit"]),
+                "--budget",     str(_cfg["budget"]),
+            ]
+            if _cfg["stream_no_matchbook"]:
+                cmd.append("--no-matchbook")
+            elif _cfg["stream_poll_only_mb"]:
+                cmd.append("--no-mb-ondemand")
+            if _cfg["stream_no_arb_log"]:
+                cmd.append("--no-arb-log")
+            if _cfg["stream_log"]:
+                cmd.append("--stream-log")
+            cmd += ["--min-start", str(_cfg["stream_min_start"])]
+            if _cfg["stream_alert"]:
+                cmd.append("--alert")
+            if _cfg["stream_autobet"]:
+                cmd.append("--autobet")
+                cmd += ["--autobet-delay", str(_cfg["stream_autobet_delay"])]
+                if _cfg["stream_autobet_min_profit"] is not None:
+                    cmd += ["--autobet-min-profit", str(_cfg["stream_autobet_min_profit"])]
+                if _cfg["stream_autobet_test"]:
+                    cmd.append("--autobet-test")
+                elif _cfg["stream_dry_run"]:
+                    cmd.append("--bet-dry-run")
+            if _cfg["debug"]:
+                cmd.append("--debug")
+            _run(cmd, env=_build_kelly_env())
+            _pause()
+            return
+
+
+# ─── Stream daemon (watch_stream.py) ─────────────────────────────────────────
+
+_STREAM_HEARTBEAT = _ROOT / "outputs" / "stream_heartbeat.txt"
+
+
+def _stream_heartbeat_summary() -> str:
+    if not _STREAM_HEARTBEAT.exists():
+        return "not running"
+    try:
+        hb = json.loads(_STREAM_HEARTBEAT.read_text(encoding="utf-8"))
+        last = (hb.get("last_checked_at") or "")[:19].replace("T", " ")
+        runs = hb.get("run_count", "?")
+        crashes = hb.get("consecutive_crashes", 0)
+        crash_s = f"  crashes={crashes}" if crashes else ""
+        age_secs = (datetime.now(timezone.utc) -
+                    datetime.fromisoformat(hb["last_checked_at"].replace("Z", "+00:00"))).total_seconds()
+        age_label = f"{int(age_secs)}s ago" if age_secs < 120 else f"{int(age_secs/60)}m ago"
+        return f"last check {last}  ({age_label})  runs={runs}{crash_s}"
+    except Exception:
+        return "heartbeat unreadable"
+
+
+def _build_stream_daemon_cmd() -> list[str]:
+    cmd = [
+        _PY, "watch_stream.py",
+        "--budget",              str(_cfg["budget"]),
+        "--min-profit",          str(_cfg["min_profit"]),
+        "--ids-refresh-interval", str(_cfg["stream_daemon_ids_refresh"]),
+        "--max-restarts",        str(_cfg["stream_daemon_max_restarts"]),
+        "--autobet-delay",       str(_cfg["stream_autobet_delay"]),
+    ]
+    if _cfg["leagues"]:
+        cmd += ["--leagues"] + _cfg["leagues"]
+    if _cfg["providers"]:
+        cmd += ["--providers"] + _cfg["providers"]
+    if _cfg["stream_autobet_min_profit"] is not None:
+        cmd += ["--autobet-min-profit", str(_cfg["stream_autobet_min_profit"])]
+    if _cfg["stream_no_matchbook"]:
+        cmd.append("--no-matchbook")
+    elif _cfg["stream_poll_only_mb"]:
+        cmd.append("--poll-only-mb")
+    cmd += ["--min-start", str(_cfg["stream_min_start"])]
+    if _cfg["stream_dry_run"]:
+        cmd.append("--bet-dry-run")
+    if _cfg["stream_autobet_test"]:
+        cmd.append("--autobet-test")
+    if _cfg["stream_daemon_skip_initial_ids"]:
+        cmd.append("--skip-initial-ids")
+    if _cfg["stream_daemon_log"]:
+        cmd += ["--log", _cfg["stream_daemon_log"]]
+    if _cfg["debug"]:
+        cmd.append("--debug")
+    return cmd
+
+
+def run_stream_daemon() -> None:
+    while True:
+        _header("Stream Daemon  (24/7 autonomous WebSocket)")
+        mode_s = "DRY RUN" if _cfg["stream_dry_run"] else "LIVE"
+        if _cfg["stream_autobet_test"]:
+            mode_s = "TEST $5"
+        if _cfg["stream_no_matchbook"]:
+            mb_s = "disabled"
+        elif _cfg["stream_poll_only_mb"]:
+            mb_s = "poll only"
+        else:
+            mb_s = "on-demand + poll"
+        skip_s    = "yes (use existing file)" if _cfg["stream_daemon_skip_initial_ids"] else "no (run ids.py first)"
+        log_s     = _cfg["stream_daemon_log"] or "(stdout)"
+        test_s    = "on  (flat $5, bypasses Kelly, pauses after each bet)" if _cfg["stream_autobet_test"] else "off"
+        dry_s     = "on" if _cfg["stream_dry_run"] else "off"
+        ab_thr_s  = f"{_cfg['stream_autobet_min_profit']:.2f}%" if _cfg["stream_autobet_min_profit"] is not None else f"same as min-profit ({_cfg['min_profit']:.2f}%)"
+        print(f"  Mode         : {mode_s}")
+        print(f"  Budget       : ${_cfg['budget']:.2f} USDC  |  min-profit: {_cfg['min_profit']:.2f}%")
+        print(f"  Matchbook    : {mb_s}")
+        print(f"  Autobet thr  : {ab_thr_s}  |  delay: {_cfg['stream_autobet_delay']:.0f}s")
+        print(f"  Kelly        : {_kelly_summary()}")
+        print(f"  Leagues      : {_ls()}")
+        print(f"  IDs refresh  : every {_cfg['stream_daemon_ids_refresh']}m  |  skip initial: {skip_s}")
+        print(f"  Max restarts : {_cfg['stream_daemon_max_restarts']} before circuit-breaker pause")
+        print(f"  Log file     : {log_s}")
+        print(f"  Heartbeat    : {_stream_heartbeat_summary()}")
+        print()
+        print(f"  [1]  Start stream daemon   — launches watch_stream.py [{mode_s}]  (Ctrl+C to stop)")
+        print(f"  [d]  Toggle dry run        — currently: {dry_s}")
+        print(f"  [t]  Test mode             — currently: {test_s}")
+        print("  [2]  Leagues")
+        print("  [3]  Min profit / budget")
+        print(f"  [m]  Matchbook mode        — currently: {mb_s}  [disabled / poll-only / on-demand+poll]")
+        print("  [at] Autobet threshold     (profit %% floor for placing, blank = same as min-profit)")
+        print(f"  [ad] Autobet delay         ({_cfg['stream_autobet_delay']:.0f}s before placing)")
+        print("  [k]  Kelly settings")
+        print("  [4]  IDs refresh interval  (minutes)")
+        print("  [5]  Max restarts          (circuit-breaker threshold)")
+        skip_ids_s = "yes" if _cfg["stream_daemon_skip_initial_ids"] else "no"
+        print(f"  [s]  Skip initial IDs scan — currently: {skip_ids_s}")
+        print("  [6]  Log file              (empty = stream to terminal)")
+        print()
+        print("  [0]  Back")
+        print()
+        c = _ask("Choice").lower()
+        if c == "0":
+            break
+        elif c == "d":
+            _cfg["stream_dry_run"] = not _cfg["stream_dry_run"]
+        elif c == "t":
+            _cfg["stream_autobet_test"] = not _cfg["stream_autobet_test"]
+        elif c == "m":
+            # Cycle: disabled -> poll-only -> on-demand+poll -> disabled
+            if _cfg["stream_no_matchbook"]:
+                _cfg["stream_no_matchbook"] = False
+                _cfg["stream_poll_only_mb"] = True
+            elif _cfg["stream_poll_only_mb"]:
+                _cfg["stream_poll_only_mb"] = False
+            else:
+                _cfg["stream_no_matchbook"] = True
+        elif c == "s":
+            _cfg["stream_daemon_skip_initial_ids"] = not _cfg["stream_daemon_skip_initial_ids"]
+        elif c == "2":
+            _toggle_list("leagues", _ALL_LEAGUES, "Leagues -- Stream Daemon")
+        elif c == "3":
+            _cfg["min_profit"] = _ask_float("Min profit %", _cfg["min_profit"])
+            _cfg["budget"]     = _ask_float("Budget (USDC)", _cfg["budget"])
+        elif c == "at":
+            raw = _ask("Autobet threshold % (leave blank = same as min-profit)", "")
+            _cfg["stream_autobet_min_profit"] = float(raw) if raw.strip() else None
+        elif c == "ad":
+            _cfg["stream_autobet_delay"] = max(0.0, _ask_float("Delay before placing (seconds)", _cfg["stream_autobet_delay"]))
+        elif c == "k":
+            kelly_menu()
+        elif c == "4":
+            _cfg["stream_daemon_ids_refresh"] = max(1, _ask_int(
+                "Minutes between IDs refresh", _cfg["stream_daemon_ids_refresh"]))
+        elif c == "5":
+            _cfg["stream_daemon_max_restarts"] = max(1, _ask_int(
+                "Max consecutive crashes", _cfg["stream_daemon_max_restarts"]))
+        elif c == "6":
+            raw = _ask("Log file path (leave blank for stdout)", _cfg["stream_daemon_log"])
+            _cfg["stream_daemon_log"] = raw.strip()
+        elif c == "1":
+            cmd = _build_stream_daemon_cmd()
+            print()
+            print(_hr("─"))
+            print(f"  $ {' '.join(cmd)}")
+            if _cfg["stream_daemon_log"]:
+                print(f"  Output -> {_cfg['stream_daemon_log']}")
+                print(f"  Follow with:  Get-Content \"{_cfg['stream_daemon_log']}\" -Wait -Tail 30")
+            print(_hr("─"))
+            print()
+            print("  Stream daemon running -- press Ctrl+C to stop.")
+            print()
+            try:
+                subprocess.run(cmd, cwd=_ROOT, env={**os.environ, **_build_kelly_env()})
+            except KeyboardInterrupt:
+                print("\n  Stream daemon stopped.")
+            _pause()
+            break
+
+
+# ─── Cashout ──────────────────────────────────────────────────────────────────
+
+def run_cashout() -> None:
+    _header("Cashout")
+    print("  Close arb positions early to recycle capital when odds converge.")
+    print()
+    print("  [1]  Cashout  (live)      — view P&L and execute close orders")
+    print("  [2]  Cashout  (dry-run)   — preview only, no orders placed")
+    print()
+    print("  [0]  Back")
+    print()
+    c = _ask("Choice")
+    if   c == "1": _run([_PY, "cashout.py"])
+    elif c == "2": _run([_PY, "cashout.py", "--dry-run"])
 
 
 # ─── Main menu ────────────────────────────────────────────────────────────────
@@ -1162,15 +1596,19 @@ def main() -> None:
         print("  [1]  Refresh IDs          — discover markets  (Stage 1)")
         print("  [2]  Scan  (single pass)  — check for arbs   (Stage 2)")
         print("  [3]  Scan  (loop)         — repeat every N seconds")
+        print("  [s]  Stream  (real-time)  — WebSocket feeds, fires on arbs immediately")
         print()
         print("  Autonomous")
         print("  " + "─" * 48)
-        print("  [7]  Daemon (24/7)        — watch_bet.py  (IDs refresh + backoff + alerts)")
+        print("  [7]  Daemon (24/7)        — watch_bet.py     (scan polling, IDs refresh + backoff)")
         print(f"       {_heartbeat_summary()}")
+        print("  [8]  Stream daemon (24/7) — watch_stream.py  (WebSocket, IDs refresh + backoff)")
+        print(f"       {_stream_heartbeat_summary()}")
         print()
         print("  Portfolio")
         print("  " + "─" * 48)
         print("  [4]  Portfolio            — balances + active bets")
+        print("  [k]  Cashout               — close arb positions early, view P&L")
         print()
         print("  Polymarket")
         print("  " + "─" * 48)
@@ -1197,9 +1635,12 @@ def main() -> None:
         elif c == "2": run_scan()
         elif c == "3": run_loop_scan()
         elif c == "4": run_portfolio()
+        elif c == "k": run_cashout()
         elif c == "5": settings_menu()
         elif c == "6": run_polymarket_setup()
         elif c == "7": run_daemon()
+        elif c == "8": run_stream_daemon()
+        elif c == "s": run_stream()
         elif c == "v":
             while True:
                 _header("VPN Bridge")

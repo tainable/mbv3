@@ -140,6 +140,11 @@ def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, floa
     ]
 
 
+def _o(odds: float) -> str:
+    """Format decimal odds with implied probability: '1.8500 (54.1%)'."""
+    return f"{odds:.4f} ({100/odds:.1f}%)"
+
+
 def _print_sure_bets(
     arbs: list[dict],
     game: dict | None = None,
@@ -182,11 +187,11 @@ def _print_sure_bets(
         total_s = f" O/U {total_line}" if total_line is not None else ""
         lines = [
             f"  [{arb['league'].upper()}{spread_s}{total_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
-            f"    Back {arb['team1']:<30} {arb['team1_back_odds']:.4f}  ({arb['team1_back_provider']}){_avail(arb.get('team1_back_avail'), arb['team1_back_provider'])}{_stake_str(arb['team1'], arb['team1_back_provider'])}",
+            f"    Back {arb['team1']:<30} {_o(arb['team1_back_odds'])}  ({arb['team1_back_provider']}){_avail(arb.get('team1_back_avail'), arb['team1_back_provider'])}{_stake_str(arb['team1'], arb['team1_back_provider'])}",
         ]
         if arb["market_type"] == "three_way":
             lines.append(
-                f"    Back {'Draw':<30} {arb['draw_back_odds']:.4f}  ({arb['draw_back_provider']}){_avail(arb.get('draw_back_avail'), arb['draw_back_provider'])}{_stake_str('Draw', arb['draw_back_provider'])}"
+                f"    Back {'Draw':<30} {_o(arb['draw_back_odds'])}  ({arb['draw_back_provider']}){_avail(arb.get('draw_back_avail'), arb['draw_back_provider'])}{_stake_str('Draw', arb['draw_back_provider'])}"
             )
         gross_str = (
             f"  (gross: {arb['gross_profit_pct']:.4f}%)"
@@ -194,7 +199,7 @@ def _print_sure_bets(
             else ""
         )
         lines += [
-            f"    Back {arb['team2']:<30} {arb['team2_back_odds']:.4f}  ({arb['team2_back_provider']}){_avail(arb.get('team2_back_avail'), arb['team2_back_provider'])}{_stake_str(arb['team2'], arb['team2_back_provider'])}",
+            f"    Back {arb['team2']:<30} {_o(arb['team2_back_odds'])}  ({arb['team2_back_provider']}){_avail(arb.get('team2_back_avail'), arb['team2_back_provider'])}{_stake_str(arb['team2'], arb['team2_back_provider'])}",
             f"    Margin: {arb['margin']:.6f}  |  Net profit: {arb['profit_pct']:.4f}%{gross_str}"
             + (f"  |  24h: +{arb['profit_24h_pct']:.4f}%" if arb.get('profit_24h_pct') is not None else ""),
             "",
@@ -231,8 +236,8 @@ def _print_back_lay_arbs(arbs: list[dict], game: dict | None = None, gbp_rate: f
         total_s = f" O/U {total_line}" if total_line is not None else ""
         lines = [
             f"  [{arb['league'].upper()}{spread_s}{total_s}] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [{arb['market_type']}]{started_flag}",
-            f"    Back {arb['arb_outcome']:<30} {arb['back_odds']:.4f}  ({arb['back_provider']}){_avail(arb.get('back_avail'), arb['back_provider'])}",
-            f"    Lay  {arb['arb_outcome']:<30} {arb['lay_odds']:.4f}  ({arb['lay_provider']}){_avail(arb.get('lay_avail'), arb['lay_provider'])}",
+            f"    Back {arb['arb_outcome']:<30} {_o(arb['back_odds'])}  ({arb['back_provider']}){_avail(arb.get('back_avail'), arb['back_provider'])}",
+            f"    Lay  {arb['arb_outcome']:<30} {_o(arb['lay_odds'])}  ({arb['lay_provider']}){_avail(arb.get('lay_avail'), arb['lay_provider'])}",
             f"    Net profit: {arb['profit_pct']:.4f}%{gross_str}"
             + (f"  |  24h: +{arb['profit_24h_pct']:.4f}%" if arb.get('profit_24h_pct') is not None else ""),
         ]
@@ -278,8 +283,8 @@ def _print_kbo_arbs(
         )
         lines = [
             f"  [KBO] {arb['team1']} vs {arb['team2']}  ({arb['date_time']})  [two_way]{started_flag}",
-            f"    Back {arb['poly_underdog_name']:<30} {arb['poly_underdog_odds']:.4f}  (polymarket){_avail(arb.get('poly_underdog_avail'), 'polymarket')}{stake_poly_str}",
-            f"    Back {arb['sx_fav_name']:<30} {arb['sx_fav_odds']:.4f}  (sx_bet){_avail(arb.get('sx_fav_avail'), 'sx_bet')}{stake_sx_str}",
+            f"    Back {arb['poly_underdog_name']:<30} {_o(arb['poly_underdog_odds'])}  (polymarket){_avail(arb.get('poly_underdog_avail'), 'polymarket')}{stake_poly_str}",
+            f"    Back {arb['sx_fav_name']:<30} {_o(arb['sx_fav_odds'])}  (sx_bet){_avail(arb.get('sx_fav_avail'), 'sx_bet')}{stake_sx_str}",
             f"    Margin: {arb['margin']:.6f}  |  Net profit: {arb['profit_pct']:.4f}%{gross_str}"
             + (f"  |  24h: +{arb['profit_24h_pct']:.4f}%" if arb.get('profit_24h_pct') is not None else ""),
             f"    Tie bonus: +{arb['tie_gain_pct']:.2f}% of staked  (PM pays 50c/token; SX Bet refunds)",
@@ -421,8 +426,9 @@ def _fetch_matchbook_leg(game: dict, outcome_name: str, side: str, http, setting
     _MB_TOTALS = {
         "total", "total runs", "total runs (incl. extra innings)",
         "total (incl. extra innings)", "over/under",
+        "total goals", "total goals (incl. overtime)", "match goals", "over/under goals",
     }
-    is_totals = game.get("league") in ("mlb_totals", "mls_totals")
+    is_totals = game.get("league") in ("mlb_totals", "mls_totals", "wc_totals")
     try:
         if settings.matchbook.username and settings.matchbook.password:
             http.post_json(
@@ -484,7 +490,7 @@ def _fetch_sx_bet_leg(game: dict, outcome_name: str, side: str, http, settings) 
             return None
         # For mlb_totals / mls_totals: outcomeOne=Over, outcomeTwo=Under.
         # Taker backing Over uses outcomeTwo maker orders; Under uses outcomeOne.
-        if game.get("league") in ("mlb_totals", "mls_totals"):
+        if game.get("league") in ("mlb_totals", "mls_totals", "wc_totals"):
             outcome_lower = outcome_name.lower()
             maker_data = entry.get("outcomeTwo") if outcome_lower == "over" else entry.get("outcomeOne")
         else:

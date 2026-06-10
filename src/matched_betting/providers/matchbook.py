@@ -82,13 +82,16 @@ class MatchbookProvider(OddsProvider):
         retrieved_at = utc_now_iso()
         self._login()
 
-        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga")):
+        if any(lg in leagues for lg in ("ucl", "epl", "uel", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga", "wc", "wc_spread", "wc_totals")):
             self._log_available_sports()
 
         records: list[OddsRecord] = []
         warnings: list[str] = []
 
         for league in leagues:
+            if league not in LEAGUE_SPORT_IDS:
+                self.debug(f"{self.name}: no sport ID configured for {league}, skipping")
+                continue
             sport_id = LEAGUE_SPORT_IDS[league]
             self.debug(f"{self.name}: fetching events for {league} (sport-id={sport_id})")
             events = self._iter_events(sport_id=sport_id)
@@ -146,7 +149,7 @@ class MatchbookProvider(OddsProvider):
                 # markets (e.g. both the +1.5 and -1.5 side). Filter to the specific
                 # line stored in the game context so only one canonical spread group
                 # is produced downstream.
-                if league in ("mlb_spread", "mls_spread"):
+                if league in ("mlb_spread", "mls_spread", "wc_spread"):
                     context_favourite = game.get("spread_favourite")
                     context_spread = game.get("spread")  # normalised (signed) value
                     before = len(event_records)
@@ -171,7 +174,7 @@ class MatchbookProvider(OddsProvider):
                         f"spread filter '{context_favourite}' abs={abs(float(context_spread)) if context_spread is not None else '?'}: "
                         f"{before} -> {len(event_records)} records"
                     )
-                if league in ("mlb_totals", "mls_totals"):
+                if league in ("mlb_totals", "mls_totals", "wc_totals"):
                     context_total_line = game.get("total_line")
                     if context_total_line is not None:
                         before = len(event_records)
@@ -305,6 +308,9 @@ class MatchbookProvider(OddsProvider):
                 tag.get("url-name") in ("veikkausliiga", "finland-veikkausliiga", "finnish-premier-league")
                 for tag in meta_tags
             )
+        if league in ("wc", "wc_spread", "wc_totals"):
+            # FIFA World Cup — confirmed url-name via API (competition meta-tag: "fifa-world-cup")
+            return any(tag.get("url-name") == "fifa-world-cup" for tag in meta_tags)
         return False
 
     def _event_to_records(
@@ -478,7 +484,7 @@ class MatchbookProvider(OddsProvider):
                         )
             return records
 
-        if league == "mls_totals":
+        if league in ("mls_totals", "wc_totals"):
             totals_markets = [m for m in open_markets if _is_totals_market(m)]
             self.debug(
                 f"{self.name}: event_id={event.get('id')} has {len(open_markets)} open markets, "
@@ -487,7 +493,7 @@ class MatchbookProvider(OddsProvider):
             if not totals_markets and open_markets:
                 names = sorted({str(m.get("name") or "").lower().strip() for m in open_markets})
                 self.debug(
-                    f"{self.name}: event_id={event.get('id')} — no mls_totals match; "
+                    f"{self.name}: event_id={event.get('id')} — no {league} totals match; "
                     f"available market names: {names}"
                 )
             for market in totals_markets:
@@ -539,8 +545,8 @@ class MatchbookProvider(OddsProvider):
                         )
             return records
 
-        if league == "mls_spread":
-            # MLS goal-line handicap.  Market name is "Handicap" (same as mlb_spread).
+        if league in ("mls_spread", "wc_spread"):
+            # Soccer goal-line handicap.  Market name is "Handicap".
             # Only accept HALF-BALL lines (0.5, 1.5, 2.5 …).  Integer lines (1.0,
             # 2.0 …) can result in a push/refund, making them three-outcome markets.
             # Polymarket only offers half-ball lines, so integer lines would never
@@ -553,7 +559,7 @@ class MatchbookProvider(OddsProvider):
             if not run_line_markets and open_markets:
                 names = sorted({str(m.get("name") or "").lower().strip() for m in open_markets})
                 self.debug(
-                    f"{self.name}: event_id={event.get('id')} — no mls_spread match; "
+                    f"{self.name}: event_id={event.get('id')} — no {league} spread match; "
                     f"available market names: {names}"
                 )
             for market in run_line_markets:
@@ -568,7 +574,7 @@ class MatchbookProvider(OddsProvider):
                         default=None,
                     )
                     self.debug(
-                        f"{self.name}: event_id={event.get('id')} mls_spread runner={runner.get('name')!r} "
+                        f"{self.name}: event_id={event.get('id')} {league} runner={runner.get('name')!r} "
                         f"handicap={hcap} best_back={best_back}"
                     )
 
@@ -580,7 +586,7 @@ class MatchbookProvider(OddsProvider):
                 if not spread_runners:
                     all_hcaps = [r.get("handicap") for r in runners]
                     self.debug(
-                        f"{self.name}: event_id={event.get('id')} mls_spread — no half-ball runners; "
+                        f"{self.name}: event_id={event.get('id')} {league} — no half-ball runners; "
                         f"handicaps present: {all_hcaps}"
                     )
                     continue
@@ -648,7 +654,7 @@ class MatchbookProvider(OddsProvider):
                 f"'{market.get('name', 'unknown')}'"
             )
             market_name = str(market.get("name") or market.get("market-type") or "Unknown market")
-            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria", "laliga", "mls", "veikkausliiga") else "two_way"
+            market_type = "three_way" if league in ("ucl", "epl", "uel", "seria", "laliga", "mls", "veikkausliiga", "wc") else "two_way"
             for runner in market.get("runners", []):
                 best_by_side = _best_prices_per_side(runner.get("prices", []))
                 for side, price in best_by_side.items():
@@ -845,6 +851,9 @@ LEAGUE_SPORT_IDS = {
     "mls_totals": 15,  # MLS goal totals; filtered by totals market name
     "ipl": 110,  # Cricket — sport ID 110 covers all cricket; filtered by meta-tag below
     "veikkausliiga": 15,  # Finnish Premier League — same soccer sport ID
+    "wc": 15,        # FIFA World Cup 1x2; filtered by meta-tag url-name "fifa-world-cup"
+    "wc_spread": 15,  # FIFA World Cup goal-line handicap; filtered by meta-tag
+    "wc_totals": 15,  # FIFA World Cup goal totals; filtered by meta-tag
 }
 
 LEAGUE_TO_SPORT = {
@@ -864,4 +873,7 @@ LEAGUE_TO_SPORT = {
     "mls_totals": "soccer",
     "ipl": "cricket",
     "veikkausliiga": "soccer",
+    "wc": "soccer",
+    "wc_spread": "soccer",
+    "wc_totals": "soccer",
 }

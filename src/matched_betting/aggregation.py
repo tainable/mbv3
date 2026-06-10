@@ -97,7 +97,7 @@ def build_aggregated_games_payload(
         event_group = events_by_id[canonical_event_id]
 
         # MLB/MLS totals: one entry per (game, total_line) pair with over/under slot names
-        if event_group.league in ("mlb_totals", "mls_totals"):
+        if event_group.league in ("mlb_totals", "mls_totals", "wc_totals"):
             lines_to_indices: dict[float, list[int]] = {}
             for index in indices:
                 meta = records[index].metadata or {}
@@ -117,7 +117,7 @@ def build_aggregated_games_payload(
                     "team2": team2,
                     "date_time": event_group.event_start,
                     "league": event_group.league,
-                    "sport": "soccer" if event_group.league == "mls_totals" else "baseball",
+                    "sport": "soccer" if event_group.league in ("mls_totals", "wc_totals") else "baseball",
                     "market_type": "two_way",
                     "total_line": total_line,
                     "polymarket_market_id": None,
@@ -208,7 +208,7 @@ def build_aggregated_games_payload(
         # Without this split, a Matchbook -1.0 record and a Polymarket -1.5
         # record for the same match would be merged into one entry, creating
         # phantom cross-line arbs with inflated margins.
-        if event_group.league in ("mlb_spread", "mls_spread"):
+        if event_group.league in ("mlb_spread", "mls_spread", "wc_spread"):
             home_team = event_group.home_team
             away_team = event_group.away_team
 

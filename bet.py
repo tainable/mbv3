@@ -56,8 +56,14 @@ _ROOT = Path(__file__).resolve().parent
 _BET_LOG = _ROOT / "outputs" / "bet_log.jsonl"
 
 
+def set_log_path(path: Path) -> None:
+    """Redirect per-leg bet logging to a different file (e.g. stream_bet_log.jsonl)."""
+    global _BET_LOG
+    _BET_LOG = path
+
+
 def _log_bet(entry: dict) -> None:
-    """Append a JSON line to outputs/bet_log.jsonl for every live bet placed."""
+    """Append a JSON line to bet_log for every live bet placed."""
     import datetime
     entry = {"timestamp": datetime.datetime.utcnow().isoformat() + "Z", **entry}
     _BET_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -67,6 +73,8 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from matched_betting.config import load_settings
 from matched_betting.http import HttpClient
+from matched_betting.polygon_rpc import PM_CHAIN_ID, PM_RPCS, pm_rpc, pm_matic_balance
+from matched_betting.mb_auth import mb_login, mb_best_price
 
 # ============================================================================
 # Polymarket
@@ -90,18 +98,7 @@ except ImportError:
 
 _PM_CLOB_HOST   = "https://clob.polymarket.com"
 _PM_DATA_API    = "https://data-api.polymarket.com"
-_PM_CHAIN_ID    = 137
-_PM_RPCS        = [
-    "https://polygon.drpc.org",
-    "https://polygon.meowrpc.com",
-    "https://endpoints.omniatech.io/v1/matic/mainnet/public",
-    "https://polygon-bor-rpc.publicnode.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.llamarpc.com",
-    "https://1rpc.io/matic",
-    "https://polygon-rpc.com",
-]
-_PM_USDC        = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
+_PM_USDC        ="0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 _PM_SPENDERS    = [
     "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E",
     "0xC5d563A36AE78145C45a50134d48A1215220f80a",
@@ -111,29 +108,6 @@ _PM_MAX_UINT256   = 2 ** 256 - 1
 _PM_APPROVE_SEL   = bytes.fromhex("095ea7b3")
 _PM_MATIC_MIN_GAS = 0.01
 
-
-def _pm_rpc(method: str, params: list, rpc_list: list[str] | None = None) -> object:
-    endpoints = rpc_list or _PM_RPCS
-    last_exc: Exception | None = None
-    for url in endpoints:
-        try:
-            r = _requests.post(
-                url,
-                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
-                timeout=15,
-            )
-            r.raise_for_status()
-            result = r.json()
-            if "error" in result:
-                raise RuntimeError(result["error"])
-            return result["result"]
-        except Exception as exc:
-            last_exc = exc
-    raise RuntimeError(f"All Polygon RPCs failed. Last: {last_exc}")
-
-
-def _pm_matic_balance(address: str, rpc_list: list[str] | None = None) -> float:
-    return int(_pm_rpc("eth_getBalance", [address, "latest"], rpc_list), 16) / 1e18
 
 
 def _pm_resolve_no_token(settings, yes_token_id: str) -> str:
@@ -171,7 +145,7 @@ def _pm_resolve_no_token(settings, yes_token_id: str) -> str:
 
 
 def _pm_build_client(private_key: str) -> "ClobClient":
-    client = ClobClient(host=_PM_CLOB_HOST, chain_id=_PM_CHAIN_ID, key=private_key)
+    client = ClobClient(host=_PM_CLOB_HOST, chain_id=PM_CHAIN_ID, key=private_key)
     # derive_api_key is silent; create_or_derive_api_key attempts create first,
     # which always 400s for existing accounts and logs a noisy error.
     client.set_api_creds(client.derive_api_key())
@@ -194,11 +168,11 @@ def pm_status(settings) -> dict:
         result["address"] = address
 
         rpc_list = (
-            [settings.polymarket.polygon_rpc_url] + _PM_RPCS
-            if settings.polymarket.polygon_rpc_url else _PM_RPCS
+            [settings.polymarket.polygon_rpc_url] + PM_RPCS
+            if settings.polymarket.polygon_rpc_url else PM_RPCS
         )
         try:
-            result["matic"] = round(_pm_matic_balance(address, rpc_list), 4)
+            result["matic"] = round(pm_matic_balance(address, rpc_list), 4)
         except Exception as e:
             result["matic_error"] = str(e)
 
@@ -287,6 +261,36 @@ def _pm_best_decimal_odds(token_id: str, side: str) -> float | None:
         return None
 
 
+def _pm_best_back_and_lay_odds(token_id: str) -> tuple[float | None, float | None]:
+    """Fetch a token's order book once and return (back_odds, lay_odds).
+
+    back = 1/best_ask (decimal price to BUY this token — what pm_place_bet
+    fills against for a back leg).
+    lay  = 1/best_bid (the WS-cache convention in ws_polymarket.py for the
+    equivalent lay price of this outcome — actual lay execution buys the
+    NO token, but the arb calculator quotes lay edges off this YES-book value).
+    """
+    try:
+        r = _requests.get(f"{_PM_CLOB_HOST}/book", params={"token_id": token_id}, timeout=10)
+        if not r.ok:
+            return None, None
+        book = r.json()
+        asks = book.get("asks", [])
+        bids = book.get("bids", [])
+        back = lay = None
+        if asks:
+            best_ask = float(asks[-1]["price"])
+            if best_ask > 0:
+                back = round(1.0 / best_ask, 4)
+        if bids:
+            best_bid = float(bids[-1]["price"])
+            if best_bid > 0:
+                lay = round(1.0 / best_bid, 4)
+        return back, lay
+    except Exception:
+        return None, None
+
+
 def pm_check_liquidity(token_id: str, amount_usdc: float, side: str = "BUY") -> tuple[bool, float]:
     """Return (ok, available_usdc) for this token's order book.
 
@@ -356,28 +360,28 @@ def pm_approve(settings) -> None:
     from eth_account import Account
     pk       = settings.polymarket.private_key
     rpc_list = (
-        [settings.polymarket.polygon_rpc_url] + _PM_RPCS
-        if settings.polymarket.polygon_rpc_url else _PM_RPCS
+        [settings.polymarket.polygon_rpc_url] + PM_RPCS
+        if settings.polymarket.polygon_rpc_url else PM_RPCS
     )
     account  = Account.from_key(pk)
     address  = account.address
-    matic    = _pm_matic_balance(address, rpc_list)
+    matic    = pm_matic_balance(address, rpc_list)
     print(f"  MATIC: {matic:.4f}")
     if matic < _PM_MATIC_MIN_GAS:
         raise RuntimeError(f"Insufficient MATIC ({matic:.4f}). Need {_PM_MATIC_MIN_GAS}+.")
-    nonce     = int(_pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
-    gas_price = int(int(_pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
+    nonce     = int(pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
+    gas_price = int(int(pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
     for i, spender in enumerate(_PM_SPENDERS):
         spender_pad = bytes.fromhex("000000000000000000000000" + spender.lower().replace("0x", ""))
         data        = "0x" + (_PM_APPROVE_SEL + spender_pad + _PM_MAX_UINT256.to_bytes(32, "big")).hex()
         tx = {"nonce": nonce + i, "gasPrice": gas_price, "gas": 100_000,
-              "to": _PM_USDC, "value": 0, "data": data, "chainId": _PM_CHAIN_ID}
+              "to": _PM_USDC, "value": 0, "data": data, "chainId": PM_CHAIN_ID}
         signed   = Account.sign_transaction(tx, pk)
-        tx_hash  = _pm_rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()], rpc_list)
+        tx_hash  = pm_rpc("eth_sendRawTransaction", ["0x" + signed.raw_transaction.hex()], rpc_list)
         print(f"  tx: {tx_hash}")
         print("    waiting", end="", flush=True)
         for _ in range(90):
-            receipt = _pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
+            receipt = pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
             if receipt:
                 if int(receipt.get("status", "0x0"), 16) == 1:
                     print(" ✓")
@@ -408,28 +412,6 @@ def pm_cancel(settings, order_id: str = "") -> None:
 _MB_MIN_STAKE = 0.10
 
 
-def _mb_login(http: HttpClient, base_url: str, username: str, password: str) -> str:
-    resp  = http.post_json(
-        f"{base_url}/bpapi/rest/security/session",
-        payload={"username": username, "password": password},
-        headers={"Accept": "application/json"},
-    )
-    token = resp.get("session-token")
-    if not token:
-        raise RuntimeError(f"Login failed: {resp}")
-    return str(token)
-
-
-def _mb_best_price(prices: list[dict], side: str) -> float | None:
-    vals = [
-        float(p.get("decimal-odds") or p.get("odds") or 0)
-        for p in prices
-        if p.get("side") == side and (p.get("decimal-odds") or p.get("odds"))
-    ]
-    if not vals:
-        return None
-    return max(vals) if side == "back" else min(vals)
-
 
 def mb_status(settings) -> dict:
     result: dict = {"platform": "Matchbook", "ok": False}
@@ -439,7 +421,7 @@ def mb_status(settings) -> dict:
         return result
     try:
         http  = HttpClient()
-        token = _mb_login(http, mb.base_url, mb.username, mb.password)
+        token = mb_login(http, mb.base_url, mb.username, mb.password)
         result["logged_in"] = True
 
         try:
@@ -483,7 +465,7 @@ def mb_get_balance(settings) -> float | None:
         return None
     try:
         http  = HttpClient()
-        token = _mb_login(http, mb.base_url, mb.username, mb.password)
+        token = mb_login(http, mb.base_url, mb.username, mb.password)
         acc   = http.get_json(
             f"{mb.base_url}/edge/rest/account",
             headers={"session-token": token, "Accept": "application/json"},
@@ -501,7 +483,7 @@ def mb_place_bet(settings, event_id: int, market_id: int, runner_id: int,
         return {"platform": "Matchbook", "ok": False, "error": "credentials not set"}
     try:
         http  = HttpClient()
-        token = _mb_login(http, mb.base_url, mb.username, mb.password)
+        token = mb_login(http, mb.base_url, mb.username, mb.password)
 
         if not odds:
             event = http.get_json(
@@ -514,7 +496,7 @@ def mb_place_bet(settings, event_id: int, market_id: int, runner_id: int,
                 for runner in market.get("runners", []):
                     if runner.get("id") != runner_id:
                         continue
-                    odds = _mb_best_price(runner.get("prices", []), side) or 0.0
+                    odds = mb_best_price(runner.get("prices", []), side) or 0.0
             if not odds:
                 return {"platform": "Matchbook", "ok": False,
                         "error": f"No {side} prices for runner {runner_id}"}
@@ -557,7 +539,7 @@ def mb_place_bet(settings, event_id: int, market_id: int, runner_id: int,
 def mb_show_event(settings, event_id: int) -> None:
     mb    = settings.matchbook
     http  = HttpClient()
-    token = _mb_login(http, mb.base_url, mb.username, mb.password)
+    token = mb_login(http, mb.base_url, mb.username, mb.password)
     event = http.get_json(
         f"{mb.base_url}/edge/rest/events/{event_id}",
         headers={"session-token": token, "Accept": "application/json"},
@@ -570,8 +552,8 @@ def mb_show_event(settings, event_id: int) -> None:
         print(f"  Market: {market.get('name')}  (market-id={market.get('id')})")
         for runner in market.get("runners", []):
             prices    = runner.get("prices", [])
-            back_odds = _mb_best_price(prices, "back")
-            lay_odds  = _mb_best_price(prices, "lay")
+            back_odds = mb_best_price(prices, "back")
+            lay_odds  = mb_best_price(prices, "lay")
             print(
                 f"    {runner.get('name'):<30} (runner-id={runner.get('id')})"
                 f"  back={back_odds or '—'}  lay={lay_odds or '—'}"
@@ -582,7 +564,7 @@ def mb_show_event(settings, event_id: int) -> None:
 def mb_cancel_offer(settings, offer_id: int) -> None:
     mb    = settings.matchbook
     http  = HttpClient()
-    token = _mb_login(http, mb.base_url, mb.username, mb.password)
+    token = mb_login(http, mb.base_url, mb.username, mb.password)
     resp  = http.request_json(
         "DELETE",
         f"{mb.base_url}/edge/rest/offers/{offer_id}",
@@ -602,7 +584,7 @@ def mb_get_positions(settings, event_id: int | None = None) -> list[dict]:
         return []
     try:
         http   = HttpClient()
-        token  = _mb_login(http, mb.base_url, mb.username, mb.password)
+        token  = mb_login(http, mb.base_url, mb.username, mb.password)
         params: dict = {}
         if event_id:
             params["event-ids"] = event_id
@@ -632,7 +614,7 @@ def mb_get_runner_prices(
         return {"back_odds": None, "lay_odds": None}
     try:
         http   = HttpClient()
-        token  = _mb_login(http, mb.base_url, mb.username, mb.password)
+        token  = mb_login(http, mb.base_url, mb.username, mb.password)
         event  = http.get_json(
             f"{mb.base_url}/edge/rest/events/{event_id}",
             headers={"session-token": token, "Accept": "application/json"},
@@ -645,8 +627,8 @@ def mb_get_runner_prices(
                     continue
                 prices = runner.get("prices", [])
                 return {
-                    "back_odds": _mb_best_price(prices, "back"),
-                    "lay_odds":  _mb_best_price(prices, "lay"),
+                    "back_odds": mb_best_price(prices, "back"),
+                    "lay_odds":  mb_best_price(prices, "lay"),
                 }
     except Exception:
         pass
@@ -858,8 +840,6 @@ def _sx_sign_fill(private_key: str, market_hash: str, base_token: str,
     fill_salt_int = int.from_bytes(salt_bytes, "big")
     fill_salt_hex = "0x" + salt_bytes.hex()
 
-    print(f"  [SX fill debug]  fill_hasher={fill_hasher}  domainVersion={domain_version}"
-          f"  desiredOdds={desired_odds}  is_one={is_one}")
 
     full_message = {
         "types": {
@@ -1004,6 +984,124 @@ def _sx_confirmed_odds(base_url: str, wallet: str, market_hash: str,
             pass
         _time.sleep(0.5)
     return None
+
+
+def refresh_sx_odds_http(game: dict, settings) -> dict:
+    """Return a copy of *game* with SX Bet odds refreshed via HTTP GET.
+
+    Calls /orders/odds/best for every SX market hash present in the game dict
+    and overwrites the sx_bet_*_back_odds fields with the current API values.
+    For soccer per-outcome binary markets (sx_bet_{slot}_market_hash) it also
+    refreshes sx_bet_{slot}_lay_odds from the "No" side's taker price.
+
+    This is used by the autobet re-validation step so the arb calculator sees
+    the same price source that sx_place_bet() will use, eliminating the gap
+    between the WS-cache snapshot and the actual fill price.
+
+    On HTTP/network error the original game is returned unchanged (fail-open).
+    On "no live orders" the relevant fields are set to None so the arb
+    calculator correctly treats SX as unavailable.
+    """
+    from matched_betting.normalization import normalize_team_name
+
+    base_url   = settings.sx_bet.base_url
+    base_token = settings.sx_bet.base_token
+    proxies    = _sx_proxies(settings)
+    league     = game.get("league", "")
+    updated    = dict(game)
+
+    # ── Two-way market (NBA, MLB, WNBA, KBO, NHL, mlb_totals, mls_totals) ─
+    mh = game.get("sx_bet_market_hash")
+    if mh:
+        try:
+            raw       = _sx_get(f"{base_url}/orders/odds/best",
+                                params={"marketHashes": mh, "baseToken": base_token},
+                                proxies=proxies)
+            best_list = raw.get("data", {}).get("bestOdds", []) or []
+            o1_norm   = (game.get("sx_bet_outcome_one_team") or "").lower()
+            if league in ("mlb_totals", "mls_totals"):
+                o1_slot, o2_slot = ("over", "under") if o1_norm == "over" else ("under", "over")
+            else:
+                t1_norm = normalize_team_name(game.get("team1") or "", league)
+                if o1_norm and o1_norm == t1_norm:
+                    o1_slot, o2_slot = "team1", "team2"
+                else:
+                    o1_slot, o2_slot = "team2", "team1"
+            if best_list:
+                taker = _sx_best_taker_odds(best_list[0])
+                updated[f"sx_bet_{o1_slot}_back_odds"] = (
+                    taker["outcome_one"]["decimal"] if "outcome_one" in taker else None
+                )
+                updated[f"sx_bet_{o2_slot}_back_odds"] = (
+                    taker["outcome_two"]["decimal"] if "outcome_two" in taker else None
+                )
+            else:
+                updated[f"sx_bet_{o1_slot}_back_odds"] = None
+                updated[f"sx_bet_{o2_slot}_back_odds"] = None
+        except Exception:
+            pass  # network/parse error → keep WS-cache odds
+
+    # ── Soccer per-outcome binary markets ─────────────────────────────────
+    for slot, key in (
+        ("team1", "sx_bet_team1_market_hash"),
+        ("draw",  "sx_bet_draw_market_hash"),
+        ("team2", "sx_bet_team2_market_hash"),
+    ):
+        h = game.get(key)
+        if not h:
+            continue
+        try:
+            raw       = _sx_get(f"{base_url}/orders/odds/best",
+                                params={"marketHashes": h, "baseToken": base_token},
+                                proxies=proxies)
+            best_list = raw.get("data", {}).get("bestOdds", []) or []
+            if best_list:
+                taker = _sx_best_taker_odds(best_list[0])
+                updated[f"sx_bet_{slot}_back_odds"] = (
+                    taker["outcome_one"]["decimal"] if "outcome_one" in taker else None
+                )
+                # outcomeTwo = "No" (slot does not happen) — backing it pays out
+                # identically to laying the named outcome, so feed it in as the
+                # lay price (mirrors ws_sx_bet.py's update_lay_odds wiring).
+                updated[f"sx_bet_{slot}_lay_odds"] = (
+                    taker["outcome_two"]["decimal"] if "outcome_two" in taker else None
+                )
+            else:
+                updated[f"sx_bet_{slot}_back_odds"] = None
+                updated[f"sx_bet_{slot}_lay_odds"] = None
+        except Exception:
+            pass  # network/parse error → keep WS-cache odds
+
+    return updated
+
+
+def refresh_pm_odds_http(game: dict, settings) -> dict:
+    """Return a copy of *game* with Polymarket back/lay odds refreshed via HTTP GET.
+
+    Calls the CLOB /book endpoint once per polymarket_*_clob_token_id present
+    in the game dict and overwrites the matching polymarket_*_back_odds and
+    polymarket_*_lay_odds fields with current best-ask / best-bid prices —
+    the same (1/best_ask, 1/best_bid) convention ws_polymarket.py uses to
+    populate the WS cache.
+
+    This mirrors refresh_sx_odds_http() — used by the autobet re-validation
+    step so the arb calculator quotes the same price source pm_place_bet()
+    will fill against, instead of the (potentially stale) WS-cache snapshot.
+
+    On HTTP/network error the original odds for that slot are kept unchanged
+    (fail-open) so a transient API hiccup doesn't block an otherwise-valid arb.
+    """
+    updated = dict(game)
+    for slot in ("team1", "team2", "draw", "over", "under"):
+        token_id = game.get(f"polymarket_{slot}_clob_token_id")
+        if not token_id:
+            continue
+        back_odds, lay_odds = _pm_best_back_and_lay_odds(str(token_id))
+        if back_odds is not None:
+            updated[f"polymarket_{slot}_back_odds"] = back_odds
+        if lay_odds is not None:
+            updated[f"polymarket_{slot}_lay_odds"] = lay_odds
+    return updated
 
 
 def sx_place_bet(settings, market_hash: str, amount: float,

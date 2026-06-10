@@ -164,7 +164,7 @@ def load_settings(project_root: Path) -> Settings:
             low_fraction=float(os.getenv("KELLY_LOW_FRACTION", "0.10")),
             high_fraction=float(os.getenv("KELLY_HIGH_FRACTION", "0.25")),
             max_stake_usdc=float(os.getenv("MAX_STAKE_USDC", "200")),
-            min_stake_usdc=float(os.getenv("MIN_STAKE_USDC", "5")),
+            min_stake_usdc=float(os.getenv("MIN_STAKE_USDC", "2")),
             min_bankroll_usdc=float(os.getenv("MIN_BANKROLL_USDC", "20")),
             sx_pm_kink_profit=float(os.getenv("SX_PM_KINK_PROFIT", "0.44")),
             sx_pm_kink_fraction=float(os.getenv("SX_PM_KINK_FRACTION", "0.15")),

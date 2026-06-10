@@ -42,7 +42,8 @@ from matched_betting.http import HttpClient
 
 from bet import mb_get_runner_prices, mb_place_bet
 from polymarket_bet import _build_client, place_market_order
-from portfolio import _pm_ensure_ctf_approval, _PM_RPCS
+from portfolio import _pm_ensure_ctf_approval
+from matched_betting.polygon_rpc import PM_RPCS as _PM_RPCS
 
 try:
     from py_clob_client.order_builder.constants import SELL as _PM_SELL

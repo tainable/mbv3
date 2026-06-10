@@ -65,7 +65,7 @@ class PolymarketWSClient:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("polymarket ws: %s — reconnecting in %.0fs", exc, _RECONNECT_DELAY_S)
+                log.warning("polymarket ws: %s — reconnecting in %.0fs", exc, _RECONNECT_DELAY_S)
                 await asyncio.sleep(_RECONNECT_DELAY_S)
 
     def stop(self) -> None:
@@ -118,34 +118,78 @@ class PolymarketWSClient:
         except (json.JSONDecodeError, TypeError):
             return
 
-        if msg.get("event_type") != "price_change":
+        # Initial dump: server sends a JSON array of book snapshots
+        if isinstance(msg, list):
+            for item in msg:
+                self._apply_book_item(item)
             return
 
-        for pc in msg.get("price_changes", []):
-            token_id = pc.get("asset_id")
-            mapping  = self.token_map.get(token_id)
-            if not mapping:
-                continue
-            gid, slot = mapping
+        event_type = msg.get("event_type")
 
-            ask_str = pc.get("best_ask")
-            bid_str = pc.get("best_bid")
+        if event_type == "book":
+            self._apply_book_item(msg)
+        elif event_type == "price_change":
+            for pc in msg.get("price_changes", []):
+                self._apply_price_change(pc)
 
+    def _apply_book_item(self, item: dict) -> None:
+        """Handle a full orderbook snapshot — extracts odds and best-ask liquidity."""
+        token_id = item.get("asset_id")
+        mapping  = self.token_map.get(token_id)
+        if not mapping:
+            return
+        gid, slot = mapping
+
+        asks = item.get("asks") or []
+        bids = item.get("bids") or []
+
+        try:
+            best_ask  = float(asks[0]["price"]) if asks else None
+            best_bid  = float(bids[0]["price"]) if bids else None
+            avail_usd = float(asks[0]["size"])  if asks else None
+        except (KeyError, IndexError, TypeError, ValueError):
+            # Fall back to top-level best_ask/best_bid if arrays are absent/malformed
+            ask_str = item.get("best_ask")
+            bid_str = item.get("best_bid")
             try:
                 best_ask = float(ask_str) if ask_str else None
                 best_bid = float(bid_str) if bid_str else None
             except (ValueError, TypeError):
-                continue
+                return
+            avail_usd = None
 
-            # Back = buy YES token at ask price; back odds = 1 / ask
-            back_odds = (1.0 / best_ask) if best_ask and 0.0 < best_ask < 1.0 else None
-            # Lay = sell YES token; lay odds derived from bid (what the market will pay)
-            lay_odds  = (1.0 / best_bid) if best_bid and 0.0 < best_bid < 1.0 else None
+        back_odds = (1.0 / best_ask) if best_ask and 0.0 < best_ask < 1.0 else None
+        lay_odds  = (1.0 / best_bid) if best_bid and 0.0 < best_bid < 1.0 else None
 
-            self.cache.update_back_and_lay_odds(gid, "polymarket", slot, back_odds, lay_odds)
-            log.debug("polymarket ws: %s %s back=%.4f lay=%.4f",
-                      gid, slot,
-                      back_odds or 0.0, lay_odds or 0.0)
+        self.cache.update_back_and_lay_odds(gid, "polymarket", slot, back_odds, lay_odds,
+                                            avail_usd=avail_usd)
+        log.debug("polymarket ws book: %s %s back=%.4f lay=%.4f avail=%s",
+                  gid, slot, back_odds or 0.0, lay_odds or 0.0,
+                  f"${avail_usd:,.0f}" if avail_usd is not None else "n/a")
+
+    def _apply_price_change(self, item: dict) -> None:
+        """Handle a price_change event — updates odds only (avail preserved from last snapshot)."""
+        token_id = item.get("asset_id")
+        mapping  = self.token_map.get(token_id)
+        if not mapping:
+            return
+        gid, slot = mapping
+
+        ask_str = item.get("best_ask")
+        bid_str = item.get("best_bid")
+
+        try:
+            best_ask = float(ask_str) if ask_str else None
+            best_bid = float(bid_str) if bid_str else None
+        except (ValueError, TypeError):
+            return
+
+        back_odds = (1.0 / best_ask) if best_ask and 0.0 < best_ask < 1.0 else None
+        lay_odds  = (1.0 / best_bid) if best_bid and 0.0 < best_bid < 1.0 else None
+
+        self.cache.update_back_and_lay_odds(gid, "polymarket", slot, back_odds, lay_odds)
+        log.debug("polymarket ws: %s %s back=%.4f lay=%.4f",
+                  gid, slot, back_odds or 0.0, lay_odds or 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -182,7 +226,7 @@ async def _open_ws(uri: str, proxy_url: str | None):
     from urllib.parse import urlparse
 
     if not proxy_url:
-        return await websockets.connect(uri)
+        return await websockets.connect(uri, max_size=None)
 
     parsed    = urlparse(uri)
     dest_host = parsed.hostname
@@ -195,4 +239,5 @@ async def _open_ws(uri: str, proxy_url: str | None):
     raw_sock = await proxy.connect(dest_host=dest_host, dest_port=dest_port)
 
     ssl_ctx = ssl.create_default_context() if parsed.scheme == "wss" else None
-    return await websockets.connect(uri, sock=raw_sock, ssl=ssl_ctx)
+    import websockets.legacy.client
+    return await websockets.legacy.client.connect(uri, sock=raw_sock, ssl=ssl_ctx, max_size=None)

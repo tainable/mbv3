@@ -32,7 +32,9 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import sys
+import time
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -62,6 +64,18 @@ log = logging.getLogger("stream")
 _DEFAULT_STREAM_LEAGUES = ["mlb", "wnba"]
 _DEFAULT_DEBOUNCE_S     = 0.2
 _DEFAULT_IDS_PATH       = _ROOT / "outputs" / "active_game_ids.json"
+
+# Set by _main_async at startup; used by _autobet_task to write to stream-specific logs.
+_stream_arb_log: Path = _ROOT / "outputs" / "stream_arb_log.jsonl"
+
+# Set by _autobet_task when bet_executor._HALT is True; checked by _arb_loop to exit(2).
+_halt_flag: bool = False
+
+# In-memory record of successfully placed (gid, arb_key) pairs for this process run.
+# Checked by _arb_loop to block re-scheduling after a bet completes.
+# Belt-and-suspenders guard: file-based dedup via game_already_bet may fail silently
+# (create_task swallows exceptions from _autobet_task after placement returns).
+_bet_history: set = set()
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +199,7 @@ async def _autobet_task(
     import bet_executor as _exec
 
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
-    mode = "TEST $10" if args.autobet_test else ("DRY-RUN" if args.bet_dry_run else "LIVE")
+    mode = "TEST $5" if args.autobet_test else ("DRY-RUN" if args.bet_dry_run else "LIVE")
     print(f"\n  [{ts}]  AUTOBET queued ({mode})  {arb_key}  — waiting {args.autobet_delay}s",
           flush=True)
 
@@ -200,6 +214,24 @@ async def _autobet_task(
         if fresh_game is None:
             print(f"\n  [{ts}]  AUTOBET {arb_key}: game no longer in cache — skipped", flush=True)
             return
+
+        # Refresh SX odds via HTTP so the arb calculator quotes against the
+        # same price source as sx_place_bet(), not the (potentially stale)
+        # WS-cache snapshot.
+        if any(fresh_game.get(k) for k in (
+            "sx_bet_market_hash",
+            "sx_bet_team1_market_hash",
+            "sx_bet_draw_market_hash",
+            "sx_bet_team2_market_hash",
+        )):
+            import bet as _bet
+            loop = asyncio.get_running_loop()
+            try:
+                fresh_game = await loop.run_in_executor(
+                    None, _bet.refresh_sx_odds_http, fresh_game, settings
+                )
+            except Exception as _sx_http_err:
+                log.warning("autobet: SX HTTP refresh failed: %s", _sx_http_err)
 
         threshold = args.autobet_min_profit
         if arb_type == "sure_bet":
@@ -233,16 +265,20 @@ async def _autobet_task(
 
         # ── Guard sequence (mirrors scan.py --auto-bet) ───────────────────
         if _exec._HALT:
-            print("  [AUTOBET] HALTED after prior leg failure — restart process to resume.",
+            global _halt_flag
+            _halt_flag = True
+            print("  [AUTOBET] HALTED after prior leg failure — stream.py will exit (code 2).",
                   file=sys.stderr)
             return
 
         proposed_legs = _exec._arb_legs(arb_type, fresh_arb)
-        if not args.bet_dry_run and _exec.game_already_bet(fresh_game, proposed_legs=proposed_legs):
+        if not args.bet_dry_run and _exec.game_already_bet(
+            fresh_game, proposed_legs=proposed_legs, extra_log=_stream_arb_log
+        ):
             print("  [AUTOBET] Already bet this game/direction — skipped.")
             return
 
-        budget    = 10.0 if args.autobet_test else args.budget
+        budget    = 5.0 if args.autobet_test else args.budget
         skip_kelly = args.autobet_test
         kelly_on  = (not skip_kelly
                      and getattr(settings, "kelly", None) is not None
@@ -280,8 +316,17 @@ async def _autobet_task(
 
         _exec.print_bet_results(results)
         if _exec.all_legs_ok(results):
-            _exec.log_arb_success(arb_type, fresh_arb, fresh_game,
-                                  results=results, dry_run=args.bet_dry_run)
+            # Record in session history immediately so re-scheduling is blocked
+            # even if the file log write below fails.
+            global _bet_history
+            _bet_history.add(flight_key)
+            try:
+                _exec.log_arb_success(arb_type, fresh_arb, fresh_game,
+                                      results=results, dry_run=args.bet_dry_run,
+                                      log_path=_stream_arb_log)
+            except Exception as _log_exc:
+                print(f"  [AUTOBET] WARNING: log_arb_success failed: {_log_exc}",
+                      file=sys.stderr)
             if not args.bet_dry_run:
                 _exec.check_bankroll_halt(settings, gbp_rate)
 
@@ -316,6 +361,11 @@ async def _arb_loop(
     # appears, its profit changes by >= _PRINT_THRESHOLD pp, or it disappears.
     _live: dict[str, dict[tuple, float]] = {}
     _PRINT_THRESHOLD = 0.005  # pp — sub-epsilon oscillations are silenced
+    _GONE_GRACE_S    = args.gone_grace
+    # gid -> {arb_key -> first-absent monotonic time}
+    # Arbs stay in _live until absent for >= _GONE_GRACE_S seconds, preventing
+    # P2P order-book churn (order fills/replaces in < 1s) from causing false GONE flicker.
+    _gone_pending: dict[str, dict[tuple, float]] = {}
 
     # Autobet in-flight tracking: set of (gid, arb_key) for bets currently in
     # their delay window or being placed.  Prevents scheduling duplicates.
@@ -327,6 +377,9 @@ async def _arb_loop(
 
     while True:
         await asyncio.sleep(args.debounce)
+
+        if _halt_flag:
+            raise SystemExit(2)
 
         dirty = cache.pop_dirty()
         if not dirty:
@@ -416,12 +469,13 @@ async def _arb_loop(
             total_back_lay += len(back_lay)
             total_kbo      += len(kbo_arbs)
 
-            for _a in _log_sure:
-                _event_log.log_arb("sure_bet", _a, _ROOT, source="stream")
-            for _a in _log_bl:
-                _event_log.log_arb("back_lay", _a, _ROOT, source="stream")
-            for _a in _log_kbo:
-                _event_log.log_arb("kbo", _a, _ROOT, source="stream")
+            if not args.no_arb_log:
+                for _a in _log_sure:
+                    _event_log.log_arb("sure_bet", _a, _ROOT, source="stream")
+                for _a in _log_bl:
+                    _event_log.log_arb("back_lay", _a, _ROOT, source="stream")
+                for _a in _log_kbo:
+                    _event_log.log_arb("kbo", _a, _ROOT, source="stream")
 
             # Full game-state tick log (opt-in via --stream-log).
             if args.stream_log:
@@ -459,13 +513,38 @@ async def _arb_loop(
                 _curr[_k] = _a["profit_pct"]
                 # KBO not in _curr_arbs — no placement support
 
-            if _curr:
-                _live[_gid_key] = _curr
-            elif _gid_key in _live:
-                del _live[_gid_key]
+            # Grace-period GONE: an arb must be absent for >= _GONE_GRACE_S seconds
+            # before being reported gone.  Pending arbs stay in _live so they are
+            # not re-shown as "appeared" if they recover within the window.
+            _now_mono = time.monotonic()
+            _gp = _gone_pending.setdefault(_gid_key, {})
+
+            for k in _prev:
+                if k not in _curr and k not in _gp:
+                    _gp[k] = _now_mono  # record first-absence time
+
+            for k in list(_gp):
+                if k in _curr:
+                    del _gp[k]  # recovered — reset grace timer
+
+            _truly_gone = {k: _prev[k] for k, t in list(_gp.items())
+                           if (_now_mono - t) >= _GONE_GRACE_S and k in _prev}
+            for k in _truly_gone:
+                del _gp[k]
+
+            if not _gp:
+                _gone_pending.pop(_gid_key, None)
+
+            # Rebuild _live: keep pending arbs, add/update current, drop confirmed-gone
+            _new_live = {k: v for k, v in _prev.items() if k not in _truly_gone}
+            _new_live.update(_curr)
+            if _new_live:
+                _live[_gid_key] = _new_live
+            else:
+                _live.pop(_gid_key, None)
 
             _appeared = {k for k in _curr if k not in _prev}
-            _gone     = {k: _prev[k] for k in _prev if k not in _curr}
+            _gone     = _truly_gone
             _changed  = {k for k in _curr if k in _prev and abs(_curr[k] - _prev[k]) >= _PRINT_THRESHOLD}
             _to_print = _appeared | _changed
 
@@ -528,7 +607,7 @@ async def _arb_loop(
                         if _ak[0] == "kbo":
                             continue  # no KBO placement support
                         _flight_key = (_gid_key, _ak)
-                        if _flight_key in _in_flight:
+                        if _flight_key in _in_flight or _flight_key in _bet_history:
                             continue
                         _ab_type, _ab_arb = _curr_arbs.get(_ak, (None, None))
                         if _ab_arb is None:
@@ -575,6 +654,27 @@ def _exclude_imminent(games: list[dict], min_start_minutes: float) -> list[dict]
 async def _main_async(args: argparse.Namespace) -> None:
     settings = load_settings(_ROOT)
     calculator.configure(settings.commission)
+
+    # Apply VPN proxy for Polymarket placement calls (mirrors scan.py).
+    # The WS clients receive proxy_url directly; HTTP placement goes through
+    # os.environ and the py_clob_client_v2 httpx singleton which must be
+    # patched because it is created at import time before env vars are set.
+    if settings.vpn_proxy_url:
+        os.environ["HTTPS_PROXY"] = settings.vpn_proxy_url
+        os.environ["HTTP_PROXY"]  = settings.vpn_proxy_url
+        import httpx as _httpx
+        _httpx_proxy = settings.vpn_proxy_url.replace("socks5h://", "socks5://")
+        try:
+            import py_clob_client_v2.http_helpers.helpers as _pm_helpers_v2
+            _pm_helpers_v2._http_client = _httpx.Client(http2=True, proxy=_httpx_proxy)
+        except Exception:
+            pass  # library not present or API changed — env vars still apply
+
+    # Redirect bet logging to stream-specific files so stream and scan logs stay separate.
+    global _stream_arb_log
+    _stream_arb_log = _ROOT / "outputs" / "stream_arb_log.jsonl"
+    import bet as _bet_module
+    _bet_module.set_log_path(_ROOT / "outputs" / "stream_bet_log.jsonl")
 
     ids_path = Path(args.ids)
     if not ids_path.exists():
@@ -627,11 +727,24 @@ async def _main_async(args: argparse.Namespace) -> None:
     # Strip all stale odds/avail from the seed — active_game_ids.json stores
     # snapshot odds from the last scan which can be hours old and include dust
     # liquidity values (e.g. lay1=110.0).  Only fresh WS data drives detection.
+    #
+    # Merge duplicate gids by preferring non-None values.  If event matching
+    # creates two entries for the same physical game (e.g. one with sx_bet_market_hash
+    # and one without), last-write-wins in the cache would drop the hash.
+    # build_market_map still subscribes via the entry that has the hash, so WS prices
+    # flow in but placement then fails with "No sx_bet_market_hash in game context".
     _ODDS_SUFFIXES = ("_back_odds", "_lay_odds", "_back_avail", "_lay_avail")
-    _seed_games = [
-        {k: v for k, v in g.items() if not any(k.endswith(s) for s in _ODDS_SUFFIXES)}
-        for g in games
-    ]
+    _seed_by_gid: dict[str, dict] = {}
+    for _g in games:
+        _stripped = {k: v for k, v in _g.items() if not any(k.endswith(s) for s in _ODDS_SUFFIXES)}
+        _key = _gid(_stripped)
+        if _key not in _seed_by_gid:
+            _seed_by_gid[_key] = _stripped
+        else:
+            for k, v in _stripped.items():
+                if v is not None:
+                    _seed_by_gid[_key][k] = v
+    _seed_games = list(_seed_by_gid.values())
     cache = OddsCache()
     cache.seed(_seed_games)
 
@@ -689,10 +802,11 @@ async def _main_async(args: argparse.Namespace) -> None:
 
     print(flush=True)
     stream_log_note = "outputs/stream.db" if args.stream_log else "off (--stream-log to enable)"
+    arb_log_note    = "off (--no-arb-log)" if args.no_arb_log else "outputs/arb_log.jsonl"
     print(f"  Min profit: {args.min_profit:.2f}%   Debounce: {args.debounce}s   "
-          f"Tick log: {stream_log_note}", flush=True)
+          f"Tick log: {stream_log_note}   Arb log: {arb_log_note}", flush=True)
     if args.autobet:
-        _ab_mode = "TEST $10" if args.autobet_test else ("DRY-RUN" if args.bet_dry_run else "LIVE")
+        _ab_mode = "TEST $5" if args.autobet_test else ("DRY-RUN" if args.bet_dry_run else "LIVE")
         print(f"  Autobet:    ENABLED [{_ab_mode}]  "
               f"threshold={args.autobet_min_profit:.2f}%  delay={args.autobet_delay}s  "
               f"budget=${args.budget:.2f}", flush=True)
@@ -741,6 +855,12 @@ def main() -> None:
         help="Arb detector tick interval in seconds (default: 0.2).",
     )
     parser.add_argument(
+        "--gone-grace", type=float, default=3.0, metavar="SECONDS",
+        help="Seconds an arb must be continuously absent before reporting GONE "
+             "(default: 3.0). Suppresses false disappearances from P2P order-book "
+             "churn where orders fill and are replaced within a second.",
+    )
+    parser.add_argument(
         "--min-profit", type=float, default=0.0, metavar="PCT",
         help="Minimum profit %% to display (default: 0.0).",
     )
@@ -750,8 +870,8 @@ def main() -> None:
              "when --autobet is active (default: 10.0).",
     )
     parser.add_argument(
-        "--min-start", type=float, default=0.0, metavar="MINUTES",
-        help="Exclude games starting within this many minutes (default: 0 = off).",
+        "--min-start", type=float, default=10.0, metavar="MINUTES",
+        help="Exclude games starting within this many minutes (default: 10).",
     )
     parser.add_argument(
         "--no-matchbook", action="store_true",
@@ -778,6 +898,11 @@ def main() -> None:
              "detector tick (includes ticks with no arb found). Arb detections are "
              "always written to arb_log.jsonl regardless of this flag.",
     )
+    parser.add_argument(
+        "--no-arb-log", action="store_true",
+        help="Suppress writing arb detections to outputs/arb_log.jsonl. "
+             "Useful when running alongside the daemon to avoid duplicate log entries.",
+    )
     parser.add_argument("--debug", action="store_true", help="Verbose logging.")
 
     # ── Autobet ────────────────────────────────────────────────────────────
@@ -797,7 +922,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--autobet-test", action="store_true",
-        help="Test mode: place real bets sized to exactly $10 total stake, "
+        help="Test mode: place real bets sized to exactly $5 total stake, "
              "bypassing Kelly. All other guards (dedup, bankroll, balance) still apply.",
     )
     parser.add_argument(

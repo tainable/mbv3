@@ -12,18 +12,20 @@ The system runs as a two-stage pipeline:
 ## Project layout
 
 ```
-mbv2-Default/
+mbv3/
 ├── ids.py                          # Stage 1: discover active games → outputs/active_game_ids.json
 ├── scan.py                         # Stage 2: live scan, per-game parallel fetch + arb detection
+├── stream.py                       # Stage 2 (real-time): WebSocket arb detection via live feeds
 ├── bet_executor.py                 # Auto-bet orchestration: leg ordering, sizing, placement, alerts
 ├── bet.py                          # Per-platform bet placement functions (Matchbook, Polymarket, SX Bet)
 ├── arb_finder.py                   # Standalone arb finder (reads a pre-built aggregated games JSON)
 ├── run.py                          # Legacy launcher (full fetch → JSON outputs)
 ├── portfolio.py                    # Wallet balance and active bet monitor
-├── watch_bet.py                    # Live watcher: polls scan output and monitors active bet status
+├── watch_bet.py                    # Autonomous 24/7 daemon: runs ids.py+scan.py in a loop with backoff, circuit breaker, and Polymarket redemption
 ├── analyse_bets.py                 # Post-hoc bet analysis and P&L reporting
 ├── menu.py                         # Interactive CLI menu for common pipeline operations
 ├── vpn_proxy_bridge.py             # SOCKS5 bridge: 127.0.0.1:1082 → upstream via Mullvad tunnel
+├── run_scan.bat                    # Legacy: sets HTTPS_PROXY env var and runs scan.py (superseded by vpn_proxy_bridge.py)
 ├── specials_scan.py                # Specials scanner: read-only eval of one-off prediction markets
 ├── specials_place.py               # Specials placement: executes strategies with live confirmation
 ├── specials_close.py               # Specials close-out: sends closing orders for open specials positions
@@ -42,6 +44,9 @@ mbv2-Default/
 │   ├── cli.py                      # Argument parsing and orchestration (used by run.py)
 │   ├── config.py                   # Settings and CommissionSettings loaded from .env
 │   ├── calculator.py               # Pure arb maths: commission helpers, find_sure_bets, find_back_lay_arbs, find_kbo_tie_aware_arbs
+│   ├── odds_cache.py               # Thread-safe in-memory odds store keyed by game_id; dirty-set for arb loop
+│   ├── ws_polymarket.py            # Polymarket CLOB WebSocket client (price_change events → OddsCache)
+│   ├── ws_sx_bet.py                # SX Bet Centrifugo WebSocket client (order book → OddsCache)
 │   ├── kelly.py                    # Profit-scaled bet sizing (Kelly-inspired bankroll fraction)
 │   ├── notifier.py                 # Webhook alert delivery (ntfy.sh, Telegram, Discord, Slack, generic) + heartbeat
 │   ├── rebalancer.py               # Post-bet balance monitor: alerts when USDC drops below threshold
@@ -64,7 +69,9 @@ mbv2-Default/
 └── tests/
     ├── test_event_matching.py
     ├── test_game_filtering.py
-    └── test_models.py
+    ├── test_models.py
+    ├── test_specials_active.py
+    └── test_specials_strategies.py
 ```
 
 ## Setup
@@ -82,7 +89,7 @@ Install the package and its dependencies:
 pip install -e .
 ```
 
-The only non-stdlib dependency is `requests` (used by the HTTP client and the notifier).
+Core dependencies: `requests` (HTTP client and notifier), `websockets` (Polymarket and SX Bet WebSocket feeds), `python-socks` (SOCKS5 proxy support for WS connections through the VPN bridge).
 
 ## Configuration
 
@@ -286,6 +293,38 @@ The summary line at the end of each run shows counts for all three arb types:
   KBO arbs:       1
 ```
 
+### Stage 2 (alternative) — real-time stream
+
+`stream.py` is an alternative to `scan.py` for detecting arbs in real time. Instead of polling, it subscribes to live WebSocket feeds from Polymarket and SX Bet and fires the arb detector within 0.2 seconds of any price change.
+
+```bash
+python stream.py
+python stream.py --stream-leagues mlb wnba
+python stream.py --min-profit 0.33 --budget 10.0
+python stream.py --no-matchbook              # disable on-demand Matchbook fetches
+python stream.py --min-start 30             # exclude games starting within 30 minutes
+python stream.py --debug
+```
+
+**Architecture:**
+
+```
+Polymarket CLOB WS  ──┐
+                       ├── OddsCache (thread-safe) ──► arb detector (debounced 0.2s) ──► print / alert
+SX Bet Centrifugo WS ──┘
+        │
+        └── Matchbook (on-demand REST, one game at a time, triggered by WS price change)
+```
+
+- **Polymarket**: subscribes to `wss://ws-subscriptions-clob.polymarket.com/ws/market` with all token IDs from the IDs file. Each `price_change` event updates `back_odds = 1/best_ask` and `lay_odds = 1/best_bid` in the cache.
+- **SX Bet**: subscribes to one `order_book:market_{hash}` Centrifugo channel per market. Accumulates an in-memory order book per market; derives taker back odds from `1 / (1 − max_maker_prob)`. Only orders with ≥ $1 USDC remaining are included to avoid phantom arbs from dust orders.
+- **OddsCache** (`odds_cache.py`): thread-safe dict of game dicts keyed by `game_id`. The game_id includes the spread line for `mlb_spread`/`mls_spread` and the total line for `mlb_totals`/`mls_totals`, so different lines for the same matchup never pollute each other's odds slots.
+- **Matchbook** (optional): fetched synchronously for exactly the games that triggered the WS tick, keeping rate-limit exposure minimal. Pass `--no-matchbook` to disable entirely.
+
+**Back-lay arbs on spread markets are disabled.** Polymarket spread markets use binary YES/NO tokens; there is no mechanism to short-sell a token you do not hold, so `lay_odds` derived from the CLOB best bid is not executable as a lay. `find_back_lay_arbs()` skips `mlb_spread` and `mls_spread` leagues for this reason.
+
+**Why stream arbs don't appear in scan.py:** The stream detects price discrepancies within 0.2s of a single WS event. `scan.py` makes sequential REST calls that take several seconds per game — by the time it fetches both providers, the gap has usually closed. The stream is the right tool for acting on these; `scan.py` is for a broader market snapshot.
+
 ### Auto-betting
 
 Pass `--auto-bet` to automatically place every arb found. Requires `--budget` (maximum stake per arb in USDC). Supported providers: Matchbook, Polymarket, SX Bet.
@@ -311,6 +350,14 @@ top-up stake = Kelly(new_edge) - Kelly(prior_edge)   (evaluated at current bankr
 This brings the total committed stake up to what Kelly would have sized at the higher edge from the start. If the delta falls below `MIN_STAKE_USDC` the top-up is skipped. Top-up bets are logged with status `PLACED_TOPUP` in `bet_log.jsonl`, and subsequent top-ups always delta against the highest previously committed edge for that game. Off by default — enable once bankroll is large enough for the deltas to clear the minimum stake threshold.
 
 After each successful bet, the rebalancer checks USDC balances on Polymarket (Polygon) and SX Bet (SX Network). If either drops below `MIN_BALANCE_USDC`, an alert is sent via the configured webhook.
+
+**BET PLACED notifications** are sent via the configured `ALERT_WEBHOOK_URL` after every successful placement. The subject includes the profit percentage and expected profit in USD:
+
+```
+BET PLACED +0.82% (+$4.10) — Team A vs Team B
+```
+
+The body shows the arb type, expected (or actual) profit in USD, and per-leg details including stake, quoted odds, and execution odds where available. If execution odds differ from quoted odds by ≥ 0.005 (slippage), they are highlighted and the profit line uses "Actual profit" rather than "Expected profit" for back-lay arbs where both execution fills are known.
 
 ### Portfolio monitor
 
@@ -382,6 +429,51 @@ python run.py
 python run.py --update          # re-fetch known market IDs only (fast)
 python run.py --leagues nba
 python run.py --debug
+```
+
+### 24/7 daemon
+
+`watch_bet.py` is an autonomous daemon that runs `ids.py` then `scan.py --auto-bet` in a continuous loop. It handles backoff after crashes, a circuit breaker after repeated failures, Polymarket settled-position redemption, per-platform balance checks, and an hourly ntfy heartbeat.
+
+```bash
+python watch_bet.py --budget 50 --providers polymarket sx_bet matchbook --min-profit 0.5
+python watch_bet.py --budget 50 --log daemon.log   # headless mode, tail with:
+Get-Content daemon.log -Wait -Tail 30
+```
+
+Key flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--budget USDC` | 50 | Max stake per arb passed to `scan.py --budget` |
+| `--min-profit PCT` | 0.0 | Min profit % filter passed to `scan.py` |
+| `--interval SECS` | 600 | Pause between scan cycles |
+| `--ids-refresh-interval MINS` | 360 | How often to re-run `ids.py` to refresh market IDs |
+| `--scan-timeout SECS` | 600 | Kill a hung `scan.py` after this many seconds |
+| `--ids-timeout SECS` | 600 | Kill a hung `ids.py` after this many seconds |
+| `--max-restarts N` | 10 | Consecutive crash limit before circuit-breaker pause |
+| `--pause-on-max-restarts SECS` | 3600 | How long to pause after hitting the crash limit |
+| `--redeem-interval MINS` | 480 | How often to redeem settled Polymarket positions and re-check platform balances (0 = disabled) |
+| `--platform-balance-threshold USD` | 12.0 | Disable a platform for the current cycle when its free balance drops below this |
+| `--bet-dry-run` | off | Simulate bets — build and sign orders but do not submit |
+| `--allow-topup` | off | Pass `--allow-topup` to every scan cycle (incremental Kelly top-ups) |
+| `--scan-delay SECS` | 0.0 | Extra pause between games, passed to `scan.py` (use to reduce Matchbook request rate) |
+| `--skip-initial-ids` | off | Use the existing IDs file at startup instead of running `ids.py` first |
+| `--log FILE` | stdout | Write all output to FILE (headless mode) |
+
+**Exit codes from `scan.py` that the daemon handles specially:**
+
+- `0` — success, keep running
+- `1` — crash, apply exponential backoff (30s → 60s → 120s → 300s) and retry
+- `2` — HALT (failed-leg incident) — stop and alert; requires manual restart
+- `3` — BANKROLL (balance below `MIN_BANKROLL_USDC`) — 24h cooldown, up to 3 retries total, then stop
+
+### Bet analysis
+
+`analyse_bets.py` reads `outputs/bet_log.jsonl` and prints a P&L summary of all placed arbs, including per-arb capital deployed, absolute profit, and totals. It has no CLI flags — run it directly:
+
+```bash
+python analyse_bets.py
 ```
 
 ## Commission

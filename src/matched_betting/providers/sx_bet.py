@@ -29,6 +29,9 @@ LEAGUE_TO_SPORT = {
     "mls_totals": "soccer",
     "ipl": "cricket",
     "veikkausliiga": "soccer",
+    "wc": "soccer",
+    "wc_spread": "soccer",
+    "wc_totals": "soccer",
 }
 
 # SX Bet league IDs (from GET /leagues)
@@ -50,10 +53,13 @@ _LEAGUE_IDS: dict[str, int | None] = {
     "mls_totals": 1115,
     "ipl": 1192,
     "veikkausliiga": 1626,
+    "wc": 1715,      # FIFA World Cup — 0 active events currently; no-op in practice
+    "wc_spread": 1715,
+    "wc_totals": 1715,
 }
 
 # Leagues that use binary Yes/No markets per outcome rather than a moneyline
-_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls", "veikkausliiga"})
+_SOCCER_LEAGUES: frozenset[str] = frozenset({"ucl", "epl", "uel", "seria", "laliga", "mls", "veikkausliiga", "wc"})
 
 # Cricket leagues: two-way match winner markets (no draw, no overtime)
 _CRICKET_LEAGUES: frozenset[str] = frozenset({"ipl"})
@@ -69,22 +75,24 @@ _MONEYLINE_TYPE = 226
 _SPREAD_TYPE_BY_LEAGUE: dict[str, int] = {
     "mlb_spread": 342,
     "mls_spread": 3,
+    "wc_spread": 3,
 }
 
 # Over/Under (totals) market type per league.
-# Baseball totals = type 28; MLS goal totals = type 2.
+# Baseball totals = type 28; MLS/WC goal totals = type 2.
 _TOTALS_TYPE_BY_LEAGUE: dict[str, int] = {
     "mlb_totals": 28,
     "mls_totals": 2,
+    "wc_totals": 2,
 }
 
 _SOCCER_RESULT_TYPE = 1
 
 # Spread leagues (run-line for baseball, goal-line handicap for soccer)
-_SPREAD_LEAGUES: frozenset[str] = frozenset({"mlb_spread", "mls_spread"})
+_SPREAD_LEAGUES: frozenset[str] = frozenset({"mlb_spread", "mls_spread", "wc_spread"})
 
 # Totals leagues (over/under)
-_TOTALS_LEAGUES: frozenset[str] = frozenset({"mlb_totals", "mls_totals"})
+_TOTALS_LEAGUES: frozenset[str] = frozenset({"mlb_totals", "mls_totals", "wc_totals"})
 
 # Max hashes per API call — SX Bet returns 414 with long query strings
 _BATCH_SIZE = 20

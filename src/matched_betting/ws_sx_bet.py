@@ -59,7 +59,9 @@ def fetch_realtime_token(api_key: str, token_url: str, proxy_url: str | None = N
         timeout=10,
     )
     resp.raise_for_status()
-    token = resp.json().get("data", {}).get("token")
+    body  = resp.json()
+    # API returns {"token": "..."} directly (not nested under "data")
+    token = body.get("token") or (body.get("data") or {}).get("token")
     if not token:
         raise ValueError(f"No token in response: {resp.text[:200]}")
     return token
@@ -108,12 +110,15 @@ class _OrderBook:
             if not (0.0 < maker_prob < 1.0):
                 continue
 
-            # Only count orders with remaining liquidity
+            # Only count orders with at least $1 of maker stake remaining.
+            # Raw amounts are in units of 10^-6 USDC, so $1 = 1_000_000.
+            # Sub-dollar dust orders generate a price signal but zero usable
+            # liquidity, producing phantom arbs with [max ~£0] availability.
             try:
                 remaining = int(order.get("totalBetSize", 0)) - int(order.get("fillAmount", 0))
             except (TypeError, ValueError):
-                remaining = 1
-            if remaining <= 0:
+                remaining = 0
+            if remaining < 1_000_000:
                 continue
 
             if order.get("isMakerBettingOutcomeOne"):
@@ -200,7 +205,7 @@ class SxBetWSClient:
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                log.error("sx_bet ws: %s — reconnecting in %.0fs", exc, _RECONNECT_DELAY_S)
+                log.warning("sx_bet ws: %s — reconnecting in %.0fs", exc, _RECONNECT_DELAY_S)
                 await asyncio.sleep(_RECONNECT_DELAY_S)
 
     def stop(self) -> None:
@@ -229,21 +234,43 @@ class SxBetWSClient:
     # Centrifugo protocol
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _parse_frame(raw: str) -> list[dict[str, Any]]:
+        """Centrifugo batches multiple JSON objects in one WS frame separated by newlines.
+
+        json.loads() raises 'Extra data' on the second object, so we split on
+        newlines and parse each non-empty line independently.
+        """
+        results = []
+        for line in raw.split("\n"):
+            s = line.strip()
+            if s:
+                try:
+                    results.append(json.loads(s))
+                except json.JSONDecodeError as e:
+                    log.debug("sx_bet ws: json parse error: %s in %.50r", e, s)
+        return results
+
     async def _centrifugo_connect(self, ws: Any, token: str) -> None:
         await ws.send(json.dumps({"id": 1, "connect": {"token": token, "name": "matched_betting"}}))
-        reply = json.loads(await asyncio.wait_for(ws.recv(), timeout=10.0))
+        raw    = await asyncio.wait_for(ws.recv(), timeout=10.0)
+        frames = self._parse_frame(raw)
+        reply  = frames[0] if frames else {}
         if "error" in reply:
             raise ConnectionError(f"Centrifugo connect error: {reply['error']}")
         log.debug("sx_bet ws: centrifugo connected — client=%s",
                   reply.get("connect", {}).get("client", "?"))
+        # Handle any extra messages batched into the same frame
+        for extra in frames[1:]:
+            self._dispatch(extra)
 
     async def _subscribe_all(self, ws: Any) -> None:
         for req_id, market_hash in enumerate(self.market_map, start=2):
             channel = f"order_book:market_{market_hash}"
             await ws.send(json.dumps({"id": req_id, "subscribe": {"channel": channel}}))
 
-        # Drain the subscribe acknowledgements and apply any initial snapshots
-        pending = len(self.market_map)
+        # Drain subscribe acknowledgements and apply any initial snapshots
+        pending  = len(self.market_map)
         deadline = asyncio.get_event_loop().time() + 15.0
         while pending > 0:
             remaining = deadline - asyncio.get_event_loop().time()
@@ -254,18 +281,14 @@ class SxBetWSClient:
                 raw = await asyncio.wait_for(ws.recv(), timeout=remaining)
             except asyncio.TimeoutError:
                 break
-            msg = json.loads(raw)
-            # Subscribe ack contains initial history in msg["subscribe"]["data"]
-            if "subscribe" in msg:
-                sub_data = msg.get("subscribe", {})
-                history  = sub_data.get("data") or []
-                # history is a list of pub objects; each pub has {"data": {"orders": [...]}}
-                for pub in history:
-                    self._apply_pub(pub)
-                pending -= 1
-            # Could also receive early publications during subscribe drain — handle them too
-            elif "push" in msg:
-                self._handle_push(msg["push"])
+            for msg in self._parse_frame(raw):
+                if "subscribe" in msg:
+                    history = (msg.get("subscribe") or {}).get("data") or []
+                    for pub in history:
+                        self._apply_pub(pub)
+                    pending -= 1
+                else:
+                    self._dispatch(msg)
 
         log.info("sx_bet ws: subscribed to %d markets", len(self.market_map))
 
@@ -273,13 +296,16 @@ class SxBetWSClient:
         async for raw in ws:
             if not raw:
                 continue
-            msg = json.loads(raw)
-            # Server keepalive ping: empty JSON object {}
-            if not msg:
-                await ws.send("{}")
-                continue
-            if "push" in msg:
-                self._handle_push(msg["push"])
+            for msg in self._parse_frame(raw):
+                if not msg:
+                    await ws.send("{}")  # Centrifugo application ping → pong
+                    continue
+                self._dispatch(msg)
+
+    def _dispatch(self, msg: dict[str, Any]) -> None:
+        """Route one parsed Centrifugo message."""
+        if "push" in msg:
+            self._handle_push(msg["push"])
 
     # ------------------------------------------------------------------
     # Message handling
@@ -294,10 +320,16 @@ class SxBetWSClient:
         self._apply_pub(pub, market_hash=market_hash)
 
     def _apply_pub(self, pub: dict[str, Any], market_hash: str | None = None) -> None:
-        data = pub.get("data") or {}
-        orders = data.get("orders") or data.get("order") or []
-        if isinstance(orders, dict):
-            orders = [orders]
+        data = pub.get("data")
+        # data may be a list of orders directly, or a dict wrapping {"orders": [...]}
+        if isinstance(data, list):
+            orders = data
+        elif isinstance(data, dict):
+            orders = data.get("orders") or data.get("order") or []
+            if isinstance(orders, dict):
+                orders = [orders]
+        else:
+            return
         if not orders:
             return
 
@@ -316,7 +348,13 @@ class SxBetWSClient:
         o1_avail, o2_avail = ctx.book.total_liquidity()
 
         self.cache.update_back_odds(ctx.game_id, "sx_bet", ctx.o1_slot, o1_odds, o1_avail)
-        self.cache.update_back_odds(ctx.game_id, "sx_bet", ctx.o2_slot, o2_odds, o2_avail)
+        if ctx.o2_slot.endswith("_no"):
+            # Soccer per-outcome binary market: outcomeTwo = "No" (ctx.o1_slot does
+            # NOT happen). Backing No at these odds pays out identically to laying
+            # the named outcome at the same odds — feed it in as the lay price.
+            self.cache.update_lay_odds(ctx.game_id, "sx_bet", ctx.o1_slot, o2_odds, o2_avail)
+        else:
+            self.cache.update_back_odds(ctx.game_id, "sx_bet", ctx.o2_slot, o2_odds, o2_avail)
 
         log.debug("sx_bet ws: %s %s=%.4f %s=%.4f",
                   ctx.game_id,
@@ -343,16 +381,22 @@ def build_market_map(games: list[dict]) -> dict[str, _MarketCtx]:
         gid    = _gid(game)
         league = game.get("league", "")
 
-        # Two-way market (NBA, MLB, WNBA, KBO, NHL …)
+        # Two-way market (NBA, MLB, WNBA, KBO, NHL …) and totals (mlb_totals, mls_totals)
         mh = game.get("sx_bet_market_hash")
         if mh:
-            # outcomeOne team is stored as the normalised name; compare to determine slots
-            o1_team_norm = game.get("sx_bet_outcome_one_team") or ""
-            t1_norm      = normalize_team_name(game.get("team1") or "", league)
-            if o1_team_norm and o1_team_norm == t1_norm:
-                o1_slot, o2_slot = "team1", "team2"
+            o1_team_norm = (game.get("sx_bet_outcome_one_team") or "").lower()
+            if league in ("mlb_totals", "mls_totals"):
+                # outcomeOne is stored as "over" or "under", not a team name
+                if o1_team_norm == "over":
+                    o1_slot, o2_slot = "over", "under"
+                else:
+                    o1_slot, o2_slot = "under", "over"
             else:
-                o1_slot, o2_slot = "team2", "team1"
+                t1_norm = normalize_team_name(game.get("team1") or "", league)
+                if o1_team_norm and o1_team_norm == t1_norm:
+                    o1_slot, o2_slot = "team1", "team2"
+                else:
+                    o1_slot, o2_slot = "team2", "team1"
             market_map[mh] = _MarketCtx(gid, o1_slot, o2_slot)
 
         # Soccer per-outcome binary markets (team1-win market, draw market, team2-win market)
@@ -380,7 +424,7 @@ async def _open_ws(uri: str, proxy_url: str | None):
     from urllib.parse import urlparse
 
     if not proxy_url:
-        return await websockets.connect(uri)
+        return await websockets.connect(uri, max_size=None)
 
     parsed    = urlparse(uri)
     dest_host = parsed.hostname
@@ -391,4 +435,5 @@ async def _open_ws(uri: str, proxy_url: str | None):
     proxy    = Proxy.from_url(url)
     raw_sock = await proxy.connect(dest_host=dest_host, dest_port=dest_port)
     ssl_ctx  = ssl.create_default_context() if parsed.scheme == "wss" else None
-    return await websockets.connect(uri, sock=raw_sock, ssl=ssl_ctx)
+    import websockets.legacy.client
+    return await websockets.legacy.client.connect(uri, sock=raw_sock, ssl=ssl_ctx, max_size=None)

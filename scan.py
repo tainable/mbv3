@@ -71,7 +71,7 @@ except ImportError:
 import arb_finder as _arb
 import bet_executor as _exec
 
-DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga"]
+DEFAULT_LEAGUES = ["nba", "wnba", "mlb", "mlb_spread", "mlb_totals", "kbo", "ucl", "epl", "uel", "nhl", "ipl", "seria", "laliga", "mls", "mls_spread", "mls_totals", "veikkausliiga", "wc", "wc_spread", "wc_totals"]
 DEFAULT_PROVIDERS = ["matchbook", "polymarket", "sx_bet"]  # Smarkets and Azuro excluded by default
 DEFAULT_IDS = Path("outputs/active_game_ids.json")
 
@@ -280,7 +280,7 @@ def _scan_game(
     # after aggregation games_payload can contain several spread-line entries for
     # the same team pair.  Comparing on abs() because context spread is signed
     # (negative = home fav) while aggregated entries may vary in sign convention.
-    if len(games_payload) > 1 and game.get("league") in ("mlb_spread", "mls_spread"):
+    if len(games_payload) > 1 and game.get("league") in ("mlb_spread", "mls_spread", "wc_spread"):
         ctx_spread = game.get("spread")
         if ctx_spread is not None:
             abs_ctx = abs(float(ctx_spread))
@@ -338,7 +338,7 @@ def _print_odds_table(
     gbp_rate: float | None = None,
 ) -> None:
     """Print a compact odds table for one game after scanning."""
-    is_totals = game.get("league") in ("mlb_totals", "mls_totals")
+    is_totals = game.get("league") in ("mlb_totals", "mls_totals", "wc_totals")
     if is_totals:
         team1 = "Over"
         team2 = "Under"
@@ -597,6 +597,21 @@ def main() -> None:
         help="Games kicking off within this many minutes are treated as imminent and skipped (default: 20).",
     )
     parser.add_argument(
+        "--no-skip-far",
+        action="store_true",
+        help=(
+            "Include games kicking off more than --max-days-ahead days away. "
+            "By default these are excluded as odds are unreliable that far out."
+        ),
+    )
+    parser.add_argument(
+        "--max-days-ahead",
+        type=int,
+        default=7,
+        metavar="DAYS",
+        help="Games kicking off more than this many days away are skipped (default: 7).",
+    )
+    parser.add_argument(
         "--show-odds",
         action="store_true",
         help="After each game, print the fetched back/lay odds per provider for debugging.",
@@ -692,6 +707,19 @@ def main() -> None:
                 imminent_skipped += 1
         games = filtered
 
+    far_skipped = 0
+    if not args.no_skip_far:
+        now = datetime.now(timezone.utc)
+        far_cutoff = now + timedelta(days=args.max_days_ahead)
+        filtered = []
+        for g in games:
+            ko = _parse_kickoff(g.get("date_time"))
+            if ko is None or ko <= far_cutoff:
+                filtered.append(g)
+            else:
+                far_skipped += 1
+        games = filtered
+
     settings = load_settings(_PROJECT_ROOT)  # loads .env → os.environ
     if settings.vpn_proxy_url:
         os.environ["HTTPS_PROXY"] = settings.vpn_proxy_url
@@ -742,7 +770,12 @@ def main() -> None:
         else f"  (--no-skip-imminent to include; cutoff={args.imminent_minutes}m)" if not args.no_skip_imminent
         else ""
     )
-    print(f"  Games:      {len(games)}  (≥2 provider coverage){imminent_note}")
+    far_note = (
+        f"  ({far_skipped} far-future skipped, >{args.max_days_ahead}d)" if far_skipped
+        else f"  (--no-skip-far to include; cutoff={args.max_days_ahead}d)" if not args.no_skip_far
+        else ""
+    )
+    print(f"  Games:      {len(games)}  (≥2 provider coverage){imminent_note}{far_note}")
     print(f"  Commission: {commission_str}")
     if args.auto_bet:
         mode = "DRY RUN" if args.bet_dry_run else "LIVE"
@@ -828,11 +861,11 @@ def main() -> None:
         _all_bl = calculator.find_back_lay_arbs(games_payload, min_profit_pct=0.0)
         _all_kbo = calculator.find_kbo_tie_aware_arbs(games_payload, min_profit_pct=0.0)
         for _entry in _all_sure:
-            _event_log.log_arb("sure_bet", _entry, _PROJECT_ROOT)
+            _event_log.log_arb("sure_bet", _entry, _PROJECT_ROOT, source="scan")
         for _entry in _all_bl:
-            _event_log.log_arb("back_lay", _entry, _PROJECT_ROOT)
+            _event_log.log_arb("back_lay", _entry, _PROJECT_ROOT, source="scan")
         for _entry in _all_kbo:
-            _event_log.log_arb("kbo", _entry, _PROJECT_ROOT)
+            _event_log.log_arb("kbo", _entry, _PROJECT_ROOT, source="scan")
 
         total_sure_bets.extend(sure_bets)
         total_back_lay_arbs.extend(back_lay_arbs)

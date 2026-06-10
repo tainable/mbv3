@@ -51,13 +51,21 @@ try:
         TradeParams,
     )
     from py_clob_client.order_builder.constants import BUY, SELL
+    _CLOB_AVAILABLE = True
 except ImportError:
-    print(
-        "ERROR: py-clob-client is not installed.\n"
-        "Run:  pip install py-clob-client",
-        file=sys.stderr,
-    )
-    sys.exit(1)
+    _CLOB_AVAILABLE = False
+    BUY = SELL = "BUY"
+
+
+def _require_clob() -> None:
+    """Exit with a helpful message if py-clob-client is not installed."""
+    if not _CLOB_AVAILABLE:
+        print(
+            "ERROR: py-clob-client is not installed.\n"
+            "Run:  pip install py-clob-client",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
 _CLOB_HOST = "https://clob.polymarket.com"
 _DATA_API = "https://data-api.polymarket.com"
@@ -633,8 +641,9 @@ def main() -> None:
         _hx_proxy = _proxy.replace("socks5h://", "socks5://")
         try:
             import httpx as _httpx
-            import py_clob_client.http_helpers.helpers as _pm_v1_helpers
-            _pm_v1_helpers._http_client = _httpx.Client(http2=True, proxy=_hx_proxy)
+            if _CLOB_AVAILABLE:
+                import py_clob_client.http_helpers.helpers as _pm_v1_helpers
+                _pm_v1_helpers._http_client = _httpx.Client(http2=True, proxy=_hx_proxy)
             print(f"[proxy] routing through {_proxy}  (httpx singleton patched)")
         except Exception as _patch_err:
             print(f"[proxy] WARNING: could not patch py_clob_client httpx client: {_patch_err}",
@@ -685,6 +694,7 @@ def main() -> None:
             sys.exit(1)
         return
 
+    _require_clob()
     print("Connecting to CLOB... ", end="", flush=True)
     try:
         client = _build_client(private_key)

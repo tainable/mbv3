@@ -39,6 +39,8 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from matched_betting.config import load_settings
 from matched_betting.http import HttpClient
+from matched_betting.polygon_rpc import PM_CHAIN_ID, PM_RPCS, pm_rpc, pm_erc20_balance
+from matched_betting.mb_auth import mb_login
 
 # ── Optional deps ─────────────────────────────────────────────────────────────
 
@@ -68,18 +70,6 @@ except ImportError:
 
 _PM_CLOB_HOST = "https://clob.polymarket.com"
 _PM_DATA_API  = "https://data-api.polymarket.com"
-_PM_CHAIN_ID  = 137
-_PM_RPCS      = [
-    "https://polygon.drpc.org",
-    "https://polygon.meowrpc.com",
-    "https://endpoints.omniatech.io/v1/matic/mainnet/public",
-    "https://polygon-bor-rpc.publicnode.com",
-    "https://rpc.ankr.com/polygon",
-    "https://polygon.llamarpc.com",
-    "https://1rpc.io/matic",
-    "https://polygon-rpc.com",
-]
-
 # Polymarket V2 collateral: pUSD (ERC-20 backed 1:1 by USDC, 6 decimals)
 _PM_PUSD_CONTRACT  = "0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"
 # Native USDC on Polygon (Circle issuance — needs wrapping to pUSD via onramp)
@@ -130,32 +120,6 @@ def _section(title: str) -> None:
     print(f"  {'─' * (len(title) + 2)}")
 
 
-def _pm_rpc(method: str, params: list, rpc_list: list[str]) -> Any:
-    last: Exception | None = None
-    for url in rpc_list:
-        try:
-            r = _requests.post(
-                url,
-                json={"jsonrpc": "2.0", "method": method, "params": params, "id": 1},
-                timeout=10,
-            )
-            r.raise_for_status()
-            result = r.json()
-            if "error" in result:
-                raise RuntimeError(result["error"])
-            return result["result"]
-        except Exception as exc:
-            last = exc
-    raise RuntimeError(f"All Polygon RPCs failed. Last: {last}")
-
-
-def _pm_erc20_balance(token: str, address: str, rpc_list: list[str]) -> float:
-    """Return an ERC-20 token balance assuming 6 decimals (USDC / pUSD)."""
-    padded = bytes.fromhex("000000000000000000000000" + address.lower().replace("0x", ""))
-    calldata = "0x" + (_PM_BALANCE_OF_SEL + padded).hex()
-    raw = _pm_rpc("eth_call", [{"to": token, "data": calldata}, "latest"], rpc_list)
-    return int(raw, 16) / 1e6
-
 
 def _pm_ensure_ctf_approval(private_key: str, address: str, rpc_list: list[str],
                             extra_operators: list[str] | None = None) -> None:
@@ -168,15 +132,15 @@ def _pm_ensure_ctf_approval(private_key: str, address: str, rpc_list: list[str],
     import time as _time
     from eth_account import Account as _EthAcct
 
-    nonce     = int(_pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
-    gas_price = int(int(_pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
+    nonce     = int(pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
+    gas_price = int(int(pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
     offset    = 0
 
     for operator in (_PM_CTF_OPERATORS + (extra_operators or [])):
         owner_pad    = bytes.fromhex("000000000000000000000000" + address.lower().replace("0x", ""))
         operator_pad = bytes.fromhex("000000000000000000000000" + operator.lower().replace("0x", ""))
         call_data    = "0x" + (_PM_IS_APPROVED_SEL + owner_pad + operator_pad).hex()
-        result       = _pm_rpc("eth_call", [{"to": _PM_CTF_CONTRACT, "data": call_data}, "latest"], rpc_list)
+        result       = pm_rpc("eth_call", [{"to": _PM_CTF_CONTRACT, "data": call_data}, "latest"], rpc_list)
         if int(result, 16) != 0:
             continue  # already approved for this operator
 
@@ -189,16 +153,16 @@ def _pm_ensure_ctf_approval(private_key: str, address: str, rpc_list: list[str],
             "to":       _PM_CTF_CONTRACT,
             "value":    0,
             "data":     tx_data,
-            "chainId":  _PM_CHAIN_ID,
+            "chainId":  PM_CHAIN_ID,
         }
         signed  = _EthAcct.sign_transaction(tx, private_key)
-        tx_hash = _pm_rpc("eth_sendRawTransaction",
+        tx_hash = pm_rpc("eth_sendRawTransaction",
                           ["0x" + signed.raw_transaction.hex()], rpc_list)
         print(f"  Approving CTF Exchange …{operator[-8:]} to transfer tokens")
         print(f"  tx: {tx_hash}")
         print("    waiting", end="", flush=True)
         for _ in range(90):
-            receipt = _pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
+            receipt = pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
             if receipt:
                 if int(receipt.get("status", "0x0"), 16) == 1:
                     print(" ✓")
@@ -223,7 +187,7 @@ def fetch_matchbook(settings) -> dict:
         return result
     try:
         http  = HttpClient()
-        token = _mb_login(http, mb.base_url, mb.username, mb.password)
+        token = mb_login(http, mb.base_url, mb.username, mb.password)
 
         # Account balance, exposure, free funds
         try:
@@ -248,18 +212,6 @@ def fetch_matchbook(settings) -> dict:
     except Exception as exc:
         result["error"] = str(exc)
     return result
-
-
-def _mb_login(http: HttpClient, base_url: str, username: str, password: str) -> str:
-    resp  = http.post_json(
-        f"{base_url}/bpapi/rest/security/session",
-        payload={"username": username, "password": password},
-        headers={"Accept": "application/json"},
-    )
-    token = resp.get("session-token")
-    if not token:
-        raise RuntimeError(f"Login failed: {resp}")
-    return str(token)
 
 
 def _mb_fetch_offers(http: HttpClient, base_url: str, token: str, per_page: int = 50) -> list[dict]:
@@ -289,7 +241,7 @@ def _mb_fetch_offers(http: HttpClient, base_url: str, token: str, per_page: int 
 def cancel_matchbook_offer(settings, offer_id: int) -> None:
     mb    = settings.matchbook
     http  = HttpClient()
-    token = _mb_login(http, mb.base_url, mb.username, mb.password)
+    token = mb_login(http, mb.base_url, mb.username, mb.password)
     resp  = http.request_json(
         "DELETE",
         f"{mb.base_url}/edge/rest/offers/{offer_id}",
@@ -312,32 +264,32 @@ def fetch_polymarket(settings) -> dict:
         result["error"] = "POLYMARKET_PRIVATE_KEY not set"
         return result
     try:
-        client  = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=_PM_CHAIN_ID)
+        client  = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=PM_CHAIN_ID)
         client.set_api_creds(client.derive_api_key())
         address = client.signer.address()
         result["address"] = address
 
         # MATIC gas balance
         rpc_list = (
-            [settings.polymarket.polygon_rpc_url] + _PM_RPCS
-            if settings.polymarket.polygon_rpc_url else _PM_RPCS
+            [settings.polymarket.polygon_rpc_url] + PM_RPCS
+            if settings.polymarket.polygon_rpc_url else PM_RPCS
         )
         try:
-            hex_bal        = _pm_rpc("eth_getBalance", [address, "latest"], rpc_list)
+            hex_bal        = pm_rpc("eth_getBalance", [address, "latest"], rpc_list)
             result["matic"] = round(int(hex_bal, 16) / 1e18, 4)
         except Exception as exc:
             result["matic_error"] = str(exc)
 
         # pUSD balance — on-chain (primary, Polymarket V2 collateral)
         try:
-            result["pusd"] = round(_pm_erc20_balance(_PM_PUSD_CONTRACT, address, rpc_list), 2)
+            result["pusd"] = round(pm_erc20_balance(_PM_PUSD_CONTRACT, address, rpc_list), 2)
         except Exception as exc:
             result["pusd_error"] = str(exc)
 
         # Native USDC wallet balance — shown alongside pUSD so user can see
         # unwrapped USDC that still needs wrapping via CollateralOnramp
         try:
-            result["usdc_native"] = round(_pm_erc20_balance(_PM_USDC_NATIVE, address, rpc_list), 2)
+            result["usdc_native"] = round(pm_erc20_balance(_PM_USDC_NATIVE, address, rpc_list), 2)
         except Exception as exc:
             result["usdc_native_error"] = str(exc)
 
@@ -459,7 +411,7 @@ def cancel_polymarket_orders(settings, order_id: str = "") -> None:
     pk = settings.polymarket.private_key
     if not pk:
         sys.exit("ERROR: POLYMARKET_PRIVATE_KEY not set")
-    client = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=_PM_CHAIN_ID)
+    client = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=PM_CHAIN_ID)
     client.set_api_creds(client.derive_api_key())
     if order_id:
         resp = client.cancel_order(OrderPayload(orderID=order_id))
@@ -488,13 +440,13 @@ def sell_polymarket_position(settings, token_id: str, amount: float,
     if settings.vpn_proxy_url:
         os.environ["HTTP_PROXY"]  = settings.vpn_proxy_url
         os.environ["HTTPS_PROXY"] = settings.vpn_proxy_url
-    client = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=_PM_CHAIN_ID)
+    client = ClobClient(host=_PM_CLOB_HOST, key=pk, chain_id=PM_CHAIN_ID)
     client.set_api_creds(client.derive_api_key())
     from eth_account import Account as _EthAcct
     address  = _EthAcct.from_key(pk).address
     rpc_list = (
-        [settings.polymarket.polygon_rpc_url] + _PM_RPCS
-        if settings.polymarket.polygon_rpc_url else _PM_RPCS
+        [settings.polymarket.polygon_rpc_url] + PM_RPCS
+        if settings.polymarket.polygon_rpc_url else PM_RPCS
     )
     if dry_run:
         print(f"  [DRY RUN] Would sell {amount} shares of token …{token_id[-20:]}")
@@ -526,8 +478,8 @@ def redeem_polymarket_positions(settings, dry_run: bool = False) -> None:
 
     address  = _EthAcct.from_key(pk).address
     rpc_list = (
-        [settings.polymarket.polygon_rpc_url] + _PM_RPCS
-        if settings.polymarket.polygon_rpc_url else _PM_RPCS
+        [settings.polymarket.polygon_rpc_url] + PM_RPCS
+        if settings.polymarket.polygon_rpc_url else PM_RPCS
     )
 
     print(f"  Wallet: {address}")
@@ -587,48 +539,83 @@ def redeem_polymarket_positions(settings, dry_run: bool = False) -> None:
     idx1_bytes   = (1).to_bytes(32, "big")      # indexSets[0] = 1  (outcome slot 0)
     idx2_bytes   = (2).to_bytes(32, "big")      # indexSets[1] = 2  (outcome slot 1)
 
-    nonce     = int(_pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
-    gas_price = int(int(_pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
+    nonce     = int(pm_rpc("eth_getTransactionCount", [address, "latest"], rpc_list), 16)
+    gas_price = int(int(pm_rpc("eth_gasPrice", [], rpc_list), 16) * 1.2)
 
-    for i, market in enumerate(markets):
-        cid_bytes = bytes.fromhex(market["condition_id"].replace("0x", ""))
-        calldata  = "0x" + (
-            redeem_sel + pusd_padded + parent_bytes + cid_bytes
-            + offset_bytes + length_bytes + idx1_bytes + idx2_bytes
-        ).hex()
-
-        contract = _PM_NEG_RISK_CTF_ADAPTER if market["neg_risk"] else _PM_CTF_ADAPTER
-        tx = {
-            "nonce":    nonce + i,
-            "gasPrice": gas_price,
-            "gas":      800_000 if market["neg_risk"] else 400_000,
-            "to":       contract,
-            "value":    0,
-            "data":     calldata,
-            "chainId":  _PM_CHAIN_ID,
-        }
-        signed  = _EthAcct.sign_transaction(tx, pk)
-        tx_hash = _pm_rpc("eth_sendRawTransaction",
-                          ["0x" + signed.raw_transaction.hex()], rpc_list)
-
-        print(f"  Redeeming: {market['title']}")
-        print(f"  tx: {tx_hash}")
-        print("    waiting", end="", flush=True)
-        for _ in range(90):
-            receipt = _pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
-            if receipt:
-                if int(receipt.get("status", "0x0"), 16) == 1:
-                    print(" OK")
-                else:
-                    print(" REVERTED")
-                    print(f"    WARNING: tx reverted — {tx_hash}")
-                break
-            _time.sleep(1)
-            print(".", end="", flush=True)
+    # Preflight: estimate total gas cost and warn if MATIC balance is too low.
+    # Uses 600k gas per market as a conservative average (400k normal, 800k neg-risk).
+    try:
+        matic_hex  = pm_rpc("eth_getBalance", [address, "latest"], rpc_list)
+        matic_bal  = int(matic_hex, 16) / 1e18
+        est_cost   = gas_price * 600_000 * len(markets) / 1e18
+        print(f"  MATIC balance : {matic_bal:.4f}")
+        print(f"  Estimated gas : {est_cost:.4f} MATIC ({len(markets)} markets × ~600k gas)")
+        if matic_bal < est_cost:
+            shortfall = est_cost - matic_bal
+            print(f"  WARNING: insufficient MATIC — need ~{shortfall:.4f} more.")
+            print(f"           Bridge MATIC to {address} before retrying.")
+            print()
         else:
-            print(f"\n  WARNING: tx not confirmed after 90s: {tx_hash}")
+            print()
+    except Exception:
+        pass
+
+    failed = []
+    for i, market in enumerate(markets):
+        print(f"  Redeeming: {market['title']}")
+        try:
+            cid_bytes = bytes.fromhex(market["condition_id"].replace("0x", ""))
+            calldata  = "0x" + (
+                redeem_sel + pusd_padded + parent_bytes + cid_bytes
+                + offset_bytes + length_bytes + idx1_bytes + idx2_bytes
+            ).hex()
+
+            contract = _PM_NEG_RISK_CTF_ADAPTER if market["neg_risk"] else _PM_CTF_ADAPTER
+            tx = {
+                "nonce":    nonce + i,
+                "gasPrice": gas_price,
+                "gas":      800_000 if market["neg_risk"] else 400_000,
+                "to":       contract,
+                "value":    0,
+                "data":     calldata,
+                "chainId":  PM_CHAIN_ID,
+            }
+            signed  = _EthAcct.sign_transaction(tx, pk)
+            tx_hash = pm_rpc("eth_sendRawTransaction",
+                              ["0x" + signed.raw_transaction.hex()], rpc_list)
+
+            print(f"  tx: {tx_hash}")
+            print("    waiting", end="", flush=True)
+            # Poll every 3s for up to 90s — slower than 1s to avoid burning
+            # through rate limits across 8 markets.
+            for _ in range(30):
+                _time.sleep(3)
+                print(".", end="", flush=True)
+                try:
+                    receipt = pm_rpc("eth_getTransactionReceipt", [tx_hash], rpc_list)
+                except Exception:
+                    continue
+                if receipt:
+                    if int(receipt.get("status", "0x0"), 16) == 1:
+                        print(" OK")
+                    else:
+                        print(" REVERTED")
+                        print(f"    WARNING: tx reverted — {tx_hash}")
+                    break
+            else:
+                print(f"\n  WARNING: tx not confirmed after 90s — {tx_hash}")
+                print(f"    Check: https://polygonscan.com/tx/{tx_hash}")
+
+        except Exception as exc:
+            print(f"  ERROR: {exc}")
+            failed.append(market["title"])
 
     print()
+    if failed:
+        print(f"  {len(failed)} market(s) failed — rerun to retry:")
+        for title in failed:
+            print(f"    {title}")
+        print()
     print("  Done. Check updated pUSD balance with:  python portfolio.py --polymarket")
 
 

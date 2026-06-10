@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -71,6 +72,30 @@ class OddsCache:
             self._dirty.add(gid)
             return True
 
+    def update_lay_odds(
+        self,
+        gid: str,
+        provider: str,
+        slot: str,
+        lay_odds: float | None,
+        avail_usd: float | None = None,
+    ) -> bool:
+        """Update one provider's lay odds for one outcome slot (back odds untouched).
+
+        slot is one of: "team1", "team2", "draw", "over", "under"
+        Returns False if the game_id is not in the cache (stale subscription).
+        """
+        with self._lock:
+            g = self._games.get(gid)
+            if g is None:
+                return False
+            g[f"{provider}_{slot}_lay_odds"] = lay_odds
+            if avail_usd is not None:
+                g[f"{provider}_{slot}_lay_avail"] = avail_usd
+            self._fetch_times[(gid, provider)] = time.monotonic()
+            self._dirty.add(gid)
+            return True
+
     def update_back_and_lay_odds(
         self,
         gid: str,
@@ -107,6 +132,35 @@ class OddsCache:
             self._dirty.clear()
             return result
 
+    def get_game(self, gid: str) -> dict[str, Any] | None:
+        """Return a snapshot of one game by ID without marking it dirty. None if unknown."""
+        with self._lock:
+            g = self._games.get(gid)
+            return dict(g) if g is not None else None
+
+    def merge_provider_fields(
+        self,
+        gid: str,
+        provider: str,
+        fields: dict[str, Any],
+        mark_dirty: bool = True,
+    ) -> bool:
+        """Merge a dict of provider-keyed fields into a game and update its fetch timestamp.
+
+        mark_dirty=False lets the arb loop write fetched odds back into the cache
+        without re-queuing the game for another arb-detection tick.
+        Returns False if the gid is unknown.
+        """
+        with self._lock:
+            g = self._games.get(gid)
+            if g is None:
+                return False
+            g.update(fields)
+            self._fetch_times[(gid, provider)] = time.monotonic()
+            if mark_dirty:
+                self._dirty.add(gid)
+            return True
+
     def all_games(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(g) for g in self._games.values()]
@@ -133,14 +187,43 @@ class OddsCache:
 # Stable game ID (must be consistent across cache lifetime)
 # ---------------------------------------------------------------------------
 
+_BUCKET_MINUTES = 90
+
+
+def _time_bucket(dt_str: str | None) -> str:
+    """Floor a datetime string to the nearest 90-minute bucket, e.g. '2026-06-07T01:30'."""
+    if not dt_str:
+        return ""
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(timezone.utc)
+        total_minutes = dt.hour * 60 + dt.minute
+        bucket = (total_minutes // _BUCKET_MINUTES) * _BUCKET_MINUTES
+        return f"{dt.date()}T{bucket // 60:02d}:{bucket % 60:02d}"
+    except ValueError:
+        return dt_str[:10]
+
+
 def game_id(game: dict[str, Any]) -> str:
     """Derive a stable string key from a game dict.
 
-    Uses league + date (YYYY-MM-DD) + team names so the ID survives restarts
-    and is human-readable in logs.
+    Spread/totals leagues include the line in the key so that different lines
+    for the same matchup (e.g. PHI/SD at −1.5, −2.5, −5.5) get separate cache
+    entries and their provider tokens cannot pollute each other's odds slots.
+
+    A 90-minute bucket is used so that provider time skew (a few minutes) still
+    maps to the same key, while double-headers on the same day (hours apart)
+    get distinct keys and cannot cross-contaminate each other's WS odds updates.
     """
     league = game.get("league", "")
-    date   = (game.get("date_time") or "")[:10]
+    date   = _time_bucket(game.get("date_time"))
     team1  = (game.get("team1") or "").lower()
     team2  = (game.get("team2") or "").lower()
+    if league in ("mlb_spread", "mls_spread", "wc_spread"):
+        spread = game.get("spread")
+        if spread is not None:
+            return f"{league}|{date}|{team1}|{team2}|{spread}"
+    elif league in ("mlb_totals", "mls_totals", "wc_totals"):
+        total_line = game.get("total_line")
+        if total_line is not None:
+            return f"{league}|{date}|{team1}|{team2}|{total_line}"
     return f"{league}|{date}|{team1}|{team2}"

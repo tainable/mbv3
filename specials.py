@@ -43,7 +43,7 @@ from matched_betting.config import load_settings
 from matched_betting.http import HttpClient
 from matched_betting import calculator
 
-from bet import _mb_login, _mb_best_price
+from matched_betting.mb_auth import mb_login as _mb_login, mb_best_price as _mb_best_price
 from specials_registry import list_events, get_event
 from specials_strategies import evaluate, PriceMap, LiquidityMap
 from specials_active import is_active

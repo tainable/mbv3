@@ -14,8 +14,27 @@ Falls back to stderr when no webhook is configured or delivery fails.
 """
 from __future__ import annotations
 
+import json
 import sys
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import TYPE_CHECKING
+
+_ALERT_LOG = Path(__file__).resolve().parent.parent.parent / "outputs" / "alert_log.jsonl"
+
+
+def _log_alert(subject: str, body: str) -> None:
+    try:
+        _ALERT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "subject": subject,
+            "body": body,
+        }
+        with _ALERT_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
 
 if TYPE_CHECKING:
     from matched_betting.config import Settings
@@ -43,6 +62,8 @@ def _ntfy_body(text: str) -> str:
 
 def send_alert(subject: str, body: str, settings: "Settings") -> None:
     """Send an alert via the configured webhook, or print to stderr."""
+    _log_alert(subject, body)
+
     if not getattr(settings, "alert_enabled", True):
         return
 

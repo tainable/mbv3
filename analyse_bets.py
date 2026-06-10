@@ -2,7 +2,19 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-GBP_RATE = 1.35  # approximate $/£ for Matchbook GBP amounts
+
+def _fetch_gbp_rate(fallback: float = 1.35) -> float:
+    try:
+        import requests
+        r = requests.get("https://open.er-api.com/v6/latest/USD", timeout=5,
+                         proxies={"https": None, "http": None})
+        r.raise_for_status()
+        return r.json()["rates"]["GBP"]
+    except Exception:
+        return fallback
+
+
+GBP_RATE = _fetch_gbp_rate()
 
 lines = Path("outputs/bet_log.jsonl").read_text(encoding="utf-8").splitlines()
 records = [json.loads(l) for l in lines if l.strip()]
@@ -76,4 +88,4 @@ print("--- TOTALS ---")
 print(f"Total capital deployed: ${total_capital:.2f}")
 print(f"Total expected profit:  ${total_profit:.4f}")
 print(f"Effective margin:       {total_profit / total_capital * 100:.4f}%  "
-      f"(Matchbook GBP converted at ~${GBP_RATE}/£)")
+      f"(Matchbook GBP converted at ${GBP_RATE:.4f}/£)")
