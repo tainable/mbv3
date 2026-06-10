@@ -28,6 +28,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from matched_betting import calculator
 from matched_betting.config import load_settings
+from matched_betting.leagues import TOTALS_LEAGUES
 from matched_betting.http import HttpClient
 
 # Re-export the finders so scan.py can import them from here if desired.
@@ -428,7 +429,7 @@ def _fetch_matchbook_leg(game: dict, outcome_name: str, side: str, http, setting
         "total (incl. extra innings)", "over/under",
         "total goals", "total goals (incl. overtime)", "match goals", "over/under goals",
     }
-    is_totals = game.get("league") in ("mlb_totals", "mls_totals", "wc_totals")
+    is_totals = game.get("league") in TOTALS_LEAGUES
     try:
         if settings.matchbook.username and settings.matchbook.password:
             http.post_json(
@@ -490,7 +491,7 @@ def _fetch_sx_bet_leg(game: dict, outcome_name: str, side: str, http, settings) 
             return None
         # For mlb_totals / mls_totals: outcomeOne=Over, outcomeTwo=Under.
         # Taker backing Over uses outcomeTwo maker orders; Under uses outcomeOne.
-        if game.get("league") in ("mlb_totals", "mls_totals", "wc_totals"):
+        if game.get("league") in TOTALS_LEAGUES:
             outcome_lower = outcome_name.lower()
             maker_data = entry.get("outcomeTwo") if outcome_lower == "over" else entry.get("outcomeOne")
         else:

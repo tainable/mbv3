@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 from urllib.request import urlopen, build_opener, ProxyHandler
 
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
+
 if TYPE_CHECKING:
     from matched_betting.config import CommissionSettings
 
@@ -276,7 +278,7 @@ def find_sure_bets(games: list[dict], min_profit_pct: float = 0.0) -> list[dict]
         if game.get("league") == "kbo":
             continue  # handled by find_kbo_tie_aware_arbs
         three_way = _is_three_way(game)
-        is_totals = game.get("league") in ("mlb_totals", "mls_totals", "wc_totals")
+        is_totals = game.get("league") in TOTALS_LEAGUES
         slot1 = "over" if is_totals else "team1"
         slot2 = "under" if is_totals else "team2"
 
@@ -360,9 +362,9 @@ def find_back_lay_arbs(games: list[dict], min_profit_pct: float = 0.0) -> list[d
     for game in games:
         if game.get("league") == "kbo":
             continue  # handled by find_kbo_tie_aware_arbs
-        if game.get("league") in ("mlb_spread", "mls_spread"):
+        if game.get("league") in SPREAD_LEAGUES:
             continue  # Polymarket binary tokens cannot be short-sold; no real lay market
-        if game.get("league") in ("mlb_totals", "mls_totals", "wc_totals"):
+        if game.get("league") in TOTALS_LEAGUES:
             slots = ("over", "under")
         elif _is_three_way(game):
             slots = ("team1", "draw", "team2")
@@ -525,7 +527,7 @@ def best_sure_bet_opportunity(game: dict) -> dict | None:
     profit_pct may be negative.  Returns None if odds are missing.
     """
     three_way = _is_three_way(game)
-    is_totals = game.get("league") in ("mlb_totals", "mls_totals", "wc_totals")
+    is_totals = game.get("league") in TOTALS_LEAGUES
     slot1 = "over" if is_totals else "team1"
     slot2 = "under" if is_totals else "team2"
     team1_odds, team1_provider = _best_back(game, slot1)
@@ -569,7 +571,7 @@ def best_back_lay_opportunity(game: dict) -> dict | None:
     so profit_pct may be negative.  Picks the outcome with the highest profit.
     Returns None if back or lay odds are missing for every outcome.
     """
-    if game.get("league") in ("mlb_totals", "mls_totals", "wc_totals"):
+    if game.get("league") in TOTALS_LEAGUES:
         slots = ("over", "under")
     elif _is_three_way(game):
         slots = ("team1", "draw", "team2")

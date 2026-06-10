@@ -24,7 +24,7 @@ class MatchbookSettings:
     username: str | None
     password: str | None
     base_url: str
-    max_requests_per_min: int = 200  # hard limit is 700; keep well below it
+    max_requests_per_min: int = 400  # hard limit is 700; keep headroom below it
 
 
 @dataclass(frozen=True)
@@ -120,7 +120,7 @@ def load_settings(project_root: Path) -> Settings:
             username=os.getenv("MATCHBOOK_USERNAME") or None,
             password=os.getenv("MATCHBOOK_PASSWORD") or None,
             base_url=os.getenv("MATCHBOOK_BASE_URL", "https://api.matchbook.com"),
-            max_requests_per_min=int(os.getenv("MATCHBOOK_MAX_REQUESTS_PER_MIN", "200")),
+            max_requests_per_min=int(os.getenv("MATCHBOOK_MAX_REQUESTS_PER_MIN", "400")),
         ),
         smarkets=SmarketsSettings(
             username=os.getenv("SMARKETS_USERNAME") or None,

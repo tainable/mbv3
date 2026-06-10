@@ -73,6 +73,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from matched_betting.config import load_settings
 from matched_betting.http import HttpClient
+from matched_betting.leagues import TOTALS_LEAGUES
 from matched_betting.polygon_rpc import PM_CHAIN_ID, PM_RPCS, pm_rpc, pm_matic_balance
 from matched_betting.mb_auth import mb_login, mb_best_price
 
@@ -1019,7 +1020,7 @@ def refresh_sx_odds_http(game: dict, settings) -> dict:
                                 proxies=proxies)
             best_list = raw.get("data", {}).get("bestOdds", []) or []
             o1_norm   = (game.get("sx_bet_outcome_one_team") or "").lower()
-            if league in ("mlb_totals", "mls_totals"):
+            if league in TOTALS_LEAGUES:
                 o1_slot, o2_slot = ("over", "under") if o1_norm == "over" else ("under", "over")
             else:
                 t1_norm = normalize_team_name(game.get("team1") or "", league)

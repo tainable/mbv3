@@ -17,6 +17,8 @@ import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 
+from matched_betting.leagues import TOTALS_LEAGUES
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -230,7 +232,7 @@ def log_stream_tick(
     """
     # Totals leagues store odds under "over"/"under" keys rather than
     # "team1"/"team2". Remap so the fixed DB columns are always populated.
-    is_totals = game.get("league") in ("mlb_totals", "mls_totals")
+    is_totals = game.get("league") in TOTALS_LEAGUES
     def _get_odds(col: str):
         val = game.get(col)
         if val is None and is_totals:

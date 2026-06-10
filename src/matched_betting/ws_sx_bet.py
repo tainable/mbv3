@@ -13,6 +13,11 @@ Auth flow:
   3. For each market hash: send {"id":N, "subscribe": {"channel": "order_book:market_HASH"}}
   4. Handle push publications; server pings answered with empty frame {}
 
+Keepalive: WS protocol-level pings every 10s (matching ws_polymarket's cadence).
+The library default of 20s let the VPN relay drop quiet connections every few
+minutes ("no close frame received") — the Polymarket socket through the same
+relay never dropped because its app-level PING fires every 10s.
+
 Order book mechanics:
   SX Bet is a P2P exchange. Orders have:
     - percentageOdds: maker's probability * 10^20 (string)
@@ -40,9 +45,10 @@ from matched_betting.odds_cache import OddsCache
 
 log = logging.getLogger(__name__)
 
-_RECONNECT_DELAY_S  = 5.0
-_PING_REPLY_TIMEOUT = 30.0   # if no server frame in this long, reconnect
-_ODDS_SCALE         = 10 ** 20
+_RECONNECT_DELAY_S = 5.0
+_PING_INTERVAL_S   = 10.0   # protocol-level ping cadence (keeps the VPN relay path alive)
+_PING_TIMEOUT_S    = 15.0   # no pong in this long → connection considered dead, reconnect
+_ODDS_SCALE        = 10 ** 20
 
 
 # ---------------------------------------------------------------------------
@@ -349,10 +355,19 @@ class SxBetWSClient:
 
         self.cache.update_back_odds(ctx.game_id, "sx_bet", ctx.o1_slot, o1_odds, o1_avail)
         if ctx.o2_slot.endswith("_no"):
-            # Soccer per-outcome binary market: outcomeTwo = "No" (ctx.o1_slot does
-            # NOT happen). Backing No at these odds pays out identically to laying
-            # the named outcome at the same odds — feed it in as the lay price.
-            self.cache.update_lay_odds(ctx.game_id, "sx_bet", ctx.o1_slot, o2_odds, o2_avail)
+            # Soccer per-outcome binary market: outcomeTwo = "No" (ctx.o1_slot
+            # does NOT happen). o2_odds is the NO-back decimal price
+            # 1/(1 - p_yes_maker); the cache lay convention — matching the
+            # provider HTTP path (sx_bet.py "Lay odds = 1 / Yes-maker
+            # probability") — is exchange lay odds, so convert:
+            #   L = d_no / (d_no - 1)  ==  1 / p_yes_maker
+            # Feeding d_no raw made the calculator read e.g. "lay Qatar @1.07"
+            # instead of @14.5, printing +500% phantom back-lay arbs
+            # (Canada/Qatar, 2026-06-10). Avail needs no conversion: both
+            # paths use the taker stake available on the NO side.
+            lay_odds = (round(o2_odds / (o2_odds - 1.0), 6)
+                        if o2_odds is not None and o2_odds > 1.0 else None)
+            self.cache.update_lay_odds(ctx.game_id, "sx_bet", ctx.o1_slot, lay_odds, o2_avail)
         else:
             self.cache.update_back_odds(ctx.game_id, "sx_bet", ctx.o2_slot, o2_odds, o2_avail)
 
@@ -372,6 +387,7 @@ def build_market_map(games: list[dict]) -> dict[str, _MarketCtx]:
     Handles both two-way markets (sx_bet_market_hash) and soccer per-outcome
     markets (sx_bet_team1_market_hash etc.).
     """
+    from matched_betting.leagues import TOTALS_LEAGUES
     from matched_betting.normalization import normalize_team_name
     from matched_betting.odds_cache import game_id as _gid
 
@@ -383,9 +399,25 @@ def build_market_map(games: list[dict]) -> dict[str, _MarketCtx]:
 
         # Two-way market (NBA, MLB, WNBA, KBO, NHL …) and totals (mlb_totals, mls_totals)
         mh = game.get("sx_bet_market_hash")
+        if (mh and game.get("market_type") == "three_way"
+                and not (game.get("sx_bet_outcome_one_team") or "").strip()):
+            # A bare two-way hash on a three-way game with no outcome mapping is
+            # ambiguous: it points at ONE of the per-outcome binary markets
+            # (often the Tie market), and guessing team slots wires e.g. draw
+            # odds into a team slot — the Qatar/Switzerland +188% phantom arb
+            # (2026-06-10). The per-outcome hash subscriptions below cover
+            # these games correctly, so skip the guess entirely. Only warn when
+            # the per-outcome hashes are also missing (game has no usable SX sub).
+            if not any(game.get(k) for k in (
+                "sx_bet_team1_market_hash", "sx_bet_draw_market_hash",
+                "sx_bet_team2_market_hash",
+            )):
+                log.warning("sx_bet: three-way game %s has only an ambiguous "
+                            "two-way market hash — no SX subscription created", gid)
+            mh = None
         if mh:
             o1_team_norm = (game.get("sx_bet_outcome_one_team") or "").lower()
-            if league in ("mlb_totals", "mls_totals"):
+            if league in TOTALS_LEAGUES:
                 # outcomeOne is stored as "over" or "under", not a team name
                 if o1_team_norm == "over":
                     o1_slot, o2_slot = "over", "under"
@@ -424,7 +456,10 @@ async def _open_ws(uri: str, proxy_url: str | None):
     from urllib.parse import urlparse
 
     if not proxy_url:
-        return await websockets.connect(uri, max_size=None)
+        return await websockets.connect(
+            uri, max_size=None,
+            ping_interval=_PING_INTERVAL_S, ping_timeout=_PING_TIMEOUT_S,
+        )
 
     parsed    = urlparse(uri)
     dest_host = parsed.hostname
@@ -436,4 +471,7 @@ async def _open_ws(uri: str, proxy_url: str | None):
     raw_sock = await proxy.connect(dest_host=dest_host, dest_port=dest_port)
     ssl_ctx  = ssl.create_default_context() if parsed.scheme == "wss" else None
     import websockets.legacy.client
-    return await websockets.legacy.client.connect(uri, sock=raw_sock, ssl=ssl_ctx, max_size=None)
+    return await websockets.legacy.client.connect(
+        uri, sock=raw_sock, ssl=ssl_ctx, max_size=None,
+        ping_interval=_PING_INTERVAL_S, ping_timeout=_PING_TIMEOUT_S,
+    )

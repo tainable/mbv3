@@ -207,6 +207,7 @@ def _build_stream_cmd(args: argparse.Namespace) -> list[str]:
         "--min-profit", str(args.min_profit),
         "--budget",     str(args.budget),
         "--autobet",
+        "--autobet-age",   str(args.autobet_age),
         "--autobet-delay", str(args.autobet_delay),
     ]
     if args.autobet_min_profit is not None:
@@ -248,8 +249,10 @@ def main() -> None:
                         help="Min net profit %% passed to stream.py (default: 0.0).")
     parser.add_argument("--autobet-min-profit", type=float, default=None, metavar="PCT",
                         help="Autobet-specific profit threshold (default: same as --min-profit).")
-    parser.add_argument("--autobet-delay", type=float, default=10.0, metavar="SECS",
-                        help="Seconds to wait before placing after arb is detected (default: 10).")
+    parser.add_argument("--autobet-age", type=float, default=30.0, metavar="SECS",
+                        help="Seconds an arb must be continuously live before placing (default: 30).")
+    parser.add_argument("--autobet-delay", type=float, default=0.0, metavar="SECS",
+                        help="Extra wait after the age gate before placing (default: 0).")
     parser.add_argument("--providers", nargs="+", default=["polymarket", "sx_bet"],
                         metavar="PROVIDER", help="Providers for ids.py.")
     parser.add_argument("--leagues", nargs="+", default=["NBA", "NHL", "MLB"],
@@ -297,6 +300,7 @@ def main() -> None:
     _log(_SEP)
     _log(f"  watch_stream daemon starting  [{mode}]")
     _log(f"  budget={args.budget} USDC  min-profit={args.min_profit}%  "
+         f"autobet-age={args.autobet_age:.0f}s  "
          f"ids-refresh={args.ids_refresh_interval}m  max-restarts={args.max_restarts}")
     if args.skip_initial_ids:
         _log(f"  --skip-initial-ids: using existing IDs file, next refresh in {args.ids_refresh_interval}m")

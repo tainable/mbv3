@@ -8,6 +8,7 @@ from typing import Any
 from matched_betting.config import PolymarketSettings
 from matched_betting.debug import DebugLogger
 from matched_betting.http import HttpClient
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
 from matched_betting.models import OddsRecord, ProviderPayload, decimal_from_probability, utc_now_iso
 from matched_betting.normalization import normalize_team_name
 from matched_betting.providers.base import GameContext, OddsProvider
@@ -384,7 +385,7 @@ class PolymarketProvider(OddsProvider):
                         except Exception as exc:
                             warnings.append(f"Skipped Polymarket CLOB market {market_id}: {exc}")
                             self.debug(f"{self.name}: CLOB: skipped market {market_id}: {exc}")
-            elif league in ("mlb_totals", "mls_totals", "wc_totals"):
+            elif league in TOTALS_LEAGUES:
                 market_id = game.get("polymarket_market_id")
                 over_token = game.get("polymarket_over_clob_token_id")
                 under_token = game.get("polymarket_under_clob_token_id")
@@ -432,7 +433,7 @@ class PolymarketProvider(OddsProvider):
                 # so we inject them from the stored game context here — the same
                 # pattern as total_line injection for totals markets.
                 _spread_meta: dict = {}
-                if league in ("mlb_spread", "mls_spread", "wc_spread"):
+                if league in SPREAD_LEAGUES:
                     _ctx_spread = game.get("spread")
                     _ctx_fav = game.get("spread_favourite")
                     if _ctx_spread is not None:
@@ -885,7 +886,7 @@ class PolymarketProvider(OddsProvider):
         _spread_value: float | None = None
         _spread_favourite: str | None = None
         _total_line_value: float | None = None
-        if league in ("mlb_spread", "mls_spread", "wc_spread"):
+        if league in SPREAD_LEAGUES:
             _spread_value, _spread_found = _extract_spread(market)
             _spread_favourite = _extract_spread_favourite(market)
             if not _spread_found:
@@ -894,7 +895,7 @@ class PolymarketProvider(OddsProvider):
                 method_warnings.append(
                     f"{league} market {market_id} ({slug}): spread not found in market data, defaulted to -1.5"
                 )
-        elif league in ("mlb_totals", "mls_totals", "wc_totals"):
+        elif league in TOTALS_LEAGUES:
             _total_line_value = _extract_total_line_pm(market)
 
         lay_probs: list[float | None] = []
@@ -1075,9 +1076,9 @@ class PolymarketProvider(OddsProvider):
                 "market_type_raw": market.get("marketType"),
                 "sports_market_type_raw": market.get("sportsMarketType"),
                 "liquidity_usd": market.get("liquidityNum"),
-                "spread": _spread_value if league in ("mlb_spread", "mls_spread", "wc_spread") else None,
-                "spread_favourite": _spread_favourite if league in ("mlb_spread", "mls_spread", "wc_spread") else None,
-                "total_line": _total_line_value if league in ("mlb_totals", "mls_totals", "wc_totals") else None,
+                "spread": _spread_value if league in SPREAD_LEAGUES else None,
+                "spread_favourite": _spread_favourite if league in SPREAD_LEAGUES else None,
+                "total_line": _total_line_value if league in TOTALS_LEAGUES else None,
             },
         )
 

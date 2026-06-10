@@ -16,6 +16,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
+
 
 class OddsCache:
 
@@ -218,11 +220,11 @@ def game_id(game: dict[str, Any]) -> str:
     date   = _time_bucket(game.get("date_time"))
     team1  = (game.get("team1") or "").lower()
     team2  = (game.get("team2") or "").lower()
-    if league in ("mlb_spread", "mls_spread", "wc_spread"):
+    if league in SPREAD_LEAGUES:
         spread = game.get("spread")
         if spread is not None:
             return f"{league}|{date}|{team1}|{team2}|{spread}"
-    elif league in ("mlb_totals", "mls_totals", "wc_totals"):
+    elif league in TOTALS_LEAGUES:
         total_line = game.get("total_line")
         if total_line is not None:
             return f"{league}|{date}|{team1}|{team2}|{total_line}"

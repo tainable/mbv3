@@ -79,7 +79,7 @@ For a **two-way moneyline** league (like NBA/NHL/MLB), `market_type` should be `
 
 ### Provider-specific notes
 
-- **Matchbook** — Requires login (`MATCHBOOK_USERNAME`, `MATCHBOOK_PASSWORD`). Has a rate limiter (`_throttle()`, default 200 req/min). Events are fetched by `sport_id` then filtered by `meta-tag url-name`. The `find_matchbook_league_tags.py` script helps discover correct tag names.
+- **Matchbook** — Requires login (`MATCHBOOK_USERNAME`, `MATCHBOOK_PASSWORD`). Has a rate limiter (`_throttle()`, default 400 req/min; account hard cap 700/min). Events are fetched by `sport_id` then filtered by `meta-tag url-name`. The `find_matchbook_league_tags.py` script helps discover correct tag names.
 - **Polymarket** — Requires VPN proxy (Montreal relay) via `VPN_PROXY_URL`. Markets are discovered by slug pattern matching against hardcoded team-slug lists. Update mode uses CLOB token IDs stored in `_market_index.json` to skip Gamma API lookups.
 - **SX Bet** — Also VPN-proxied. Uses `leagueId` + market `type` integer to filter. `find_sx_bet_league_ids.py` discovers league IDs. Moneyline = type 226. Soccer uses one market per outcome (home/draw/away) grouped by `sportXEventId`.
 - **Smarkets / Azuro** — Largely unused in active runs; smarkets has rate-limit retry logic in `cli.py`.

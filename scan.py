@@ -39,6 +39,7 @@ if str(_SRC_DIR) not in sys.path:
 
 from matched_betting.config import load_settings
 from matched_betting.debug import noop_debug, stderr_debug
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
 from matched_betting.event_matching import match_records_to_canonical_events
 from matched_betting.http import HttpClient
 from matched_betting.market_matching import is_game_win_loss_record
@@ -280,7 +281,7 @@ def _scan_game(
     # after aggregation games_payload can contain several spread-line entries for
     # the same team pair.  Comparing on abs() because context spread is signed
     # (negative = home fav) while aggregated entries may vary in sign convention.
-    if len(games_payload) > 1 and game.get("league") in ("mlb_spread", "mls_spread", "wc_spread"):
+    if len(games_payload) > 1 and game.get("league") in SPREAD_LEAGUES:
         ctx_spread = game.get("spread")
         if ctx_spread is not None:
             abs_ctx = abs(float(ctx_spread))
@@ -338,7 +339,7 @@ def _print_odds_table(
     gbp_rate: float | None = None,
 ) -> None:
     """Print a compact odds table for one game after scanning."""
-    is_totals = game.get("league") in ("mlb_totals", "mls_totals", "wc_totals")
+    is_totals = game.get("league") in TOTALS_LEAGUES
     if is_totals:
         team1 = "Over"
         team2 = "Under"

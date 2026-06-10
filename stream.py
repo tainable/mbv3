@@ -190,25 +190,37 @@ async def _autobet_task(
     args:       argparse.Namespace,
     gbp_rate:   float | None,
     in_flight:  set,
+    age_s:      float | None = None,
 ) -> None:
     """
-    Wait args.autobet_delay seconds, re-validate the arb from the live cache,
-    then place it using the same guard sequence as scan.py's --auto-bet path.
+    Re-validate the arb from the live cache, then place it using the same
+    guard sequence as scan.py's --auto-bet path.
+
+    Scheduled by the arb loop once an arb has been continuously live for
+    args.autobet_age seconds (the age gate — slippage analysis of stream
+    ticks showed ~70% of arbs younger than 5s die within the execution
+    window vs ~2% once they have survived 30s). args.autobet_delay adds an
+    optional extra wait on top (default 0).
+
     Runs as an asyncio background task; placement IO is offloaded to a thread pool.
     """
     import bet_executor as _exec
 
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
     mode = "TEST $5" if args.autobet_test else ("DRY-RUN" if args.bet_dry_run else "LIVE")
-    print(f"\n  [{ts}]  AUTOBET queued ({mode})  {arb_key}  — waiting {args.autobet_delay}s",
+    age_note = f"  (live {age_s:.0f}s)" if age_s is not None else ""
+    wait_note = f" — waiting {args.autobet_delay}s" if args.autobet_delay > 0 else " — placing now"
+    print(f"\n  [{ts}]  AUTOBET queued ({mode})  {arb_key}{age_note}{wait_note}",
           flush=True)
 
     try:
-        await asyncio.sleep(args.autobet_delay)
+        if args.autobet_delay > 0:
+            await asyncio.sleep(args.autobet_delay)
 
         # Re-validate: fetch the current game state from the live cache.
-        # The arb loop has kept MB odds fresh via on-demand fetches so no
-        # second Matchbook call is needed here.
+        # SX odds are refreshed via HTTP below; Matchbook is refreshed inside
+        # the executor's pre-commit revalidation (_refresh_leg_odds), so the
+        # final margin check never runs on a stale MB quote.
         fresh_game = cache.get_game(gid)
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
         if fresh_game is None:
@@ -256,7 +268,7 @@ async def _autobet_task(
                 break
 
         if fresh_arb is None:
-            print(f"\n  [{ts}]  AUTOBET {arb_key}: arb gone after {args.autobet_delay}s — skipped",
+            print(f"\n  [{ts}]  AUTOBET {arb_key}: arb gone on re-check — skipped",
                   flush=True)
             return
 
@@ -371,6 +383,61 @@ async def _arb_loop(
     # their delay window or being placed.  Prevents scheduling duplicates.
     _in_flight: set[tuple] = set()
 
+    # First-seen monotonic time per gid -> {arb_key -> t}.  Drives the
+    # age-based autobet trigger: an arb must be continuously live (tolerating
+    # the same GONE grace window as _live) for >= args.autobet_age seconds
+    # before placement is scheduled.  Slippage analysis of stream ticks:
+    # P(arb killed within the 5s execution window) is ~70% at age 0-5s but
+    # ~2.5% once an arb has survived 30s.
+    _first_seen: dict[str, dict[tuple, float]] = {}
+
+    _halt_printed = False
+
+    def _schedule_due_autobets() -> None:
+        """Schedule placement for every live arb whose continuous-live age has
+        crossed args.autobet_age.  Called on every debounce tick (not just
+        dirty ones) so the trigger doesn't depend on a fresh WS tick arriving
+        after the threshold — quiet books still get placed on time.
+        """
+        nonlocal _halt_printed
+        if not args.autobet:
+            return
+        import bet_executor as _exec
+        if _exec._HALT:
+            if not _halt_printed:
+                _halt_printed = True
+                print("  [AUTOBET] HALTED — restart process to resume.", file=sys.stderr)
+            return
+        now_mono = time.monotonic()
+        for g_key, arbs in _live.items():
+            fs = _first_seen.get(g_key)
+            if not fs:
+                continue
+            pending_gone = _gone_pending.get(g_key) or {}
+            for ak, pct in arbs.items():
+                if ak[0] == "kbo":
+                    continue  # no KBO placement support
+                if pct < args.autobet_min_profit:
+                    continue
+                if ak in pending_gone:
+                    continue  # currently flickering out — wait for recovery
+                seen = fs.get(ak)
+                if seen is None or (now_mono - seen) < args.autobet_age:
+                    continue
+                flight_key = (g_key, ak)
+                if flight_key in _in_flight or flight_key in _bet_history:
+                    continue
+                arb_type = "sure_bet" if ak[0] == "sb" else "back_lay"
+                _in_flight.add(flight_key)
+                asyncio.create_task(
+                    _autobet_task(
+                        flight_key, ak, arb_type, g_key,
+                        cache, settings, args, gbp_rate, _in_flight,
+                        age_s=now_mono - seen,
+                    ),
+                    name=f"autobet-{g_key}-{ak[0]}",
+                )
+
     # Games already logged as dropped due to imminence — avoids repeating the
     # message on every subsequent dirty tick for the same game.
     _dropped_imminent: set[str] = set()
@@ -383,6 +450,7 @@ async def _arb_loop(
 
         dirty = cache.pop_dirty()
         if not dirty:
+            _schedule_due_autobets()
             continue
 
         # ── Dynamic imminent-game filter ──────────────────────────────────────
@@ -427,6 +495,7 @@ async def _arb_loop(
             dirty = _kept
 
         if not dirty:
+            _schedule_due_autobets()
             continue
 
         if mb_provider is not None:
@@ -499,25 +568,28 @@ async def _arb_loop(
             _gid_key = _gid(game)
             _prev = _live.get(_gid_key, {})
             _curr: dict[tuple, float] = {}
-            _curr_arbs: dict[tuple, tuple[str, dict]] = {}
             for _a in sure_bets:
                 _k: tuple = ("sb", _a.get("team1_back_provider", ""), _a.get("draw_back_provider", ""), _a.get("team2_back_provider", ""))
                 _curr[_k] = _a["profit_pct"]
-                _curr_arbs[_k] = ("sure_bet", _a)
             for _a in back_lay:
                 _k = ("bl", (_a.get("arb_outcome") or "").lower(), _a.get("back_provider", ""), _a.get("lay_provider", ""))
                 _curr[_k] = _a["profit_pct"]
-                _curr_arbs[_k] = ("back_lay", _a)
             for _a in kbo_arbs:
                 _k = ("kbo", _a.get("poly_underdog_slot", ""), _a.get("sx_fav_slot", ""))
                 _curr[_k] = _a["profit_pct"]
-                # KBO not in _curr_arbs — no placement support
 
             # Grace-period GONE: an arb must be absent for >= _GONE_GRACE_S seconds
             # before being reported gone.  Pending arbs stay in _live so they are
             # not re-shown as "appeared" if they recover within the window.
             _now_mono = time.monotonic()
             _gp = _gone_pending.setdefault(_gid_key, {})
+
+            # Age-trigger bookkeeping: stamp first-seen time for new arbs.
+            # Keys absent-but-in-grace keep their stamp, so a sub-grace flicker
+            # does not reset the age clock (matches the _live lifecycle).
+            _fs = _first_seen.setdefault(_gid_key, {}) if (_curr or _gid_key in _first_seen) else {}
+            for k in _curr:
+                _fs.setdefault(k, _now_mono)
 
             for k in _prev:
                 if k not in _curr and k not in _gp:
@@ -531,6 +603,7 @@ async def _arb_loop(
                            if (_now_mono - t) >= _GONE_GRACE_S and k in _prev}
             for k in _truly_gone:
                 del _gp[k]
+                _fs.pop(k, None)  # confirmed gone — next appearance starts a new age clock
 
             if not _gp:
                 _gone_pending.pop(_gid_key, None)
@@ -542,6 +615,7 @@ async def _arb_loop(
                 _live[_gid_key] = _new_live
             else:
                 _live.pop(_gid_key, None)
+                _first_seen.pop(_gid_key, None)
 
             _appeared = {k for k in _curr if k not in _prev}
             _gone     = _truly_gone
@@ -594,34 +668,13 @@ async def _arb_loop(
                 except Exception as exc:
                     log.warning("alert failed: %s", exc)
 
-            # ── Autobet scheduling ────────────────────────────────────────────
-            # Schedule a delayed placement task for each newly-appeared arb that
-            # clears the autobet threshold.  In-flight dedup ensures we don't
-            # schedule the same bet twice during its delay window.
-            if args.autobet:
-                import bet_executor as _exec
-                if _exec._HALT:
-                    print("  [AUTOBET] HALTED — restart process to resume.", file=sys.stderr)
-                else:
-                    for _ak in _appeared:
-                        if _ak[0] == "kbo":
-                            continue  # no KBO placement support
-                        _flight_key = (_gid_key, _ak)
-                        if _flight_key in _in_flight or _flight_key in _bet_history:
-                            continue
-                        _ab_type, _ab_arb = _curr_arbs.get(_ak, (None, None))
-                        if _ab_arb is None:
-                            continue
-                        if (_ab_arb.get("profit_pct") or 0) < args.autobet_min_profit:
-                            continue
-                        _in_flight.add(_flight_key)
-                        asyncio.create_task(
-                            _autobet_task(
-                                _flight_key, _ak, _ab_type, _gid_key,
-                                cache, settings, args, gbp_rate, _in_flight,
-                            ),
-                            name=f"autobet-{_gid_key}-{_ak[0]}",
-                        )
+        # ── Autobet scheduling (age-based) ────────────────────────────────
+        # Placement is triggered by arb age, not appearance: an arb is placed
+        # the moment it has been continuously live for args.autobet_age
+        # seconds.  The sweep runs every debounce tick (see the early-continue
+        # paths above) so threshold crossings are caught within ~args.debounce
+        # even when no further WS ticks arrive for the game.
+        _schedule_due_autobets()
 
 
 # ---------------------------------------------------------------------------
@@ -808,8 +861,8 @@ async def _main_async(args: argparse.Namespace) -> None:
     if args.autobet:
         _ab_mode = "TEST $5" if args.autobet_test else ("DRY-RUN" if args.bet_dry_run else "LIVE")
         print(f"  Autobet:    ENABLED [{_ab_mode}]  "
-              f"threshold={args.autobet_min_profit:.2f}%  delay={args.autobet_delay}s  "
-              f"budget=${args.budget:.2f}", flush=True)
+              f"threshold={args.autobet_min_profit:.2f}%  age={args.autobet_age:.0f}s  "
+              f"delay={args.autobet_delay}s  budget=${args.budget:.2f}", flush=True)
     print(flush=True)
     print("  Listening for arbs -- Ctrl-C to stop", flush=True)
     print(flush=True)
@@ -908,13 +961,21 @@ def main() -> None:
     # ── Autobet ────────────────────────────────────────────────────────────
     parser.add_argument(
         "--autobet", action="store_true",
-        help="Automatically place arbs found during streaming. "
-             "Waits --autobet-delay seconds then re-validates before placing.",
+        help="Automatically place arbs found during streaming. An arb is placed "
+             "once it has been continuously live for --autobet-age seconds and "
+             "still re-validates against live odds.",
     )
     parser.add_argument(
-        "--autobet-delay", type=float, default=10.0, metavar="SECONDS",
-        help="Seconds to wait after an arb is detected before placing (default: 10). "
-             "Arb must still be profitable after the delay or the bet is skipped.",
+        "--autobet-age", type=float, default=30.0, metavar="SECONDS",
+        help="Seconds an arb must be continuously live before autobet places it "
+             "(default: 30). Stream-tick analysis: ~70%% of arbs younger than 5s "
+             "are killed within the execution window vs ~2%% once they have "
+             "survived 30s. Set 0 to place on first detection.",
+    )
+    parser.add_argument(
+        "--autobet-delay", type=float, default=0.0, metavar="SECONDS",
+        help="Extra seconds to wait after the age gate before placing (default: 0). "
+             "The arb is re-validated after the wait either way.",
     )
     parser.add_argument(
         "--autobet-min-profit", type=float, default=None, metavar="PCT",

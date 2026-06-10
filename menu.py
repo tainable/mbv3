@@ -574,7 +574,8 @@ _cfg: dict = {
     "stream_autobet":             False,
     "stream_autobet_test":        False,
     "stream_dry_run":             False,
-    "stream_autobet_delay":       10.0,
+    "stream_autobet_age":         30.0,  # secs an arb must be continuously live before placing
+    "stream_autobet_delay":       0.0,   # extra wait after the age gate
     "stream_autobet_min_profit":  None,  # None = same as min_profit
     # Kelly bet sizing (injected as env vars into subprocesses)
     "kelly_enabled":          True,
@@ -1287,7 +1288,7 @@ def run_stream() -> None:
                 ab_mode = "LIVE"
             ab_thr = _cfg["stream_autobet_min_profit"]
             ab_thr_s = f"{ab_thr:.2f}%" if ab_thr is not None else f"same as min-profit ({_cfg['min_profit']:.2f}%)"
-            ab_s = f"on [{ab_mode}]  threshold={ab_thr_s}  delay={_cfg['stream_autobet_delay']:.0f}s"
+            ab_s = f"on [{ab_mode}]  threshold={ab_thr_s}  age={_cfg['stream_autobet_age']:.0f}s  delay={_cfg['stream_autobet_delay']:.0f}s"
         else:
             ab_s = "off"
 
@@ -1324,7 +1325,8 @@ def run_stream() -> None:
             dry_s  = "on" if _cfg["stream_dry_run"] else "off"
             print(f"  [t]  Test mode             ({test_s})")
             print(f"  [dr] Dry run               ({dry_s})")
-            print(f"  [ad] Autobet delay         ({_cfg['stream_autobet_delay']:.0f}s)")
+            print(f"  [ag] Autobet age gate      ({_cfg['stream_autobet_age']:.0f}s continuously live before placing)")
+            print(f"  [ad] Autobet delay         ({_cfg['stream_autobet_delay']:.0f}s extra after age gate)")
             ab_thr_disp = f"{_cfg['stream_autobet_min_profit']:.2f}%" if _cfg["stream_autobet_min_profit"] is not None else "same as min-profit"
             print(f"  [at] Autobet threshold     ({ab_thr_disp})")
         print()
@@ -1364,8 +1366,10 @@ def run_stream() -> None:
             _cfg["stream_autobet_test"] = not _cfg["stream_autobet_test"]
         elif c == "dr":
             _cfg["stream_dry_run"] = not _cfg["stream_dry_run"]
+        elif c == "ag":
+            _cfg["stream_autobet_age"] = max(0.0, _ask_float("Age gate: seconds continuously live before placing", _cfg["stream_autobet_age"]))
         elif c == "ad":
-            _cfg["stream_autobet_delay"] = max(0.0, _ask_float("Delay before placing (seconds)", _cfg["stream_autobet_delay"]))
+            _cfg["stream_autobet_delay"] = max(0.0, _ask_float("Extra delay after age gate (seconds)", _cfg["stream_autobet_delay"]))
         elif c == "at":
             raw = _ask("Autobet threshold % (leave blank = same as min-profit)", "")
             _cfg["stream_autobet_min_profit"] = float(raw) if raw.strip() else None
@@ -1391,6 +1395,7 @@ def run_stream() -> None:
                 cmd.append("--alert")
             if _cfg["stream_autobet"]:
                 cmd.append("--autobet")
+                cmd += ["--autobet-age",   str(_cfg["stream_autobet_age"])]
                 cmd += ["--autobet-delay", str(_cfg["stream_autobet_delay"])]
                 if _cfg["stream_autobet_min_profit"] is not None:
                     cmd += ["--autobet-min-profit", str(_cfg["stream_autobet_min_profit"])]
@@ -1434,6 +1439,7 @@ def _build_stream_daemon_cmd() -> list[str]:
         "--min-profit",          str(_cfg["min_profit"]),
         "--ids-refresh-interval", str(_cfg["stream_daemon_ids_refresh"]),
         "--max-restarts",        str(_cfg["stream_daemon_max_restarts"]),
+        "--autobet-age",         str(_cfg["stream_autobet_age"]),
         "--autobet-delay",       str(_cfg["stream_autobet_delay"]),
     ]
     if _cfg["leagues"]:
@@ -1480,7 +1486,7 @@ def run_stream_daemon() -> None:
         print(f"  Mode         : {mode_s}")
         print(f"  Budget       : ${_cfg['budget']:.2f} USDC  |  min-profit: {_cfg['min_profit']:.2f}%")
         print(f"  Matchbook    : {mb_s}")
-        print(f"  Autobet thr  : {ab_thr_s}  |  delay: {_cfg['stream_autobet_delay']:.0f}s")
+        print(f"  Autobet thr  : {ab_thr_s}  |  age: {_cfg['stream_autobet_age']:.0f}s  |  delay: {_cfg['stream_autobet_delay']:.0f}s")
         print(f"  Kelly        : {_kelly_summary()}")
         print(f"  Leagues      : {_ls()}")
         print(f"  IDs refresh  : every {_cfg['stream_daemon_ids_refresh']}m  |  skip initial: {skip_s}")
@@ -1495,7 +1501,8 @@ def run_stream_daemon() -> None:
         print("  [3]  Min profit / budget")
         print(f"  [m]  Matchbook mode        — currently: {mb_s}  [disabled / poll-only / on-demand+poll]")
         print("  [at] Autobet threshold     (profit %% floor for placing, blank = same as min-profit)")
-        print(f"  [ad] Autobet delay         ({_cfg['stream_autobet_delay']:.0f}s before placing)")
+        print(f"  [ag] Autobet age gate      ({_cfg['stream_autobet_age']:.0f}s continuously live before placing)")
+        print(f"  [ad] Autobet delay         ({_cfg['stream_autobet_delay']:.0f}s extra after age gate)")
         print("  [k]  Kelly settings")
         print("  [4]  IDs refresh interval  (minutes)")
         print("  [5]  Max restarts          (circuit-breaker threshold)")
@@ -1531,8 +1538,10 @@ def run_stream_daemon() -> None:
         elif c == "at":
             raw = _ask("Autobet threshold % (leave blank = same as min-profit)", "")
             _cfg["stream_autobet_min_profit"] = float(raw) if raw.strip() else None
+        elif c == "ag":
+            _cfg["stream_autobet_age"] = max(0.0, _ask_float("Age gate: seconds continuously live before placing", _cfg["stream_autobet_age"]))
         elif c == "ad":
-            _cfg["stream_autobet_delay"] = max(0.0, _ask_float("Delay before placing (seconds)", _cfg["stream_autobet_delay"]))
+            _cfg["stream_autobet_delay"] = max(0.0, _ask_float("Extra delay after age gate (seconds)", _cfg["stream_autobet_delay"]))
         elif c == "k":
             kelly_menu()
         elif c == "4":

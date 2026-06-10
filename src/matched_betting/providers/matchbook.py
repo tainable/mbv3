@@ -8,6 +8,7 @@ from typing import Any
 from matched_betting.config import MatchbookSettings
 from matched_betting.http import HttpClient
 from matched_betting.debug import DebugLogger
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
 from matched_betting.models import OddsRecord, ProviderPayload, utc_now_iso
 from matched_betting.normalization import normalize_team_name
 from matched_betting.providers.base import GameContext, OddsProvider, ProviderNotReadyError
@@ -42,7 +43,7 @@ class MatchbookProvider(OddsProvider):
         2. Sliding-window cap: at most requests_per_min calls in any 60-second
            window — prevents sustained over-rate even across process boundaries.
 
-        Configure via MATCHBOOK_MAX_REQUESTS_PER_MIN in .env (default 200;
+        Configure via MATCHBOOK_MAX_REQUESTS_PER_MIN in .env (default 400;
         Matchbook hard limit is 700/min).
         """
         min_gap = 60.0 / self._requests_per_minute
@@ -149,7 +150,7 @@ class MatchbookProvider(OddsProvider):
                 # markets (e.g. both the +1.5 and -1.5 side). Filter to the specific
                 # line stored in the game context so only one canonical spread group
                 # is produced downstream.
-                if league in ("mlb_spread", "mls_spread", "wc_spread"):
+                if league in SPREAD_LEAGUES:
                     context_favourite = game.get("spread_favourite")
                     context_spread = game.get("spread")  # normalised (signed) value
                     before = len(event_records)
@@ -174,7 +175,7 @@ class MatchbookProvider(OddsProvider):
                         f"spread filter '{context_favourite}' abs={abs(float(context_spread)) if context_spread is not None else '?'}: "
                         f"{before} -> {len(event_records)} records"
                     )
-                if league in ("mlb_totals", "mls_totals", "wc_totals"):
+                if league in TOTALS_LEAGUES:
                     context_total_line = game.get("total_line")
                     if context_total_line is not None:
                         before = len(event_records)

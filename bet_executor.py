@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 import unicodedata
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -48,6 +49,7 @@ sys.path.insert(0, str(_ROOT / "src"))
 
 from matched_betting.http import HttpClient
 from matched_betting import calculator, kelly
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
 from matched_betting.mb_auth import mb_login as _mb_login
 
 _SUPPORTED = {"polymarket", "matchbook", "sx_bet"}
@@ -1348,7 +1350,7 @@ def _sure_bet_stakes(arb: dict, budget_usdc: float) -> list[tuple[str, str, str,
 
     Returns a list of (slot, provider, outcome_name, raw_odds, stake_usdc).
     """
-    is_totals = arb.get("league") in ("mlb_totals", "mls_totals")
+    is_totals = arb.get("league") in TOTALS_LEAGUES
     slot1 = "over" if is_totals else "team1"
     slot2 = "under" if is_totals else "team2"
     legs = [(slot1, arb["team1_back_provider"], arb["team1"], arb["team1_back_odds"])]
@@ -1584,44 +1586,112 @@ def _back_lay_outcome_slot(game: dict, outcome_name: str) -> str:
     return "team2"
 
 
-def _refresh_sx_and_pm_odds(game: dict, settings) -> dict:
-    """Concurrently re-fetch live SX Bet and Polymarket odds for *game*.
+# Lazily-built Matchbook provider for pre-commit odds re-validation.
+# Built once per process and reused so the login session and rate limiter
+# are shared across placements.
+_MB_REFRESH_PROVIDER = None
+_MB_REFRESH_LOCK = threading.Lock()
 
-    These are the two providers with HTTP re-validation paths (refresh_sx_odds_http
-    / refresh_pm_odds_http). They touch disjoint field namespaces (sx_bet_* vs
-    polymarket_*) and are independent round trips, so running them concurrently
-    costs max(t_sx, t_pm) instead of t_sx + t_pm — mirrors _fetch_all_balances().
 
-    Matchbook is intentionally not refreshed here: sure-bet/back-lay placement
-    posts Matchbook orders as limit orders at the scanned price with
-    remain-unmatched=KEEP, so a stale Matchbook price doesn't produce a bad
-    fill the way a stale "take" order on SX/Polymarket would — it just sits
-    open. Re-validating that leg would need different handling, not this check.
+def _mb_refresh_provider(settings):
+    """Return a shared MatchbookProvider for re-validation fetches.
+
+    HttpClient(proxy_url=None) sends explicit None proxies on every request,
+    which overrides any HTTPS_PROXY/HTTP_PROXY env vars set for Polymarket —
+    Matchbook must never be reached through the VPN.
+    """
+    global _MB_REFRESH_PROVIDER
+    with _MB_REFRESH_LOCK:
+        if _MB_REFRESH_PROVIDER is None:
+            from matched_betting.providers.registry import build_provider_registry
+            registry = build_provider_registry(settings, HttpClient(proxy_url=None))
+            _MB_REFRESH_PROVIDER = registry.get("matchbook")
+    return _MB_REFRESH_PROVIDER
+
+
+def refresh_mb_odds(game: dict, settings) -> dict | None:
+    """Re-fetch live Matchbook odds for one game.
+
+    Returns a dict of matchbook_*_back_odds / matchbook_*_lay_odds fields, or
+    None if the game has no Matchbook event, the fetch fails, or the fetched
+    records don't map back to this exact game (spread/totals lines are matched
+    via the cache game_id, which encodes the line).
+    """
+    if not game.get("matchbook_event_id"):
+        return None
+    provider = _mb_refresh_provider(settings)
+    if provider is None:
+        return None
+
+    from matched_betting.event_matching import match_records_to_canonical_events
+    from matched_betting.market_matching import is_game_win_loss_record
+    from matched_betting.aggregation import build_aggregated_games_payload
+    from matched_betting.odds_cache import game_id as _mb_gid
+
+    league = game.get("league")
+    payload = provider.fetch_odds_by_ids([game], [league] if league else [])
+    records = [r for r in payload.records if is_game_win_loss_record(r)]
+    if not records:
+        return None
+    ca, ce = match_records_to_canonical_events(records)
+    agg = build_aggregated_games_payload(records, ca, ce)
+    target = _mb_gid(game)
+    mb_game = next((g for g in agg if _mb_gid(g) == target), None)
+    if mb_game is None:
+        return None
+    return {k: v for k, v in mb_game.items()
+            if k.startswith("matchbook_") and (k.endswith("_back_odds") or k.endswith("_lay_odds"))}
+
+
+def _refresh_leg_odds(game: dict, settings, providers: set[str] | None = None) -> dict:
+    """Concurrently re-fetch live odds for the providers in an arb's legs.
+
+    SX Bet and Polymarket are re-checked against the same HTTP price sources
+    their placement paths fill against (refresh_sx_odds_http /
+    refresh_pm_odds_http). Matchbook is re-fetched via the provider API:
+    although its leg is posted as a KEEP limit at the scanned price (so it
+    cannot fill at worse odds), a stale Matchbook quote lets a phantom arb
+    pass re-validation — the MB leg then rests unmatched while the SX/PM legs
+    fill at market, leaving an unhedged position. Refreshing it here kills
+    those arbs before any capital is committed.
+
+    providers restricts the refresh to the platforms actually in the arb
+    (None = refresh every platform the game has IDs for). The fetches touch
+    disjoint field namespaces and are independent round trips, so they run
+    concurrently — total cost is max() not sum().
 
     Returns a copy of *game* with refreshed *_back_odds / *_lay_odds fields
-    overlaid; anything that couldn't be refreshed keeps its WS-cache value
-    (both refresh helpers are fail-open on network errors).
+    overlaid; anything that couldn't be refreshed keeps its cached value
+    (all refresh helpers are fail-open on network errors).
     """
     from bet import refresh_sx_odds_http, refresh_pm_odds_http
 
-    has_sx = any(game.get(k) for k in (
+    def _wanted(p: str) -> bool:
+        return providers is None or p in providers
+
+    has_sx = _wanted("sx_bet") and any(game.get(k) for k in (
         "sx_bet_market_hash", "sx_bet_team1_market_hash",
         "sx_bet_draw_market_hash", "sx_bet_team2_market_hash",
     ))
-    has_pm = any(k.startswith("polymarket_") and k.endswith("_clob_token_id") and v
-                 for k, v in game.items())
+    has_pm = _wanted("polymarket") and any(
+        k.startswith("polymarket_") and k.endswith("_clob_token_id") and v
+        for k, v in game.items())
+    has_mb = _wanted("matchbook") and bool(game.get("matchbook_event_id"))
 
     refreshers = {}
-    with ThreadPoolExecutor(max_workers=2) as ex:
+    with ThreadPoolExecutor(max_workers=3) as ex:
         if has_sx:
             refreshers["sx"] = ex.submit(refresh_sx_odds_http, game, settings)
         if has_pm:
             refreshers["pm"] = ex.submit(refresh_pm_odds_http, game, settings)
+        if has_mb:
+            refreshers["mb"] = ex.submit(refresh_mb_odds, game, settings)
         results = {}
         for name, fut in refreshers.items():
             try:
                 results[name] = fut.result()
-            except Exception:
+            except Exception as exc:
+                print(f"  ({name} odds refresh failed — using cached: {exc})", file=sys.stderr)
                 results[name] = None
 
     fresh_game = dict(game)
@@ -1633,6 +1703,9 @@ def _refresh_sx_and_pm_odds(game: dict, settings) -> dict:
     if pm_result is not None:
         fresh_game.update({k: v for k, v in pm_result.items()
                            if k.startswith("polymarket_") and (k.endswith("_back_odds") or k.endswith("_lay_odds"))})
+    mb_result = results.get("mb")
+    if mb_result:
+        fresh_game.update(mb_result)
     return fresh_game
 
 
@@ -1642,26 +1715,27 @@ def _revalidate_sure_bet_odds(arb: dict, game: dict, settings) -> tuple[bool, di
     The scanner's WS-cache odds can be several seconds stale by the time an
     order actually reaches the book (see _SLIPPAGE_MIN_PROFIT_PCT comment).
     This re-checks the same price sources sx_place_bet()/pm_place_bet() will
-    fill against and recomputes the margin, so a thin scanned edge that has
-    already evaporated gets skipped *before* the first leg is placed — rather
-    than discovered afterwards as a half-covered position or a realised loss.
+    fill against — plus live Matchbook odds when an MB leg is involved — and
+    recomputes the margin, so a thin scanned edge that has already evaporated
+    gets skipped *before* the first leg is placed — rather than discovered
+    afterwards as a half-covered position or a realised loss.
 
     Returns (ok, fresh_game, reason). ok=False means the live edge no longer
     clears _SLIPPAGE_MIN_PROFIT_PCT and the arb should be skipped outright.
     fresh_game carries forward any odds that were successfully refreshed (the
     refresh helpers are fail-open: a network error keeps the WS-cache value).
     """
-    fresh_game = _refresh_sx_and_pm_odds(game, settings)
-
     # Slot/provider derivation mirrors _sure_bet_stakes() — but skip its stake
     # math entirely (it would apply rounding-loss guards meant for real stakes).
-    is_totals = arb.get("league") in ("mlb_totals", "mls_totals")
+    is_totals = arb.get("league") in TOTALS_LEAGUES
     slot1 = "over" if is_totals else "team1"
     slot2 = "under" if is_totals else "team2"
     legs = [(slot1, arb["team1_back_provider"], arb["team1"])]
     if arb.get("market_type") == "three_way" and arb.get("draw_back_odds"):
         legs.append(("draw", arb["draw_back_provider"], "Draw"))
     legs.append((slot2, arb["team2_back_provider"], arb["team2"]))
+
+    fresh_game = _refresh_leg_odds(game, settings, {prov for _, prov, _ in legs})
 
     margin = 0.0
     for slot, provider, name in legs:
@@ -1691,12 +1765,13 @@ def _revalidate_back_lay_odds(arb: dict, game: dict, settings) -> tuple[bool, di
 
     Returns (ok, fresh_game, reason) — see _revalidate_sure_bet_odds().
     """
-    fresh_game = _refresh_sx_and_pm_odds(game, settings)
-
     back_prov    = arb["back_provider"]
     lay_prov     = arb["lay_provider"]
     outcome_name = arb["arb_outcome"]
-    slot         = _back_lay_outcome_slot(fresh_game, outcome_name)
+
+    fresh_game = _refresh_leg_odds(game, settings, {back_prov, lay_prov})
+
+    slot = _back_lay_outcome_slot(fresh_game, outcome_name)
 
     live_back = fresh_game.get(f"{back_prov}_{slot}_back_odds")
     if live_back is None:
@@ -1801,9 +1876,9 @@ def place_sure_bet(
         elif provider == "matchbook":
             mb_stake = round(stake_usdc * gbp_rate, 2) if gbp_rate else stake_usdc
             _league = game.get("league")
-            if _league in ("mlb_spread", "mls_spread"):
+            if _league in SPREAD_LEAGUES:
                 _mb_resolver = _resolve_mb_spread_runner
-            elif _league in ("mlb_totals", "mls_totals"):
+            elif _league in TOTALS_LEAGUES:
                 _mb_resolver = _resolve_mb_totals_runner
             else:
                 _mb_resolver = _resolve_mb_runner
@@ -1816,9 +1891,9 @@ def place_sure_bet(
                 })
                 continue
             if not market_id:
-                if _league in ("mlb_spread", "mls_spread"):
+                if _league in SPREAD_LEAGUES:
                     _market_type = "handicap"
-                elif _league in ("mlb_totals", "mls_totals"):
+                elif _league in TOTALS_LEAGUES:
                     _market_type = "totals"
                 else:
                     _market_type = "moneyline"
@@ -2003,9 +2078,9 @@ def place_back_lay_arb(
     elif back_prov == "matchbook":
         mb_stake = round(back_stake * gbp_rate, 2) if gbp_rate else back_stake
         _back_league = game.get("league")
-        if _back_league in ("mlb_spread", "mls_spread"):
+        if _back_league in SPREAD_LEAGUES:
             _mb_back_resolver = _resolve_mb_spread_runner
-        elif _back_league in ("mlb_totals", "mls_totals"):
+        elif _back_league in TOTALS_LEAGUES:
             _mb_back_resolver = _resolve_mb_totals_runner
         else:
             _mb_back_resolver = _resolve_mb_runner
@@ -2030,9 +2105,9 @@ def place_back_lay_arb(
     if lay_prov == "matchbook":
         mb_lay_stake = round(lay_stake * gbp_rate, 2) if gbp_rate else lay_stake
         _lay_league = game.get("league")
-        if _lay_league in ("mlb_spread", "mls_spread"):
+        if _lay_league in SPREAD_LEAGUES:
             _mb_lay_resolver = _resolve_mb_spread_runner
-        elif _lay_league in ("mlb_totals", "mls_totals"):
+        elif _lay_league in TOTALS_LEAGUES:
             _mb_lay_resolver = _resolve_mb_totals_runner
         else:
             _mb_lay_resolver = _resolve_mb_runner

@@ -10,8 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from matched_betting.leagues import SPREAD_LEAGUES, TOTALS_LEAGUES
 from matched_betting.models import OddsRecord
 from matched_betting.normalization import normalize_team_name
+from matched_betting.providers.sx_bet import _SOCCER_LEAGUES as _SX_SOCCER_LEAGUES
 
 
 # Fields stored in the market/IDs index for targeted re-fetching.
@@ -97,7 +99,7 @@ def build_aggregated_games_payload(
         event_group = events_by_id[canonical_event_id]
 
         # MLB/MLS totals: one entry per (game, total_line) pair with over/under slot names
-        if event_group.league in ("mlb_totals", "mls_totals", "wc_totals"):
+        if event_group.league in TOTALS_LEAGUES:
             lines_to_indices: dict[float, list[int]] = {}
             for index in indices:
                 meta = records[index].metadata or {}
@@ -208,7 +210,7 @@ def build_aggregated_games_payload(
         # Without this split, a Matchbook -1.0 record and a Polymarket -1.5
         # record for the same match would be merged into one entry, creating
         # phantom cross-line arbs with inflated margins.
-        if event_group.league in ("mlb_spread", "mls_spread", "wc_spread"):
+        if event_group.league in SPREAD_LEAGUES:
             home_team = event_group.home_team
             away_team = event_group.away_team
 
@@ -505,8 +507,13 @@ def build_aggregated_games_payload(
                             entry["sx_bet_outcome_one_team"] = outcome_one
                     break
 
-        # Soccer: per-outcome SX Bet market hashes for targeted re-fetching
-        if entry.get("league") in ("ucl", "epl", "uel", "seria", "laliga", "mls"):
+        # Soccer: per-outcome SX Bet market hashes for targeted re-fetching.
+        # Uses the provider's _SOCCER_LEAGUES so a new soccer league can't be
+        # missed here — when "wc" was absent from a hardcoded copy of this
+        # list, WC games stored only the bare sx_bet_market_hash (pointing at
+        # the Tie market) and the stream wired draw odds into a team slot,
+        # producing +188% phantom arbs (Qatar/Switzerland, 2026-06-10).
+        if entry.get("league") in _SX_SOCCER_LEAGUES:
             for team_slot in ("team1", "draw", "team2"):
                 for side in ("back", "lay"):
                     chosen = best_by_provider_team.get(("sx_bet", team_slot, side))
